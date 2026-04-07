@@ -59,9 +59,7 @@ Set the following environment variables before running:
 
 # Not So Smart Anti-Spam Bot（不是很聰明的反廣告機器人）
 
-使用 Rust 開發的異步 Telegram 反廣告機器人。結合 Naive Bayes 分類器、管理員工具以及可回溯的模型訓練機制。
-
-## 技術棧
+使用 Rust 開發的 Telegram 反廣告機器人。結合 Naive Bayes 分類器、管理員工具以及可回溯的模型訓練機制。
 
 - 使用 Naive Bayes 演算法進行字詞分類與 Spam 偵測
 - `teloxide` 處理 Telegram Bot API 交互
