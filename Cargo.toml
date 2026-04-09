@@ -1,5 +1,5 @@
 [package]
-name = "not_so_smart_anti_spam"
+name = "wikipedia-zh-antispam"
 version = "0.1.3"
 edition = "2021"
 
