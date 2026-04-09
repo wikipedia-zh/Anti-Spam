@@ -16,7 +16,6 @@ struct Config {
     data_dir: PathBuf,
     sqlite_path: PathBuf,
     spam_threshold: f64,
-    min_training_samples: u64,
 }
 
 impl Config {
@@ -39,11 +38,6 @@ impl Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.85);
-        let min_training_samples = env::var("MIN_TRAINING_SAMPLES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(20);
-
         Ok(Self {
             bot_token,
             log_channel_id,
@@ -52,7 +46,6 @@ impl Config {
             data_dir: PathBuf::from(data_dir),
             sqlite_path: PathBuf::from(sqlite_path),
             spam_threshold,
-            min_training_samples,
         })
     }
 }
@@ -455,16 +448,7 @@ impl Runtime {
     }
 
     async fn effective_threshold(&self) -> Result<f64> {
-        let (spam, ham, total) = self.training_stats().await?;
-        let base = self.current_threshold().await?;
-        if total < self.config.min_training_samples {
-            return Ok(base);
-        }
-        if spam > ham {
-            Ok((base - 0.07).clamp(0.50, 0.99))
-        } else {
-            Ok((base + 0.03).clamp(0.50, 0.99))
-        }
+        self.current_threshold().await
     }
 }
 
@@ -702,6 +686,10 @@ fn escape_html(input: &str) -> String {
         .replace('>', "&gt;")
 }
 
+fn utc8_display(dt: DateTime<Utc>) -> String {
+    (dt + chrono::TimeDelta::hours(8)).format("%Y-%m-%d %H:%M:%S UTC+8").to_string()
+}
+
 async fn is_maintainer(bot: &Bot, config: &Config, user_id: i64) -> bool {
     if config.maintainer_ids.contains(&user_id) {
         return true;
@@ -752,7 +740,7 @@ async fn log_action(bot: &Bot, runtime: &Runtime, case: &CaseRecord) -> Response
         case.actor_user_id.map(|id| id.to_string()).unwrap_or_else(|| "system".to_string()),
         case.model_score.map(|s| format!("{s:.4}")).unwrap_or_else(|| "-".to_string()),
         escape_html(&case.evidence_text),
-        case.created_at.to_rfc3339(),
+        utc8_display(case.created_at),
     );
     let sent = bot
         .send_message(ChatId(runtime.config.log_channel_id), text)
@@ -1229,6 +1217,11 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
         return Ok(());
     };
 
+    let Some(message) = q.message.as_ref() else {
+        bot.answer_callback_query(q.id).text("找不到原始訊息").await?;
+        return Ok(());
+    };
+
     match decision {
         "approve" => {
             if let Err(err) = ban_user(&bot, ChatId(case.chat_id), case.target_user_id).await {
@@ -1249,18 +1242,20 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
             updated.status = "approved_and_banned".to_string();
             updated.actor_user_id = Some(from_id);
             updated.actor_name = Some(short_user(&from));
-            match log_action(&bot, &runtime, &updated).await {
-                Ok(log_message_id) => {
-                    updated.log_message_id = Some(log_message_id);
-                    if let Err(err) = store_case(&runtime, &updated).await {
-                        log_callback_error(&bot, &runtime, &case, "store_case", &err.to_string()).await;
-                    }
-                    let _ = bot.edit_message_text(ChatId(runtime.config.log_channel_id), MessageId(log_message_id), format!("<b>Case</b>: <code>{}</code>\n<b>Status</b>: 已受理並封禁", updated.id)).parse_mode(ParseMode::Html).await;
-                }
-                Err(err) => {
-                    log_callback_error(&bot, &runtime, &case, "log_action", &err.to_string()).await;
-                }
+            if let Err(err) = store_case(&runtime, &updated).await {
+                log_callback_error(&bot, &runtime, &case, "store_case", &err.to_string()).await;
             }
+            let body = format!(
+                "<b>新的 /spam 申請</b>\n\n<b>對象</b>: {} ({})\n<b>發起人</b>: {}\n<b>內容</b>: <blockquote>{}</blockquote>\n<b>Case</b>: <code>{}</code>\n<b>狀態</b>: 已受理並封禁\n<b>處理者</b>: <code>{}</code>",
+                escape_html(&case.target_name),
+                case.target_user_id,
+                escape_html(&short_user(&from)),
+                escape_html(&case.evidence_text),
+                case.id,
+                from_id
+            );
+            let _ = bot.edit_message_text(message.chat().id, message.id(), body).parse_mode(ParseMode::Html).await;
+            let _ = bot.edit_message_reply_markup(message.chat().id, message.id()).await;
             bot.answer_callback_query(q.id).text("已受理並封禁").await?;
         }
         "reject" => {
@@ -1272,19 +1267,21 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
             updated.status = "rejected_and_cleaned".to_string();
             updated.actor_user_id = Some(from_id);
             updated.actor_name = Some(short_user(&from));
-            match log_action(&bot, &runtime, &updated).await {
-                Ok(log_message_id) => {
-                    updated.log_message_id = Some(log_message_id);
-                    if let Err(err) = store_case(&runtime, &updated).await {
-                        log_callback_error(&bot, &runtime, &case, "store_case", &err.to_string()).await;
-                    }
-                    let _ = bot.edit_message_text(ChatId(runtime.config.log_channel_id), MessageId(log_message_id), format!("<b>Case</b>: <code>{}</code>\n<b>Status</b>: 已拒絕並清洗模型", updated.id)).parse_mode(ParseMode::Html).await;
-                }
-                Err(err) => {
-                    log_callback_error(&bot, &runtime, &case, "log_action", &err.to_string()).await;
-                }
+            if let Err(err) = store_case(&runtime, &updated).await {
+                log_callback_error(&bot, &runtime, &case, "store_case", &err.to_string()).await;
             }
-            bot.answer_callback_query(q.id).text("已拒絕並清洗模型").await?;
+            let body = format!(
+                "<b>新的 /spam 申請</b>\n\n<b>對象</b>: {} ({})\n<b>發起人</b>: {}\n<b>內容</b>: <blockquote>{}</blockquote>\n<b>Case</b>: <code>{}</code>\n<b>狀態</b>: 已拒絕受理\n<b>處理者</b>: <code>{}</code>",
+                escape_html(&case.target_name),
+                case.target_user_id,
+                escape_html(&short_user(&from)),
+                escape_html(&case.evidence_text),
+                case.id,
+                from_id
+            );
+            let _ = bot.edit_message_text(message.chat().id, message.id(), body).parse_mode(ParseMode::Html).await;
+            let _ = bot.edit_message_reply_markup(message.chat().id, message.id()).await;
+            bot.answer_callback_query(q.id).text("已拒絕受理").await?;
         }
         _ => {}
     }
