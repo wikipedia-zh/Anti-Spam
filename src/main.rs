@@ -501,6 +501,7 @@ enum ModerationCommand {
     CaseLookup(String),
     MlTrainSpam,
     MlCleanSpam,
+    MarkHam,
     MlStats,
     MlThreshold(String),
     MlExport,
@@ -509,6 +510,8 @@ enum ModerationCommand {
     MlRebuild,
     MlStartMassTrain,
     MlFinishMassTrain,
+    MlStartMassHam,
+    MlFinishMassHam,
     MlImport,
     MlStartMassTrainWithMode(String),
     MlDebugParse,
@@ -533,6 +536,7 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/leave" => ModerationCommand::Leave(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
         "/ml_train_spam" => ModerationCommand::MlTrainSpam,
         "/ml_clean_spam" => ModerationCommand::MlCleanSpam,
+        "/mark_ham" => ModerationCommand::MarkHam,
         "/ml_stats" => ModerationCommand::MlStats,
         "/ml_threshold" => ModerationCommand::MlThreshold(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/ml_export" => ModerationCommand::MlExport,
@@ -541,10 +545,13 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/ml_rebuild" => ModerationCommand::MlRebuild,
         "/ml_start_mass_train" => ModerationCommand::MlStartMassTrain,
         "/ml_finish_mass_train" => ModerationCommand::MlFinishMassTrain,
+        "/ml_start_mass_ham" => ModerationCommand::MlStartMassHam,
+        "/ml_finish_mass_ham" => ModerationCommand::MlFinishMassHam,
         "/import" => ModerationCommand::MlImport,
         "/ml_start_mass_train_smart" => ModerationCommand::MlStartMassTrainWithMode("smart".to_string()),
         "/ml_start_mass_train_plain" => ModerationCommand::MlStartMassTrainWithMode("plain".to_string()),
         "/ml_debug_parse" => ModerationCommand::MlDebugParse,
+        "/ml_score_debug" => ModerationCommand::MlDebugParse,
         _ => ModerationCommand::Unknown,
     }
 }
@@ -718,8 +725,12 @@ fn import_train_payloads(input: &str) -> Vec<String> {
     out
 }
 
-fn help_text() -> &'static str {
-    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n\n<b>項目組指令（僅 maintainer 可見）：</b>\n<code>/ml_train_spam</code>、<code>/ml_clean_spam</code>：單筆訓練/洗樣本\n<code>/ml_purge &lt;case_id&gt;</code>、<code>/ml_purge_text &lt;文字片段&gt;</code>：清除誤樣本\n<code>/ml_rebuild</code>：重建模型\n<code>/ml_stats</code>：查看樣本與門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整自動封禁門檻\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_start_mass_train_smart</code>：貼原始日志，自動抽正文全當 spam\n<code>/ml_start_mass_train_plain</code>：逐條手工標註\n<code>/ml_finish_mass_train</code>：結束批量訓練\n<code>/ml_debug_parse</code>：測試 smart 抽取"
+fn help_text(is_maintainer: bool) -> String {
+    let mut text = String::from("<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n");
+    if is_maintainer {
+        text.push_str("\n<b>項目組指令（僅 maintainer 可見）：</b>\n<code>/ml_train_spam</code>、<code>/ml_clean_spam</code>：單筆訓練/洗樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>、<code>/ml_purge_text &lt;文字片段&gt;</code>：清除誤樣本\n<code>/ml_rebuild</code>：重建模型\n<code>/ml_stats</code>：查看樣本與門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整自動封禁門檻\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_start_mass_train_smart</code>：貼原始日志，自動抽正文全當 spam\n<code>/ml_start_mass_train_plain</code>：逐條手工標註 spam\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果\n");
+    }
+    text
 }
 
 fn score_spam(model: &ModelState, display_name: &str, text: &str) -> f64 {
@@ -728,11 +739,17 @@ fn score_spam(model: &ModelState, display_name: &str, text: &str) -> f64 {
         return 0.0;
     }
 
+    let raw_len = text.chars().count();
+    if raw_len < 4 && tokens.len() <= 1 {
+        return 0.0;
+    }
+
     let spam_total = model.spam_tokens.values().sum::<u64>() as f64 + 1.0;
     let ham_total = model.ham_tokens.values().sum::<u64>() as f64 + 1.0;
     let vocab = (model.spam_tokens.len() + model.ham_tokens.len()).max(1) as f64;
-    let prior_spam = (model.spam_docs as f64 + 1.0) / ((model.spam_docs + model.ham_docs) as f64 + 2.0);
-    let prior_ham = 1.0 - prior_spam;
+    // Use a neutral prior so the model is not dominated by heavily spam-biased training batches.
+    let prior_spam: f64 = 0.5;
+    let prior_ham: f64 = 0.5;
 
     let mut log_spam = prior_spam.ln();
     let mut log_ham = prior_ham.ln();
@@ -923,12 +940,14 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
 
     match cmd {
         ModerationCommand::Start | ModerationCommand::Help => {
-            bot.send_message(message.chat.id, help_text()).parse_mode(ParseMode::Html).await?;
+            let is_maintainer = is_maintainer(&bot, &runtime.config, from_id).await;
+            bot.send_message(message.chat.id, help_text(is_maintainer)).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::MyId => {
             let uid = message.from.as_ref().map(|u| u.id.0.to_string()).unwrap_or_else(|| "unknown".to_string());
             let maintainer = if is_maintainer(&bot, &runtime.config, from_id).await { "yes" } else { "no" };
-            bot.send_message(message.chat.id, format!("你的 Telegram ID: <code>{uid}</code>\n是否在 MAINTAINER_IDS: {maintainer}")).parse_mode(ParseMode::Html).await?;
+            let body = format!("<b>你的資訊</b>\n• Telegram ID: <code>{uid}</code>\n• Maintainer: {maintainer}");
+            bot.send_message(message.chat.id, body).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::MyChat => {
             bot.send_message(message.chat.id, format!("這個群的 Chat ID: <code>{}</code>", message.chat.id.0)).parse_mode(ParseMode::Html).await?;
@@ -1143,6 +1162,18 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 _ => {}
             }
         }
+        ModerationCommand::MarkHam => {
+            if !is_maintainer(&bot, &runtime.config, from_id).await {
+                bot.send_message(message.chat.id, "只有維護人員可以使用 /mark_ham。") .await?;
+                return Ok(());
+            }
+            let Some(text) = message.reply_to_message().and_then(|m| m.text().or(m.caption())) else {
+                bot.send_message(message.chat.id, "請回覆一條訊息作為 ham 樣本。") .await?;
+                return Ok(());
+            };
+            train_ham(&runtime, &from_name(from), text, None).await.ok();
+            bot.send_message(message.chat.id, "已將該樣本寫入 ham 模型。") .await?;
+        }
         ModerationCommand::MlPurge(case_id) => {
             if !is_maintainer(&bot, &runtime.config, from_id).await {
                 bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
@@ -1264,6 +1295,16 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             bot.send_message(message.chat.id, format!("已啟動批量訓練，模式: {mode}。"))
                 .await?;
         }
+        ModerationCommand::MlStartMassHam => {
+            if !message.chat.is_private() || !is_maintainer(&bot, &runtime.config, from_id).await {
+                bot.send_message(message.chat.id, "只允許維護者在私訊中啟動批量訓練。") .await?;
+                return Ok(());
+            }
+            runtime.start_mass_train(from_id).await;
+            runtime.set_mass_train_mode(from_id, "ham" ).await;
+            bot.send_message(message.chat.id, "已啟動批量訓練，模式: ham。接下來你在這個私訊中傳送的純文本訊息會被收集；完成後使用 /ml_finish_mass_ham。")
+                .await?;
+        }
         ModerationCommand::MlDebugParse => {
             if !message.chat.is_private() || !is_maintainer(&bot, &runtime.config, from_id).await {
                 bot.send_message(message.chat.id, "只允許維護者在私訊中使用 /ml_debug_parse。") .await?;
@@ -1319,9 +1360,27 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             bot.send_message(message.chat.id, format!("批量訓練完成。spam: {spam_count}, ham: {ham_count}\n\n已提取並訓練的字串：\n{debug}")).await?;
             runtime.clear_mass_train(from_id).await;
         }
+        ModerationCommand::MlFinishMassHam => {
+            if !message.chat.is_private() || !is_maintainer(&bot, &runtime.config, from_id).await {
+                bot.send_message(message.chat.id, "只允許維護者在私訊中結束批量訓練。") .await?;
+                return Ok(());
+            }
+            let samples = runtime.finish_mass_train(from_id).await;
+            let mut imported = Vec::new();
+            let mut count = 0usize;
+            for sample in samples {
+                if sample.trim().is_empty() { continue; }
+                imported.push(sample.clone());
+                train_ham(&runtime, "mass-train", &sample, None).await.ok();
+                count += 1;
+            }
+            bot.send_message(message.chat.id, format!("批量訓練完成。ham: {count}\n\n已提取並訓練的字串：\n{}", if imported.is_empty() { "無可提取樣本".to_string() } else { imported.join("\n---\n") })).await?;
+            runtime.clear_mass_train(from_id).await;
+        }
         ModerationCommand::Unknown => {
             if message.chat.is_private() {
-                bot.send_message(message.chat.id, help_text()).parse_mode(ParseMode::Html).await?;
+                let is_maintainer = is_maintainer(&bot, &runtime.config, from_id).await;
+                bot.send_message(message.chat.id, help_text(is_maintainer)).parse_mode(ParseMode::Html).await?;
             }
         }
     }
