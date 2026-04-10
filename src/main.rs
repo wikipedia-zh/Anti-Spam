@@ -4,6 +4,7 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, env, path::PathBuf, sync::Arc};
 use teloxide::{prelude::*, types::{CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, MessageId, ParseMode, UserId}};
+use url::Url;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -12,6 +13,7 @@ struct Config {
     bot_token: String,
     log_channel_id: i64,
     report_channel_id: i64,
+    test_group_id: Option<i64>,
     maintainer_ids: Vec<i64>,
     data_dir: PathBuf,
     sqlite_path: PathBuf,
@@ -27,6 +29,7 @@ impl Config {
         let report_channel_id = env::var("REPORT_CHANNEL_ID")
             .context("REPORT_CHANNEL_ID is required")?
             .parse()?;
+        let test_group_id = env::var("TEST_GROUP_ID").ok().and_then(|v| v.parse::<i64>().ok());
         let maintainer_ids = env::var("MAINTAINER_IDS")
             .unwrap_or_default()
             .split(',')
@@ -42,6 +45,7 @@ impl Config {
             bot_token,
             log_channel_id,
             report_channel_id,
+            test_group_id,
             maintainer_ids,
             data_dir: PathBuf::from(data_dir),
             sqlite_path: PathBuf::from(sqlite_path),
@@ -119,6 +123,7 @@ struct ModelState {
 struct Runtime {
     config: Config,
     sqlite_path: PathBuf,
+    project_chat: Mutex<Option<i64>>,
     model: Mutex<ModelState>,
     mass_train_buffer: Mutex<HashMap<i64, Vec<String>>>,
     mass_train_mode: Mutex<HashMap<i64, String>>,
@@ -131,7 +136,8 @@ impl Runtime {
         let conn = Connection::open(&sqlite_path)?;
         Self::init_db(&conn)?;
         let model = Self::load_model(&conn)?;
-        Ok(Self { config, sqlite_path, model: Mutex::new(model), mass_train_buffer: Mutex::new(HashMap::new()), mass_train_mode: Mutex::new(HashMap::new()) })
+        let project_chat = Self::load_project_chat(&conn)?;
+        Ok(Self { config, sqlite_path, project_chat: Mutex::new(project_chat), model: Mutex::new(model), mass_train_buffer: Mutex::new(HashMap::new()), mass_train_mode: Mutex::new(HashMap::new()) })
     }
 
     fn open_conn(&self) -> Result<Connection> {
@@ -214,6 +220,17 @@ impl Runtime {
         if let Some(row) = rows.next()? {
             let value: String = row.get(0)?;
             Ok(value.parse::<f64>().ok())
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn load_project_chat(conn: &Connection) -> Result<Option<i64>> {
+        let mut stmt = conn.prepare("SELECT value FROM model_meta WHERE key = 'project_chat_id'")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let value: String = row.get(0)?;
+            Ok(value.parse::<i64>().ok())
         } else {
             Ok(None)
         }
@@ -421,6 +438,22 @@ impl Runtime {
         modes.remove(&user_id);
     }
 
+    async fn set_project_chat(&self, chat_id: i64) {
+        if let Ok(conn) = self.open_conn() {
+            let _ = conn.execute(
+                "INSERT INTO model_meta (key, value) VALUES ('project_chat_id', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![chat_id.to_string()],
+            );
+        }
+        let mut project_chat = self.project_chat.lock().await;
+        *project_chat = Some(chat_id);
+    }
+
+    async fn project_chat(&self) -> Option<i64> {
+        let project_chat = self.project_chat.lock().await;
+        *project_chat
+    }
+
     async fn training_stats(&self) -> Result<(u64, u64, u64)> {
         let conn = self.open_conn()?;
         let spam: u64 = conn.query_row("SELECT COUNT(*) FROM training_samples WHERE label='spam'", [], |row| row.get(0))?;
@@ -457,7 +490,10 @@ enum ModerationCommand {
     Start,
     Help,
     MyId,
+    MyChat,
     ScoreTest(String),
+    SetChat(String),
+    Leave(String),
     SpamBan,
     Mute,
     Kick,
@@ -488,9 +524,12 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/start" => ModerationCommand::Start,
         "/help" => ModerationCommand::Help,
         "/myid" | "/id" => ModerationCommand::MyId,
+        "/mychat" => ModerationCommand::MyChat,
         "/spam" | "/report" => ModerationCommand::SpamReport,
         "/case" | "/lookup" => ModerationCommand::CaseLookup(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/ml_score" | "/score" => ModerationCommand::ScoreTest(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
+        "/setchat" => ModerationCommand::SetChat(text.split_whitespace().nth(1).unwrap_or("").to_string()),
+        "/leave" => ModerationCommand::Leave(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
         "/ml_train_spam" => ModerationCommand::MlTrainSpam,
         "/ml_clean_spam" => ModerationCommand::MlCleanSpam,
         "/ml_stats" => ModerationCommand::MlStats,
@@ -645,7 +684,7 @@ fn smart_train_payloads(input: &str) -> Vec<String> {
 }
 
 fn help_text() -> &'static str {
-    "<b>Not So Smart Anti-Spam Bot</b>\n\n<blockquote>指令總覽</blockquote>\n\n<b>管理員</b>\n<code>/spamban</code> 或 <code>/sb</code>：回覆訊息後封禁+踢出+訓練\n<code>/mute</code> 或 <code>/m</code>：回覆訊息後禁言\n<code>/kick</code> 或 <code>/k</code>：回覆訊息後踢出\n\n<b>所有人</b>\n<code>/spam</code> 或 <code>/report</code>：回覆可疑 spam 送審\n<code>/case &lt;id&gt;</code>：查詢案件\n<code>/ml_score</code>：測試文本分數，可直接帶文本或回覆訊息\n\n<b>項目組</b>\n<code>/ml_train_spam</code>、<code>/ml_clean_spam</code>：單筆訓練/洗樣本\n<code>/ml_purge &lt;case_id&gt;</code>、<code>/ml_purge_text &lt;文字片段&gt;</code>：清除誤樣本\n<code>/ml_rebuild</code>：重建模型\n<code>/ml_stats</code>：查看樣本與門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整自動封禁門檻\n<code>/ml_export</code>：匯出訓練資料\n<code>/ml_start_mass_train_smart</code>：貼原始日志，自動抽正文全當 spam\n<code>/ml_start_mass_train_plain</code>：逐條手工標註\n<code>/ml_finish_mass_train</code>：結束批量訓練\n<code>/ml_debug_parse</code>：測試 smart 抽取"
+    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n\n<b>項目組指令：</b>\n<code>/ml_train_spam</code>、<code>/ml_clean_spam</code>：單筆訓練/洗樣本\n<code>/ml_purge &lt;case_id&gt;</code>、<code>/ml_purge_text &lt;文字片段&gt;</code>：清除誤樣本\n<code>/ml_rebuild</code>：重建模型\n<code>/ml_stats</code>：查看樣本與門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整自動封禁門檻\n<code>/ml_export</code>：匯出訓練資料\n<code>/ml_start_mass_train_smart</code>：貼原始日志，自動抽正文全當 spam\n<code>/ml_start_mass_train_plain</code>：逐條手工標註\n<code>/ml_finish_mass_train</code>：結束批量訓練\n<code>/ml_debug_parse</code>：測試 smart 抽取"
 }
 
 fn score_spam(model: &ModelState, display_name: &str, text: &str) -> f64 {
@@ -723,6 +762,15 @@ fn short_user(user: &teloxide::types::User) -> String {
     } else {
         name
     }
+}
+
+fn is_special_user(config: &Config, user_id: i64) -> bool {
+    config.maintainer_ids.contains(&user_id)
+}
+
+fn project_chat_link(chat_id: i64) -> String {
+    let id = chat_id.abs().to_string().trim_start_matches("100").to_string();
+    format!("https://t.me/c/{id}/1")
 }
 
 fn from_name(user: &teloxide::types::User) -> String {
@@ -847,7 +895,14 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let maintainer = if is_maintainer(&bot, &runtime.config, from_id).await { "yes" } else { "no" };
             bot.send_message(message.chat.id, format!("你的 Telegram ID: <code>{uid}</code>\n是否在 MAINTAINER_IDS: {maintainer}")).parse_mode(ParseMode::Html).await?;
         }
+        ModerationCommand::MyChat => {
+            bot.send_message(message.chat.id, format!("這個群的 Chat ID: <code>{}</code>", message.chat.id.0)).parse_mode(ParseMode::Html).await?;
+        }
         ModerationCommand::ScoreTest(text) => {
+            if !is_maintainer(&bot, &runtime.config, from_id).await {
+                bot.send_message(message.chat.id, "只有維護人員可以使用 /ml_score。") .await?;
+                return Ok(());
+            }
             let text = if text.trim().is_empty() {
                 message
                     .reply_to_message()
@@ -868,6 +923,37 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let threshold = runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold);
             bot.send_message(message.chat.id, format!("<b>Score</b>: {score:.4}\n<b>Threshold</b>: {threshold:.4}\n<b>Verdict</b>: {}", if score >= threshold { "spam" } else { "ham" })).parse_mode(ParseMode::Html).await?;
         }
+        ModerationCommand::SetChat(chat_id) => {
+            if !is_maintainer(&bot, &runtime.config, from_id).await {
+                bot.send_message(message.chat.id, "只有維護人員可以設定項目交流群。") .await?;
+                return Ok(());
+            }
+            let Some(value) = chat_id.parse::<i64>().ok() else {
+                bot.send_message(message.chat.id, "請提供有效的 Chat ID。") .await?;
+                return Ok(());
+            };
+            runtime.set_project_chat(value).await;
+            bot.send_message(message.chat.id, format!("已設定項目交流群為 <code>{value}</code>")).parse_mode(ParseMode::Html).await?;
+        }
+        ModerationCommand::Leave(reason) => {
+            if !is_maintainer(&bot, &runtime.config, from_id).await {
+                bot.send_message(message.chat.id, "只有維護人員可以使用 /leave。") .await?;
+                return Ok(());
+            }
+            let reason = if reason.trim().is_empty() { "違反使用規則".to_string() } else { reason };
+            let project_chat = match runtime.project_chat().await {
+                Some(id) => id,
+                None => {
+                    bot.send_message(message.chat.id, "尚未設定項目交流群，請先使用 /setchat。") .await?;
+                    return Ok(());
+                }
+            };
+            let text = format!("已停止為此群提供服務。原因：{}", escape_html(&reason));
+            let button = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::url("前往項目交流群查詢", Url::parse(&project_chat_link(project_chat)).unwrap())]]);
+            let _ = bot.send_message(message.chat.id, text).parse_mode(ParseMode::Html).reply_markup(button).await;
+            let _ = bot.leave_chat(message.chat.id).await;
+            bot.send_message(message.chat.id, "已退出此群。") .await?;
+        }
         ModerationCommand::SpamBan | ModerationCommand::Mute | ModerationCommand::Kick => {
             let Some((target_id, target_name, source_id, evidence_text)) = extract_reply_context(&message).await else {
                 bot.send_message(message.chat.id, "請回覆一條訊息後再使用此指令。").await?;
@@ -879,8 +965,8 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 return Ok(());
             }
 
-            if is_group_admin(&bot, message.chat.id, target_id).await {
-                bot.send_message(message.chat.id, "不能對群組管理員執行 /sb /spamban。").await?;
+            if is_group_admin(&bot, message.chat.id, target_id).await || is_special_user(&runtime.config, target_id) {
+                bot.send_message(message.chat.id, "不能對群組管理員或項目維護人員執行此指令。").await?;
                 return Ok(());
             }
 
@@ -1294,7 +1380,7 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
     if user.is_bot {
         return Ok(());
     }
-    if is_group_admin(&bot, message.chat.id, user.id.0 as i64).await {
+    if is_group_admin(&bot, message.chat.id, user.id.0 as i64).await || is_special_user(&runtime.config, user.id.0 as i64) {
         return Ok(());
     }
     let Some(text) = message.text().or(message.caption()) else { return Ok(()); };
@@ -1335,11 +1421,47 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
     Ok(())
 }
 
+async fn score_only(bot: &Bot, runtime: &Runtime, message: &Message) -> ResponseResult<()> {
+    let Some(user) = message.from.as_ref() else { return Ok(()); };
+    if user.is_bot {
+        return Ok(());
+    }
+    let Some(text) = message.text().or(message.caption()) else { return Ok(()); };
+    let model = runtime.model.lock().await;
+    let display_name = short_user(user);
+    let score = score_spam(&model, &display_name, text);
+    drop(model);
+    let threshold = runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold);
+    let verdict = if score >= threshold { "spam" } else { "ham" };
+    let reply = format!("<b>Score</b>: {score:.4}\n<b>Threshold</b>: {threshold:.4}\n<b>Verdict</b>: {verdict}");
+    bot.send_message(message.chat.id, reply).parse_mode(ParseMode::Html).await?;
+    Ok(())
+}
+
+async fn ensure_bot_can_moderate(bot: &Bot, _runtime: &Runtime, chat_id: ChatId) -> ResponseResult<bool> {
+    let me = bot.get_me().await?;
+    let member = match bot.get_chat_member(chat_id, me.id).await {
+        Ok(m) => m,
+        Err(_) => {
+            let _ = bot.send_message(chat_id, "機器人無法檢查權限，將退出此群。請確認管理員權限後再邀請。" ).await;
+            let _ = bot.leave_chat(chat_id).await;
+            return Ok(false);
+        }
+    };
+    let status = format!("{:?}", member);
+    let allowed = status.contains("Administrator") || status.contains("Owner");
+    if !allowed {
+        let _ = bot.send_message(chat_id, "機器人缺乏足夠的管理員權限，將退出此群。請確認至少具備刪訊息、封禁、解除封禁、禁言、踢出權限。" ).await;
+        let _ = bot.leave_chat(chat_id).await;
+    }
+    Ok(allowed)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_env()?;
+    let bot = Bot::new(config.bot_token.clone());
     let runtime = Arc::new(Runtime::load(config).await?);
-    let bot = Bot::new(runtime.config.bot_token.clone());
 
     let message_handler = Update::filter_message().endpoint({
         let runtime = runtime.clone();
@@ -1353,14 +1475,29 @@ async fn main() -> Result<()> {
                         }
                         return Ok(());
                     }
+                    if runtime.config.test_group_id == Some(message.chat.id.0) {
+                        return score_only(&bot, &runtime, &message).await;
+                    }
                     if message.chat.is_private() {
                         return handle_command(bot, runtime, message).await;
+                    }
+                    if !ensure_bot_can_moderate(&bot, &runtime, message.chat.id).await? {
+                        return Ok(());
                     }
                     if matches!(parse_command(text), ModerationCommand::Unknown) {
                         auto_moderate(bot, runtime, message).await?;
                         return Ok(());
                     }
                 } else {
+                    if runtime.config.test_group_id == Some(message.chat.id.0) {
+                        return score_only(&bot, &runtime, &message).await;
+                    }
+                    if message.chat.is_private() {
+                        return handle_command(bot, runtime, message).await;
+                    }
+                    if !ensure_bot_can_moderate(&bot, &runtime, message.chat.id).await? {
+                        return Ok(());
+                    }
                     auto_moderate(bot, runtime, message).await?;
                     return Ok(());
                 }
