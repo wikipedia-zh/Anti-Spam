@@ -820,6 +820,20 @@ fn is_special_user(config: &Config, user_id: i64) -> bool {
     config.maintainer_ids.contains(&user_id)
 }
 
+fn parse_leave_args(args: &str) -> (Option<i64>, String) {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return (None, String::new());
+    }
+    let mut parts = trimmed.split_whitespace();
+    let first = parts.next().unwrap_or("");
+    if let Ok(chat_id) = first.parse::<i64>() {
+        let reason = parts.collect::<Vec<_>>().join(" ");
+        return (Some(chat_id), reason);
+    }
+    (None, trimmed.to_string())
+}
+
 fn project_chat_link(chat_id: i64) -> String {
     let id = chat_id.abs().to_string().trim_start_matches("100").to_string();
     format!("https://t.me/c/{id}/1")
@@ -994,7 +1008,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "只有維護人員可以使用 /leave。") .await?;
                 return Ok(());
             }
+            let (target_chat_id, reason) = parse_leave_args(&reason);
             let reason = if reason.trim().is_empty() { "違反使用規則".to_string() } else { reason };
+            let target_chat_id = target_chat_id.unwrap_or(message.chat.id.0);
             let project_chat = match runtime.project_chat().await {
                 Some(id) => id,
                 None => {
@@ -1004,9 +1020,8 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             };
             let text = format!("已停止為此群提供服務。原因：{}", escape_html(&reason));
             let button = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::url("前往項目交流群查詢", Url::parse(&project_chat_link(project_chat)).unwrap())]]);
-            let _ = bot.send_message(message.chat.id, text).parse_mode(ParseMode::Html).reply_markup(button).await;
-            let _ = bot.leave_chat(message.chat.id).await;
-            bot.send_message(message.chat.id, "已退出此群。") .await?;
+            let _ = bot.send_message(ChatId(target_chat_id), text).parse_mode(ParseMode::Html).reply_markup(button).await;
+            let _ = bot.leave_chat(ChatId(target_chat_id)).await;
         }
         ModerationCommand::SpamBan | ModerationCommand::Mute | ModerationCommand::Kick => {
             let Some((target_id, target_name, source_id, evidence_text)) = extract_reply_context(&message).await else {
@@ -1555,6 +1570,23 @@ async fn score_only(bot: &Bot, runtime: &Runtime, message: &Message) -> Response
     Ok(())
 }
 
+async fn silent_auto_ham(runtime: &Runtime, message: &Message) -> ResponseResult<()> {
+    let Some(user) = message.from.as_ref() else { return Ok(()); };
+    if user.is_bot {
+        return Ok(());
+    }
+    let Some(text) = message.text().or(message.caption()) else { return Ok(()); };
+    let model = runtime.model.lock().await;
+    let display_name = short_user(user);
+    let score = score_spam(&model, &display_name, text);
+    drop(model);
+    let threshold = runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold);
+    if score < threshold {
+        train_ham(runtime, &display_name, text, None).await.ok();
+    }
+    Ok(())
+}
+
 async fn ensure_bot_can_moderate(bot: &Bot, _runtime: &Runtime, chat_id: ChatId) -> ResponseResult<bool> {
     let me = bot.get_me().await?;
     let member = match bot.get_chat_member(chat_id, me.id).await {
@@ -1592,28 +1624,34 @@ async fn main() -> Result<()> {
                         }
                         return Ok(());
                     }
-                    if runtime.config.test_group_id == Some(message.chat.id.0) {
-                        return score_only(&bot, &runtime, &message).await;
-                    }
                     if message.chat.is_private() {
                         return handle_command(bot, runtime, message).await;
                     }
+                    if runtime.config.test_group_id == Some(message.chat.id.0) {
+                        return score_only(&bot, &runtime, &message).await;
+                    }
                     if !ensure_bot_can_moderate(&bot, &runtime, message.chat.id).await? {
                         return Ok(());
+                    }
+                    if runtime.project_chat().await == Some(message.chat.id.0) {
+                        return silent_auto_ham(&runtime, &message).await;
                     }
                     if matches!(parse_command(text), ModerationCommand::Unknown) {
                         auto_moderate(bot, runtime, message).await?;
                         return Ok(());
                     }
                 } else {
-                    if runtime.config.test_group_id == Some(message.chat.id.0) {
-                        return score_only(&bot, &runtime, &message).await;
-                    }
                     if message.chat.is_private() {
                         return handle_command(bot, runtime, message).await;
                     }
+                    if runtime.config.test_group_id == Some(message.chat.id.0) {
+                        return score_only(&bot, &runtime, &message).await;
+                    }
                     if !ensure_bot_can_moderate(&bot, &runtime, message.chat.id).await? {
                         return Ok(());
+                    }
+                    if runtime.project_chat().await == Some(message.chat.id.0) {
+                        return silent_auto_ham(&runtime, &message).await;
                     }
                     auto_moderate(bot, runtime, message).await?;
                     return Ok(());
