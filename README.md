@@ -78,10 +78,12 @@ Set the following environment variables before running:
 - 只有 `TEST_GROUP_ID` 內的訊息只做評分、不封禁。
 - 提供 `/case <id>` 指令供任何人查詢特定案件的處置細節。
 - 提供 `/ml_score` 指令測試單條文本分數，僅 maintainer 可用。
-- 維護組可使用 `/ml_train_spam` 與 `/ml_clean_spam` 即時修正模型。
+- 維護組可使用 `/ml_train_spam`、`/ml_clean_spam` 與 `/mark_ham` 即時修正模型。
 - 支援從原始日誌中批量抽取正文訓練、重建模型、清除特定樣本以及動態調整封禁門檻。
+- 支援 `/ml_start_mass_ham` 與 `/ml_finish_mass_ham` 批量標記 ham。
 - `TEST_GROUP_ID` 內每條消息都會回傳分數，但不會觸發封禁。
 - 項目組指令僅 maintainer 可見。
+- `/ml_score_debug` 與 `/ml_score` 僅 maintainer 可用。
 
 ## 環境變數
 
