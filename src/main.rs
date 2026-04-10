@@ -509,6 +509,7 @@ enum ModerationCommand {
     MlRebuild,
     MlStartMassTrain,
     MlFinishMassTrain,
+    MlImport,
     MlStartMassTrainWithMode(String),
     MlDebugParse,
     Unknown,
@@ -540,6 +541,7 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/ml_rebuild" => ModerationCommand::MlRebuild,
         "/ml_start_mass_train" => ModerationCommand::MlStartMassTrain,
         "/ml_finish_mass_train" => ModerationCommand::MlFinishMassTrain,
+        "/import" => ModerationCommand::MlImport,
         "/ml_start_mass_train_smart" => ModerationCommand::MlStartMassTrainWithMode("smart".to_string()),
         "/ml_start_mass_train_plain" => ModerationCommand::MlStartMassTrainWithMode("plain".to_string()),
         "/ml_debug_parse" => ModerationCommand::MlDebugParse,
@@ -683,8 +685,41 @@ fn smart_train_payloads(input: &str) -> Vec<String> {
     out
 }
 
+fn import_train_payloads(input: &str) -> Vec<String> {
+    let normalized = input.replace("\r\n", "\n");
+    let mut collecting = false;
+    let mut out = Vec::new();
+
+    for line in normalized.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.contains("已提取並訓練的字串") {
+            collecting = true;
+            continue;
+        }
+        if !collecting {
+            continue;
+        }
+        if trimmed.starts_with("批量訓練完成") {
+            break;
+        }
+        if trimmed == "---" {
+            continue;
+        }
+        if trimmed.starts_with("spam:") || trimmed.starts_with("ham:") || trimmed.starts_with("總樣本:") || trimmed.starts_with("有效門檻:") {
+            continue;
+        }
+        out.push(trimmed.to_string());
+    }
+
+    out.dedup();
+    out
+}
+
 fn help_text() -> &'static str {
-    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n\n<b>項目組指令：</b>\n<code>/ml_train_spam</code>、<code>/ml_clean_spam</code>：單筆訓練/洗樣本\n<code>/ml_purge &lt;case_id&gt;</code>、<code>/ml_purge_text &lt;文字片段&gt;</code>：清除誤樣本\n<code>/ml_rebuild</code>：重建模型\n<code>/ml_stats</code>：查看樣本與門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整自動封禁門檻\n<code>/ml_export</code>：匯出訓練資料\n<code>/ml_start_mass_train_smart</code>：貼原始日志，自動抽正文全當 spam\n<code>/ml_start_mass_train_plain</code>：逐條手工標註\n<code>/ml_finish_mass_train</code>：結束批量訓練\n<code>/ml_debug_parse</code>：測試 smart 抽取"
+    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n\n<b>項目組指令（僅 maintainer 可見）：</b>\n<code>/ml_train_spam</code>、<code>/ml_clean_spam</code>：單筆訓練/洗樣本\n<code>/ml_purge &lt;case_id&gt;</code>、<code>/ml_purge_text &lt;文字片段&gt;</code>：清除誤樣本\n<code>/ml_rebuild</code>：重建模型\n<code>/ml_stats</code>：查看樣本與門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整自動封禁門檻\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_start_mass_train_smart</code>：貼原始日志，自動抽正文全當 spam\n<code>/ml_start_mass_train_plain</code>：逐條手工標註\n<code>/ml_finish_mass_train</code>：結束批量訓練\n<code>/ml_debug_parse</code>：測試 smart 抽取"
 }
 
 fn score_spam(model: &ModelState, display_name: &str, text: &str) -> f64 {
@@ -1185,6 +1220,29 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "正在匯出訓練資料，請稍候...").await?;
                 bot.send_document(message.chat.id, InputFile::memory(export.into_bytes()).file_name(filename)).await?;
             }
+        }
+        ModerationCommand::MlImport => {
+            if !is_maintainer(&bot, &runtime.config, from_id).await {
+                bot.send_message(message.chat.id, "只有維護人員可以使用 /import。") .await?;
+                return Ok(());
+            }
+            let Some(text) = message.reply_to_message().and_then(|m| m.text().or(m.caption())) else {
+                bot.send_message(message.chat.id, "請回覆一段匯出列表或輸出結果。") .await?;
+                return Ok(());
+            };
+            let payloads = import_train_payloads(text);
+            if payloads.is_empty() {
+                bot.send_message(message.chat.id, "沒有找到可匯入的訓練字串。") .await?;
+                return Ok(());
+            }
+            let mut count = 0usize;
+            let mut debug = Vec::new();
+            for payload in payloads {
+                debug.push(payload.clone());
+                train_spam(&runtime, &from_name(from), &payload, None).await.ok();
+                count += 1;
+            }
+            bot.send_message(message.chat.id, format!("已匯入並訓練 {count} 筆。\n\n匯入字串：\n{}", debug.join("\n---\n"))).await?;
         }
         ModerationCommand::MlStartMassTrain => {
             if !message.chat.is_private() || !is_maintainer(&bot, &runtime.config, from_id).await {
