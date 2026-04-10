@@ -74,9 +74,13 @@ Set the following environment variables before running:
 - 所有自動與手動操作皆寫入日誌頻道，並生成唯一的 case ID。
 - 管理員可透過回覆訊息執行 `/sb` (封禁並寫入模型)、`/mute` (禁言) 與 `/kick` (踢出)。
 - 使用者可透過 `/spam` 舉報訊息，交由維護組在私有頻道進行按鈕審核。
+- 群組管理員與維護人員不會在服務群被封禁。
+- 只有 `TEST_GROUP_ID` 內的訊息只做評分、不封禁。
 - 提供 `/case <id>` 指令供任何人查詢特定案件的處置細節。
+- 提供 `/ml_score` 指令測試單條文本分數。
 - 維護組可使用 `/ml_train_spam` 與 `/ml_clean_spam` 即時修正模型。
 - 支援從原始日誌中批量抽取正文訓練、重建模型、清除特定樣本以及動態調整封禁門檻。
+- `TEST_GROUP_ID` 內每條消息都會回傳分數，但不會觸發封禁。
 
 ## 環境變數
 
@@ -87,6 +91,7 @@ Set the following environment variables before running:
 | `BOT_TOKEN` | Telegram 機器人 Token。 |
 | `LOG_CHANNEL_ID` | 操作日誌頻道 ID。 |
 | `REPORT_CHANNEL_ID` | 舉報審核頻道 ID。 |
+| `TEST_GROUP_ID` | 測試群組 ID，所有消息只做評分不封禁。 |
 | `MAINTAINER_IDS` | 維護人員 User ID (多個以逗號分隔)。 |
 | `SQLITE_PATH` | 資料庫路徑 (預設 `data/bot.db`)。 |
 | `SPAM_THRESHOLD` | 自動封禁門檻 (預設 `0.85`)。 |
@@ -97,9 +102,10 @@ Set the following environment variables before running:
 2. 設定環境變數：
    ```bash
    export BOT_TOKEN="你的Token"
-   export LOG_CHANNEL_ID="-100..."
-   export REPORT_CHANNEL_ID="-100..."
-   export MAINTAINER_IDS="123,456"
+    export LOG_CHANNEL_ID="-100..."
+    export REPORT_CHANNEL_ID="-100..."
+    export TEST_GROUP_ID="-100..."
+    export MAINTAINER_IDS="123,456"
    ```
 3. 編譯並執行：
    ```bash
