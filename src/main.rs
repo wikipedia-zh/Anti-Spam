@@ -739,17 +739,11 @@ fn score_spam(model: &ModelState, display_name: &str, text: &str) -> f64 {
         return 0.0;
     }
 
-    let raw_len = text.chars().count();
-    if raw_len < 4 && tokens.len() <= 1 {
-        return 0.0;
-    }
-
     let spam_total = model.spam_tokens.values().sum::<u64>() as f64 + 1.0;
     let ham_total = model.ham_tokens.values().sum::<u64>() as f64 + 1.0;
     let vocab = (model.spam_tokens.len() + model.ham_tokens.len()).max(1) as f64;
-    // Use a neutral prior so the model is not dominated by heavily spam-biased training batches.
-    let prior_spam: f64 = 0.5;
-    let prior_ham: f64 = 0.5;
+    let prior_spam = (model.spam_docs as f64 + 1.0) / ((model.spam_docs + model.ham_docs) as f64 + 2.0);
+    let prior_ham = 1.0 - prior_spam;
 
     let mut log_spam = prior_spam.ln();
     let mut log_ham = prior_ham.ln();
@@ -1595,23 +1589,6 @@ async fn score_only(bot: &Bot, runtime: &Runtime, message: &Message) -> Response
     Ok(())
 }
 
-async fn silent_auto_ham(runtime: &Runtime, message: &Message) -> ResponseResult<()> {
-    let Some(user) = message.from.as_ref() else { return Ok(()); };
-    if user.is_bot {
-        return Ok(());
-    }
-    let Some(text) = message.text().or(message.caption()) else { return Ok(()); };
-    let model = runtime.model.lock().await;
-    let display_name = short_user(user);
-    let score = score_spam(&model, &display_name, text);
-    drop(model);
-    let threshold = runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold);
-    if score < threshold {
-        train_ham(runtime, &display_name, text, None).await.ok();
-    }
-    Ok(())
-}
-
 async fn ensure_bot_can_moderate(bot: &Bot, _runtime: &Runtime, chat_id: ChatId) -> ResponseResult<bool> {
     let me = bot.get_me().await?;
     let member = match bot.get_chat_member(chat_id, me.id).await {
@@ -1659,9 +1636,6 @@ async fn main() -> Result<()> {
                     if !ensure_bot_can_moderate(&bot, &runtime, message.chat.id).await? {
                         return Ok(());
                     }
-                    if runtime.project_chat().await == Some(message.chat.id.0) {
-                        return silent_auto_ham(&runtime, &message).await;
-                    }
                     if matches!(parse_command(text), ModerationCommand::Unknown) {
                         auto_moderate(bot, runtime, message).await?;
                         return Ok(());
@@ -1675,9 +1649,6 @@ async fn main() -> Result<()> {
                     }
                     if !ensure_bot_can_moderate(&bot, &runtime, message.chat.id).await? {
                         return Ok(());
-                    }
-                    if runtime.project_chat().await == Some(message.chat.id.0) {
-                        return silent_auto_ham(&runtime, &message).await;
                     }
                     auto_moderate(bot, runtime, message).await?;
                     return Ok(());
