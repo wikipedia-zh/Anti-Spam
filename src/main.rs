@@ -820,6 +820,21 @@ fn is_special_user(config: &Config, user_id: i64) -> bool {
     config.maintainer_ids.contains(&user_id)
 }
 
+async fn notify_bot_added(bot: &Bot, runtime: &Runtime, message: &Message) {
+    if let Some(users) = message.new_chat_members() {
+        if users.iter().any(|u| u.is_bot) {
+            let title = message.chat.title().unwrap_or("unknown");
+            let text = format!(
+                "<b>Bot Added</b>\n<b>Chat</b>: <code>{}</code>\n<b>Title</b>: {}\n<b>By</b>: <code>{}</code>",
+                message.chat.id.0,
+                escape_html(title),
+                message.from.as_ref().map(short_user).unwrap_or_else(|| "unknown".to_string())
+            );
+            let _ = bot.send_message(ChatId(runtime.config.report_channel_id), text).parse_mode(ParseMode::Html).await;
+        }
+    }
+}
+
 fn parse_leave_args(args: &str) -> (Option<i64>, String) {
     let trimmed = args.trim();
     if trimmed.is_empty() {
@@ -958,9 +973,14 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             bot.send_message(message.chat.id, help_text(is_maintainer)).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::MyId => {
-            let uid = message.from.as_ref().map(|u| u.id.0.to_string()).unwrap_or_else(|| "unknown".to_string());
+            let target_user = message
+                .reply_to_message()
+                .and_then(|m| m.from.as_ref())
+                .or_else(|| message.from.as_ref());
+            let uid = target_user.map(|u| u.id.0.to_string()).unwrap_or_else(|| "unknown".to_string());
+            let target_name = target_user.map(short_user).unwrap_or_else(|| "unknown".to_string());
             let maintainer = if is_maintainer(&bot, &runtime.config, from_id).await { "yes" } else { "no" };
-            let body = format!("<b>你的資訊</b>\n• Telegram ID: <code>{uid}</code>\n• Maintainer: {maintainer}");
+            let body = format!("<b>查詢結果</b>\n• 對象: <code>{target_name}</code>\n• Telegram ID: <code>{uid}</code>\n• Maintainer: {maintainer}");
             bot.send_message(message.chat.id, body).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::MyChat => {
@@ -1617,6 +1637,7 @@ async fn main() -> Result<()> {
         move |bot: Bot, message: Message| {
             let runtime = runtime.clone();
             async move {
+                notify_bot_added(&bot, &runtime, &message).await;
                 if let Some(text) = message.text() {
                     if text.trim_start().starts_with('/') {
                         if !matches!(parse_command(text), ModerationCommand::Unknown) {
