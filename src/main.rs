@@ -973,13 +973,18 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             bot.send_message(message.chat.id, help_text(is_maintainer)).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::MyId => {
+            let requester = message.from.as_ref();
             let target_user = message
                 .reply_to_message()
                 .and_then(|m| m.from.as_ref())
-                .or_else(|| message.from.as_ref());
+                .or(requester);
             let uid = target_user.map(|u| u.id.0.to_string()).unwrap_or_else(|| "unknown".to_string());
             let target_name = target_user.map(short_user).unwrap_or_else(|| "unknown".to_string());
-            let maintainer = if is_maintainer(&bot, &runtime.config, from_id).await { "yes" } else { "no" };
+            let maintainer = if let Some(user) = target_user {
+                if is_maintainer(&bot, &runtime.config, user.id.0 as i64).await { "yes" } else { "no" }
+            } else {
+                "no"
+            };
             let body = format!("<b>查詢結果</b>\n• 對象: <code>{target_name}</code>\n• Telegram ID: <code>{uid}</code>\n• Maintainer: {maintainer}");
             bot.send_message(message.chat.id, body).parse_mode(ParseMode::Html).await?;
         }
