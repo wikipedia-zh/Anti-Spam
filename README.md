@@ -84,6 +84,8 @@ Set the following environment variables before running:
 - `TEST_GROUP_ID` 內每條消息都會回傳分數，但不會觸發封禁。
 - 項目組指令僅 maintainer 可見。
 - `/ml_score_debug` 與 `/ml_score` 僅 maintainer 可用。
+- `/id` 可查自己；回覆一條訊息時可查回覆對象。
+- 機器人被加入群組時，會通知到舉報處理頻道。
 
 ## 環境變數
 
