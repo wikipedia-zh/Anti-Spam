@@ -71,7 +71,6 @@ impl<'a> teloxide::update_listeners::AsUpdateStream<'a> for RawJsonPolling {
                     }
                 };
 
-                let matched = rules.iter().any(|rule| rule.is_match(&raw));
                 let value: Value = match serde_json::from_str(&raw) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -86,7 +85,10 @@ impl<'a> teloxide::update_listeners::AsUpdateStream<'a> for RawJsonPolling {
                         offset = id + 1;
                     }
 
-                    if matched {
+                    let upd_str = upd.to_string();
+                    let is_spam = rules.iter().any(|rule| rule.is_match(&upd_str));
+
+                    if is_spam {
                         if let Some(message) = upd.get("message") {
                             if let (Some(chat_id), Some(message_id), Some(user_id)) = (
                                 message.get("chat").and_then(|c| c.get("id")).and_then(|v| v.as_i64()),
