@@ -1265,16 +1265,6 @@ fn extract_full_text(msg: &Message) -> String {
         }
     }
 
-    if let Some(reply) = msg.reply_to_message() {
-        let reply_text = reply.text().or(reply.caption()).unwrap_or("").trim().to_string();
-        if !reply_text.is_empty() {
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str(&reply_text);
-        }
-    }
-
     if let Some(origin) = msg.forward_origin() {
         if !text.is_empty() {
             text.push('\n');
@@ -1304,7 +1294,21 @@ fn extract_full_text(msg: &Message) -> String {
                     text.push_str(&format!("[external_origin_username: {}]\n", username));
                 }
             }
-            text.push_str(&format!("[external_reply_origin: {:?}]\n", external.origin));
+            match &external.origin {
+                teloxide::types::MessageOrigin::Channel { chat, .. } => {
+                    text.push_str(&format!("[external_reply_origin_channel_id: {}]\n", chat.id.0));
+                    if let Some(username) = chat.username() {
+                        text.push_str(&format!("[external_reply_origin_channel_username: {}]\n", username));
+                    }
+                }
+                teloxide::types::MessageOrigin::Chat { sender_chat, .. } => {
+                    text.push_str(&format!("[external_reply_origin_chat_id: {}]\n", sender_chat.id.0));
+                    if let Some(username) = sender_chat.username() {
+                        text.push_str(&format!("[external_reply_origin_chat_username: {}]\n", username));
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -1359,11 +1363,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "只有維護人員可以使用 /ml_score。") .await?;
                 return Ok(());
             }
+            let target_msg = message.reply_to_message().unwrap_or(&message);
             let text = if text.trim().is_empty() {
-                message
-                    .reply_to_message()
-                    .map(extract_full_text)
-                    .unwrap_or_default()
+                extract_full_text(target_msg)
             } else {
                 text
             };
@@ -1565,7 +1567,8 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
                 return Ok(());
             }
-            let text = message.reply_to_message().map(extract_full_text).unwrap_or_default();
+            let target_msg = message.reply_to_message().unwrap_or(&message);
+            let text = extract_full_text(target_msg);
             if text.trim().is_empty() {
                 bot.send_message(message.chat.id, "請回覆一條訊息來訓練或清洗模型。").await?;
                 return Ok(());
@@ -1587,7 +1590,8 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "只有維護人員可以使用 /mark_ham。") .await?;
                 return Ok(());
             }
-            let text = message.reply_to_message().map(extract_full_text).unwrap_or_default();
+            let target_msg = message.reply_to_message().unwrap_or(&message);
+            let text = extract_full_text(target_msg);
             if text.trim().is_empty() {
                 bot.send_message(message.chat.id, "請回覆一條訊息作為 ham 樣本。") .await?;
                 return Ok(());
@@ -1710,7 +1714,8 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "只有維護人員可以使用 /import。") .await?;
                 return Ok(());
             }
-            let text = message.reply_to_message().map(extract_full_text).unwrap_or_default();
+            let target_msg = message.reply_to_message().unwrap_or(&message);
+            let text = extract_full_text(target_msg);
             if text.trim().is_empty() {
                 bot.send_message(message.chat.id, "請回覆一段匯出列表或輸出結果。") .await?;
                 return Ok(());
@@ -1764,7 +1769,8 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "只允許維護者在私訊中使用 /ml_debug_parse。") .await?;
                 return Ok(());
             }
-            let text = message.reply_to_message().map(extract_full_text).unwrap_or_default();
+            let target_msg = message.reply_to_message().unwrap_or(&message);
+            let text = extract_full_text(target_msg);
             if text.trim().is_empty() {
                 bot.send_message(message.chat.id, "請回覆一段日誌或訊息內容。") .await?;
                 return Ok(());
@@ -1782,7 +1788,8 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "只有維護人員可以使用 /ml_score_debug。") .await?;
                 return Ok(());
             }
-            let text = extract_full_text(&message);
+            let target_msg = message.reply_to_message().unwrap_or(&message);
+            let text = extract_full_text(target_msg);
             if text.trim().is_empty() {
                 bot.send_message(message.chat.id, "請回覆一條消息或提供內容。") .await?;
                 return Ok(());
