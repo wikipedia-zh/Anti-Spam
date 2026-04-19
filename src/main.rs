@@ -2139,23 +2139,6 @@ async fn main() -> Result<()> {
         .inspect(|u: teloxide::types::Update| {
             println!("=> [DISPATCHER RECEIVED UPDATE]: ID {:?}", u.id);
         })
-        .filter_async(|update: teloxide::types::Update, runtime: Arc<Runtime>| async move {
-            if let teloxide::types::UpdateKind::Message(msg) = update.kind {
-                let text = extract_full_text(&msg);
-                let suspicious = text.contains("-1003547149544") || text.contains("手机拍照项目");
-                if suspicious {
-                    log::info!("Root Filter: Dropping known spam pattern immediately.");
-                    return false;
-                }
-
-                let rules = runtime.spam_rules.read().await;
-                if rules.iter().any(|rule| rule.regex.is_match(&text)) {
-                    log::info!("Root Filter: Dropping regex-matched update immediately.");
-                    return false;
-                }
-            }
-            true
-        })
         .branch(message_handler)
         .branch(callback_handler);
 
