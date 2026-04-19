@@ -678,11 +678,13 @@ impl Runtime {
         .await?
     }
 
-    async fn inspect_message(&self, display_name: &str, text: &str) -> Result<InspectionResult> {
-        let haystack = feature_text(display_name, text);
+    async fn inspect_message(&self, _display_name: &str, text: &str) -> Result<InspectionResult> {
         let rules = self.spam_rules.read().await;
+        if tokenize(text).is_empty() {
+            return Ok(InspectionResult::Ham { score: 0.0 });
+        }
         for rule in rules.iter() {
-            if rule.regex.is_match(&haystack) {
+            if rule.regex.is_match(text) {
                 return Ok(InspectionResult::Spam {
                     score: 1.0,
                     matched_rule: Some(MatchedRule {
@@ -696,37 +698,17 @@ impl Runtime {
         drop(rules);
 
         let model = self.model.lock().await;
-        let score = score_spam(&model, display_name, text);
+        let score = score_spam_from_text(&model, text);
         Ok(InspectionResult::Ham { score })
     }
 
-    async fn score_debug(&self, display_name: &str, text: &str) -> Result<ScoreDebugReport> {
-        let tokens = tokenize(&feature_text(display_name, text));
-        let model = self.model.lock().await;
-        let spam_total = model.spam_tokens.values().sum::<u64>() as f64 + 1.0;
-        let ham_total = model.ham_tokens.values().sum::<u64>() as f64 + 1.0;
-        let vocab = (model.spam_tokens.len() + model.ham_tokens.len()).max(1) as f64;
-        let prior_spam = (model.spam_docs as f64 + 1.0) / ((model.spam_docs + model.ham_docs) as f64 + 2.0);
-        let prior_ham = 1.0 - prior_spam;
-
-        let mut log_spam = prior_spam.ln();
-        let mut log_ham = prior_ham.ln();
-        let mut contributions = Vec::new();
-
-        for token in tokens {
-            let spam_count = *model.spam_tokens.get(&token).unwrap_or(&0);
-            let ham_count = *model.ham_tokens.get(&token).unwrap_or(&0);
-            let spam_prob = (spam_count as f64 + 1.0) / (spam_total + vocab);
-            let ham_prob = (ham_count as f64 + 1.0) / (ham_total + vocab);
-            let delta = spam_prob.ln() - ham_prob.ln();
-            log_spam += spam_prob.ln();
-            log_ham += ham_prob.ln();
-            contributions.push(ScoreContribution { token, spam_count, ham_count, spam_prob, ham_prob, delta });
+    async fn score_debug(&self, _display_name: &str, text: &str) -> Result<ScoreDebugReport> {
+        let tokens = tokenize(text);
+        if tokens.is_empty() {
+            return Ok(ScoreDebugReport { score: 0.0, tokens: Vec::new() });
         }
-
-        let odds = (log_spam - log_ham).exp();
-        let score = odds / (1.0 + odds);
-        Ok(ScoreDebugReport { score, tokens: contributions })
+        let model = self.model.lock().await;
+        Ok(score_debug_from_text(&model, text))
     }
 }
 
@@ -828,10 +810,6 @@ fn normalize_tokens(text: &str, jieba: &Jieba) -> Vec<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty() && s.chars().count() > 1)
         .collect()
-}
-
-fn feature_text(display_name: &str, text: &str) -> String {
-    format!("{display_name} {text}")
 }
 
 fn extract_smart_spam_text(input: &str) -> Option<String> {
@@ -999,32 +977,6 @@ fn help_text(is_maintainer: bool) -> String {
     text
 }
 
-fn score_spam(model: &ModelState, display_name: &str, text: &str) -> f64 {
-    let tokens = tokenize(&feature_text(display_name, text));
-    if tokens.is_empty() {
-        return 0.0;
-    }
-
-    let spam_total = model.spam_tokens.values().sum::<u64>() as f64 + 1.0;
-    let ham_total = model.ham_tokens.values().sum::<u64>() as f64 + 1.0;
-    let vocab = (model.spam_tokens.len() + model.ham_tokens.len()).max(1) as f64;
-    let prior_spam = (model.spam_docs as f64 + 1.0) / ((model.spam_docs + model.ham_docs) as f64 + 2.0);
-    let prior_ham = 1.0 - prior_spam;
-
-    let mut log_spam = prior_spam.ln();
-    let mut log_ham = prior_ham.ln();
-
-    for token in tokens {
-        let spam = *model.spam_tokens.get(&token).unwrap_or(&0) as f64 + 1.0;
-        let ham = *model.ham_tokens.get(&token).unwrap_or(&0) as f64 + 1.0;
-        log_spam += (spam / (spam_total + vocab)).ln();
-        log_ham += (ham / (ham_total + vocab)).ln();
-    }
-
-    let odds = (log_spam - log_ham).exp();
-    odds / (1.0 + odds)
-}
-
 fn format_score_debug(report: &ScoreDebugReport) -> String {
     let mut out = String::new();
     out.push_str(&format!("<b>Score</b>: {:.6}\n", report.score));
@@ -1131,10 +1083,6 @@ fn project_chat_link(chat_id: i64) -> String {
     format!("https://t.me/c/{id}/1")
 }
 
-fn from_name(user: &teloxide::types::User) -> String {
-    short_user(user)
-}
-
 async fn log_action(bot: &Bot, runtime: &Runtime, case: &CaseRecord) -> ResponseResult<i32> {
     let action_text = if let (Some(rule_id), Some(pattern)) = (case.matched_rule_id, case.matched_rule_pattern.as_ref()) {
         format!("Banned by Regex Rule #{} ({})", rule_id, escape_html(pattern))
@@ -1205,8 +1153,8 @@ async fn kick_user(bot: &Bot, chat_id: ChatId, user_id: i64) -> Result<()> {
     Ok(())
 }
 
-async fn train_spam(runtime: &Runtime, display_name: &str, text: &str, case_id: Option<&str>) -> Result<()> {
-    let tokens = tokenize(&feature_text(display_name, text));
+async fn train_spam(runtime: &Runtime, text: &str, case_id: Option<&str>) -> Result<()> {
+    let tokens = tokenize(text);
     {
         let mut model = runtime.model.lock().await;
         model.spam_docs += 1;
@@ -1225,8 +1173,8 @@ async fn train_spam(runtime: &Runtime, display_name: &str, text: &str, case_id: 
     runtime.update_model_meta().await
 }
 
-async fn train_ham(runtime: &Runtime, display_name: &str, text: &str, case_id: Option<&str>) -> Result<()> {
-    let tokens = tokenize(&feature_text(display_name, text));
+async fn train_ham(runtime: &Runtime, text: &str, case_id: Option<&str>) -> Result<()> {
+    let tokens = tokenize(text);
     {
         let mut model = runtime.model.lock().await;
         model.ham_docs += 1;
@@ -1310,6 +1258,73 @@ fn extract_full_text(msg: &Message) -> String {
     }
 
     text
+}
+
+fn tokenize_or_empty(text: &str) -> Vec<String> {
+    tokenize(text)
+}
+
+fn is_empty_ml_text(text: &str) -> bool {
+    tokenize_or_empty(text).is_empty()
+}
+
+fn score_spam_from_text(model: &ModelState, text: &str) -> f64 {
+    if is_empty_ml_text(text) {
+        return 0.0;
+    }
+    let tokens = tokenize(text);
+    let spam_total = model.spam_tokens.values().sum::<u64>() as f64 + 1.0;
+    let ham_total = model.ham_tokens.values().sum::<u64>() as f64 + 1.0;
+    let vocab = (model.spam_tokens.len() + model.ham_tokens.len()).max(1) as f64;
+    let prior_spam = (model.spam_docs as f64 + 1.0) / ((model.spam_docs + model.ham_docs) as f64 + 2.0);
+    let prior_ham = 1.0 - prior_spam;
+
+    let mut log_spam = prior_spam.ln();
+    let mut log_ham = prior_ham.ln();
+
+    for token in tokens {
+        let spam_count = *model.spam_tokens.get(&token).unwrap_or(&0);
+        let ham_count = *model.ham_tokens.get(&token).unwrap_or(&0);
+        let spam_prob = (spam_count as f64 + 1.0) / (spam_total + vocab);
+        let ham_prob = (ham_count as f64 + 1.0) / (ham_total + vocab);
+        log_spam += spam_prob.ln();
+        log_ham += ham_prob.ln();
+    }
+
+    let odds = (log_spam - log_ham).exp();
+    odds / (1.0 + odds)
+}
+
+fn score_debug_from_text(model: &ModelState, text: &str) -> ScoreDebugReport {
+    if is_empty_ml_text(text) {
+        return ScoreDebugReport { score: 0.0, tokens: Vec::new() };
+    }
+
+    let tokens = tokenize(text);
+    let spam_total = model.spam_tokens.values().sum::<u64>() as f64 + 1.0;
+    let ham_total = model.ham_tokens.values().sum::<u64>() as f64 + 1.0;
+    let vocab = (model.spam_tokens.len() + model.ham_tokens.len()).max(1) as f64;
+    let prior_spam = (model.spam_docs as f64 + 1.0) / ((model.spam_docs + model.ham_docs) as f64 + 2.0);
+    let prior_ham = 1.0 - prior_spam;
+
+    let mut log_spam = prior_spam.ln();
+    let mut log_ham = prior_ham.ln();
+    let mut contributions = Vec::new();
+
+    for token in tokens {
+        let spam_count = *model.spam_tokens.get(&token).unwrap_or(&0);
+        let ham_count = *model.ham_tokens.get(&token).unwrap_or(&0);
+        let spam_prob = (spam_count as f64 + 1.0) / (spam_total + vocab);
+        let ham_prob = (ham_count as f64 + 1.0) / (ham_total + vocab);
+        let delta = spam_prob.ln() - ham_prob.ln();
+        log_spam += spam_prob.ln();
+        log_ham += ham_prob.ln();
+        contributions.push(ScoreContribution { token, spam_count, ham_count, spam_prob, ham_prob, delta });
+    }
+
+    let odds = (log_spam - log_ham).exp();
+    let score = odds / (1.0 + odds);
+    ScoreDebugReport { score, tokens: contributions }
 }
 
 async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> ResponseResult<()> {
@@ -1467,7 +1482,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 ActionKind::SpamBan => {
                     let _ = bot.delete_message(message.chat.id, MessageId(source_id)).await;
                     ban_user(&bot, message.chat.id, target_id).await.ok();
-                    train_spam(&runtime, &target_name, &evidence_text, Some(&case_id)).await.ok();
+                    train_spam(&runtime, &evidence_text, Some(&case_id)).await.ok();
                 }
                 ActionKind::Mute => {
                     mute_user(&bot, message.chat.id, target_id).await.ok();
@@ -1572,11 +1587,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             }
             match cmd {
                 ModerationCommand::MlTrainSpam => {
-                    train_spam(&runtime, &from_name(from), &text, None).await.ok();
+                    train_spam(&runtime, &text, None).await.ok();
                     bot.send_message(message.chat.id, "已將該樣本寫入 spam 模型。") .await?;
                 }
                 ModerationCommand::MlCleanSpam => {
-                    train_ham(&runtime, &from_name(from), &text, None).await.ok();
+                    train_ham(&runtime, &text, None).await.ok();
                     bot.send_message(message.chat.id, "已將該樣本寫入 ham/clean 模型。") .await?;
                 }
                 _ => {}
@@ -1593,7 +1608,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "請回覆一條訊息作為 ham 樣本。") .await?;
                 return Ok(());
             }
-            train_ham(&runtime, &from_name(from), &text, None).await.ok();
+            train_ham(&runtime, &text, None).await.ok();
             bot.send_message(message.chat.id, "已將該樣本寫入 ham 模型。") .await?;
         }
         ModerationCommand::MlPurge(case_id) => {
@@ -1726,7 +1741,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let mut debug = Vec::new();
             for payload in payloads {
                 debug.push(payload.clone());
-                train_spam(&runtime, &from_name(from), &payload, None).await.ok();
+                train_spam(&runtime, &payload, None).await.ok();
                 count += 1;
             }
             bot.send_message(message.chat.id, format!("已匯入並訓練 {count} 筆。\n\n匯入字串：\n{}", debug.join("\n---\n"))).await?;
@@ -1825,17 +1840,17 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     }
                     for payload in payloads {
                         extracted_debug.push(payload.clone());
-                        train_spam(&runtime, "mass-train", &payload, None).await.ok();
+                        train_spam(&runtime, &payload, None).await.ok();
                         spam_count += 1;
                     }
                 } else {
                     let payload = sample.clone();
                     extracted_debug.push(payload.clone());
                     if sample.starts_with("-") || sample.starts_with("ham:") {
-                        train_ham(&runtime, "mass-train", &payload, None).await.ok();
+                        train_ham(&runtime, &payload, None).await.ok();
                         ham_count += 1;
                     } else {
-                        train_spam(&runtime, "mass-train", &payload, None).await.ok();
+                        train_spam(&runtime, &payload, None).await.ok();
                         spam_count += 1;
                     }
                 }
@@ -1855,7 +1870,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             for sample in samples {
                 if sample.trim().is_empty() { continue; }
                 imported.push(sample.clone());
-                train_ham(&runtime, "mass-train", &sample, None).await.ok();
+                train_ham(&runtime, &sample, None).await.ok();
                 count += 1;
             }
             bot.send_message(message.chat.id, format!("批量訓練完成。ham: {count}\n\n已提取並訓練的字串：\n{}", if imported.is_empty() { "無可提取樣本".to_string() } else { imported.join("\n---\n") })).await?;
@@ -1921,7 +1936,7 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
                     log_callback_error(&bot, &runtime, &case, "delete_message", &err.to_string()).await;
                 }
             }
-            if let Err(err) = train_spam(&runtime, &case.target_name, &case.evidence_text, Some(&case.id)).await {
+            if let Err(err) = train_spam(&runtime, &case.evidence_text, Some(&case.id)).await {
                 log_callback_error(&bot, &runtime, &case, "train_spam", &err.to_string()).await;
             }
             let mut updated = case.clone();
@@ -1946,7 +1961,7 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
             bot.answer_callback_query(q.id).text("已受理並封禁").await?;
         }
         "reject" => {
-            if let Err(err) = train_ham(&runtime, &case.target_name, &case.evidence_text, Some(&case.id)).await {
+            if let Err(err) = train_ham(&runtime, &case.evidence_text, Some(&case.id)).await {
                 log_callback_error(&bot, &runtime, &case, "train_ham", &err.to_string()).await;
             }
             let mut updated = case.clone();
