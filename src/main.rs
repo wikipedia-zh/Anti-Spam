@@ -5,12 +5,10 @@ use regex::Regex;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, env, path::PathBuf, sync::{Arc, OnceLock}};
-use teloxide::{error_handlers::LoggingErrorHandler, prelude::*, types::{CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, MessageId, ParseMode, UserId}};
+use teloxide::{prelude::*, types::{CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, MessageId, ParseMode, UserId}};
 use url::Url;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
-
-mod raw_listener;
 
 #[derive(Clone)]
 struct Config {
@@ -2073,12 +2071,6 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     let bot = Bot::new(config.bot_token.clone());
     let runtime = Arc::new(Runtime::load(config).await?);
-    let raw_rules = {
-        let rules = runtime.spam_rules.read().await;
-        rules.iter().map(|rule| rule.regex.clone()).collect::<Vec<_>>()
-    };
-    let listener = raw_listener::RawJsonPolling::new(bot.clone(), runtime.config.bot_token.clone(), raw_rules);
-
     let message_handler = Update::filter_message().endpoint({
         let runtime = runtime.clone();
         move |bot: Bot, message: Message| {
@@ -2135,6 +2127,23 @@ async fn main() -> Result<()> {
         .inspect(|u: teloxide::types::Update| {
             println!("=> [DISPATCHER RECEIVED UPDATE]: ID {:?}", u.id);
         })
+        .filter_async(|update: teloxide::types::Update, runtime: Arc<Runtime>| async move {
+            if let teloxide::types::UpdateKind::Message(msg) = update.kind {
+                let text = extract_full_text(&msg);
+                let suspicious = text.contains("-1003547149544") || text.contains("手机拍照项目");
+                if suspicious {
+                    log::info!("Root Filter: Dropping known spam pattern immediately.");
+                    return false;
+                }
+
+                let rules = runtime.spam_rules.read().await;
+                if rules.iter().any(|rule| rule.regex.is_match(&text)) {
+                    log::info!("Root Filter: Dropping regex-matched update immediately.");
+                    return false;
+                }
+            }
+            true
+        })
         .branch(message_handler)
         .branch(callback_handler);
 
@@ -2143,9 +2152,7 @@ async fn main() -> Result<()> {
         .enable_ctrlc_handler()
         .build();
 
-    dispatcher
-        .dispatch_with_listener(listener, LoggingErrorHandler::with_custom_text("Dispatcher Error"))
-        .await;
+    dispatcher.dispatch().await;
 
     Ok(())
 }
