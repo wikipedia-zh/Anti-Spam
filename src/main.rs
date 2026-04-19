@@ -1271,15 +1271,12 @@ fn extract_full_text(msg: &Message) -> String {
         }
         match origin {
             teloxide::types::MessageOrigin::Channel { chat, .. } => {
-                text.push_str(&format!("[forward_origin_channel_id: {}]\n", chat.id.0));
+                text.push_str(&format!("\n[fwd_id: {}]", chat.id.0));
                 if let Some(username) = chat.username() {
-                    text.push_str(&format!("[forward_origin_channel_username: {}]\n", username));
+                    text.push_str(&format!("\n[fwd_user: {}]", username));
                 }
-                text.push_str(&format!("[forward_origin: {:?}]", origin));
             }
-            _ => {
-                text.push_str(&format!("[forward_origin: {:?}]", origin));
-            }
+            _ => {}
         }
     }
 
@@ -1289,22 +1286,22 @@ fn extract_full_text(msg: &Message) -> String {
                 text.push('\n');
             }
             if let Some(chat) = &external.chat {
-                text.push_str(&format!("[external_origin_chat_id: {}]\n", chat.id.0));
+                text.push_str(&format!("\n[external_origin_chat_id: {}]", chat.id.0));
                 if let Some(username) = chat.username() {
-                    text.push_str(&format!("[external_origin_username: {}]\n", username));
+                    text.push_str(&format!("\n[external_origin_username: {}]", username));
                 }
             }
             match &external.origin {
                 teloxide::types::MessageOrigin::Channel { chat, .. } => {
-                    text.push_str(&format!("[external_reply_origin_channel_id: {}]\n", chat.id.0));
+                    text.push_str(&format!("\n[external_reply_origin_channel_id: {}]", chat.id.0));
                     if let Some(username) = chat.username() {
-                        text.push_str(&format!("[external_reply_origin_channel_username: {}]\n", username));
+                        text.push_str(&format!("\n[external_reply_origin_channel_username: {}]", username));
                     }
                 }
                 teloxide::types::MessageOrigin::Chat { sender_chat, .. } => {
-                    text.push_str(&format!("[external_reply_origin_chat_id: {}]\n", sender_chat.id.0));
+                    text.push_str(&format!("\n[external_reply_origin_chat_id: {}]", sender_chat.id.0));
                     if let Some(username) = sender_chat.username() {
-                        text.push_str(&format!("[external_reply_origin_chat_username: {}]\n", username));
+                        text.push_str(&format!("\n[external_reply_origin_chat_username: {}]", username));
                     }
                 }
                 _ => {}
