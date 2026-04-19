@@ -2131,12 +2131,17 @@ async fn main() -> Result<()> {
         }
     });
 
-    let handler = dptree::entry().branch(message_handler).branch(callback_handler);
+    let handler = dptree::entry()
+        .inspect(|u: std::sync::Arc<teloxide::types::Update>| {
+            println!("=> [DISPATCHER RECEIVED UPDATE]: ID {:?}", u.id);
+        })
+        .branch(message_handler)
+        .branch(callback_handler);
 
     Dispatcher::builder(bot, handler)
         .enable_ctrlc_handler()
         .build()
-        .dispatch_with_listener(listener, LoggingErrorHandler::with_custom_text("raw update listener error"))
+        .dispatch_with_listener(listener, LoggingErrorHandler::with_custom_text("Dispatcher Error"))
         .await;
 
     Ok(())
