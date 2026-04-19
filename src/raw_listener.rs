@@ -50,6 +50,7 @@ impl<'a> teloxide::update_listeners::AsUpdateStream<'a> for RawJsonPolling {
         let rules = self.rules.clone();
         tokio::spawn(async move {
             loop {
+                println!("Fetching updates with offset: {}", offset);
                 let response = match client
                     .get(&url)
                     .query(&[("offset", offset.to_string()), ("timeout", "30".to_string())])
@@ -58,6 +59,7 @@ impl<'a> teloxide::update_listeners::AsUpdateStream<'a> for RawJsonPolling {
                 {
                     Ok(resp) => resp,
                     Err(err) => {
+                        println!("CRITICAL PARSE ERROR: {}", err);
                         let _ = tx.send(Err(err)).await;
                         continue;
                     }
@@ -66,6 +68,7 @@ impl<'a> teloxide::update_listeners::AsUpdateStream<'a> for RawJsonPolling {
                 let raw = match response.text().await {
                     Ok(text) => text,
                     Err(err) => {
+                        println!("CRITICAL PARSE ERROR: {}", err);
                         let _ = tx.send(Err(err)).await;
                         continue;
                     }
@@ -73,10 +76,14 @@ impl<'a> teloxide::update_listeners::AsUpdateStream<'a> for RawJsonPolling {
 
                 let value: Value = match serde_json::from_str(&raw) {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(err) => {
+                        println!("CRITICAL PARSE ERROR: {}", err);
+                        continue;
+                    }
                 };
 
                 let Some(updates) = value.get("result").and_then(|r| r.as_array()) else {
+                    println!("NO RESULT ARRAY. Raw: {}", raw);
                     continue;
                 };
 
@@ -89,6 +96,7 @@ impl<'a> teloxide::update_listeners::AsUpdateStream<'a> for RawJsonPolling {
                     let is_spam = rules.iter().any(|rule| rule.is_match(&upd_str));
 
                     if is_spam {
+                        println!("[SPAM DETECTED & DROPPED]: {}", upd_str);
                         if let Some(message) = upd.get("message") {
                             if let (Some(chat_id), Some(message_id), Some(user_id)) = (
                                 message.get("chat").and_then(|c| c.get("id")).and_then(|v| v.as_i64()),
@@ -107,6 +115,9 @@ impl<'a> teloxide::update_listeners::AsUpdateStream<'a> for RawJsonPolling {
 
                     if let Ok(update) = serde_json::from_value::<Update>(upd.clone()) {
                         let _ = tx.send(Ok(update)).await;
+                        println!("Forwarded Update ID to Dispatcher.");
+                    } else if let Err(err) = serde_json::from_value::<Update>(upd.clone()) {
+                        println!("[TELOXIDE DESERIALIZE ERROR]: {}", err);
                     }
                 }
             }
