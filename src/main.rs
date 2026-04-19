@@ -760,6 +760,7 @@ enum ModerationCommand {
     MlImport,
     MlStartMassTrainWithMode(String),
     MlDebugParse,
+    MlScoreDebug,
     AddRule(String),
     ListRules,
     DelRule(String),
@@ -799,7 +800,7 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/ml_start_mass_train_smart" => ModerationCommand::MlStartMassTrainWithMode("smart".to_string()),
         "/ml_start_mass_train_plain" => ModerationCommand::MlStartMassTrainWithMode("plain".to_string()),
         "/ml_debug_parse" => ModerationCommand::MlDebugParse,
-        "/ml_score_debug" => ModerationCommand::MlDebugParse,
+        "/ml_score_debug" => ModerationCommand::MlScoreDebug,
         "/add_rule" => ModerationCommand::AddRule(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
         "/list_rules" => ModerationCommand::ListRules,
         "/del_rule" => ModerationCommand::DelRule(text.split_whitespace().nth(1).unwrap_or("").to_string()),
@@ -1247,8 +1248,67 @@ async fn train_ham(runtime: &Runtime, display_name: &str, text: &str, case_id: O
 async fn extract_reply_context(message: &Message) -> Option<(i64, String, i32, String)> {
     let reply = message.reply_to_message()?;
     let user = reply.from.as_ref()?;
-    let text = reply.text().or(reply.caption()).unwrap_or("").to_string();
+    let text = extract_full_text(reply);
     Some((user.id.0 as i64, short_user(user), reply.id.0, text))
+}
+
+fn extract_full_text(msg: &Message) -> String {
+    let mut text = msg.text().or(msg.caption()).unwrap_or("").to_string();
+
+    if let Some(quote) = msg.quote() {
+        let quote_text = quote.text.trim();
+        if !quote_text.is_empty() {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(quote_text);
+        }
+    }
+
+    if let Some(reply) = msg.reply_to_message() {
+        let reply_text = reply.text().or(reply.caption()).unwrap_or("").trim().to_string();
+        if !reply_text.is_empty() {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&reply_text);
+        }
+    }
+
+    if let Some(origin) = msg.forward_origin() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        match origin {
+            teloxide::types::MessageOrigin::Channel { chat, .. } => {
+                text.push_str(&format!("[forward_origin_channel_id: {}]\n", chat.id.0));
+                if let Some(username) = chat.username() {
+                    text.push_str(&format!("[forward_origin_channel_username: {}]\n", username));
+                }
+                text.push_str(&format!("[forward_origin: {:?}]", origin));
+            }
+            _ => {
+                text.push_str(&format!("[forward_origin: {:?}]", origin));
+            }
+        }
+    }
+
+    if let teloxide::types::MessageKind::Common(common) = &msg.kind {
+        if let Some(external) = &common.external_reply {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            if let Some(chat) = &external.chat {
+                text.push_str(&format!("[external_origin_chat_id: {}]\n", chat.id.0));
+                if let Some(username) = chat.username() {
+                    text.push_str(&format!("[external_origin_username: {}]\n", username));
+                }
+            }
+            text.push_str(&format!("[external_reply_origin: {:?}]\n", external.origin));
+        }
+    }
+
+    text
 }
 
 async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> ResponseResult<()> {
@@ -1302,9 +1362,8 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let text = if text.trim().is_empty() {
                 message
                     .reply_to_message()
-                    .and_then(|m| m.text().or(m.caption()))
-                    .unwrap_or("")
-                    .to_string()
+                    .map(extract_full_text)
+                    .unwrap_or_default()
             } else {
                 text
             };
@@ -1313,7 +1372,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 return Ok(());
             }
             let user_name = message.from.as_ref().map(short_user).unwrap_or_else(|| "unknown".to_string());
-            let result = runtime.inspect_message(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string())))?;
+            let result = runtime.inspect_message(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
             let response = match &result {
                 InspectionResult::Spam { score, matched_rule: Some(rule) } => format!(
                     "<b>Verdict</b>: spam\n<b>Score</b>: {score:.6}\n<b>Regex</b>: #{} {}\n<b>Description</b>: {}",
@@ -1322,11 +1381,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     escape_html(&rule.description),
                 ),
                 InspectionResult::Spam { score, .. } => {
-                    let report = runtime.score_debug(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string())))?;
+                    let report = runtime.score_debug(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
                     format!("<b>Verdict</b>: spam\n<b>Score</b>: {score:.6}\n{}", format_score_debug(&report))
                 }
                 InspectionResult::Ham { score } => {
-                    let report = runtime.score_debug(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string())))?;
+                    let report = runtime.score_debug(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
                     format!("<b>Verdict</b>: ham\n<b>Score</b>: {score:.6}\n{}", format_score_debug(&report))
                 }
             };
@@ -1506,17 +1565,18 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
                 return Ok(());
             }
-            let Some(text) = message.reply_to_message().and_then(|m| m.text().or(m.caption())) else {
+            let text = message.reply_to_message().map(extract_full_text).unwrap_or_default();
+            if text.trim().is_empty() {
                 bot.send_message(message.chat.id, "請回覆一條訊息來訓練或清洗模型。").await?;
                 return Ok(());
-            };
+            }
             match cmd {
                 ModerationCommand::MlTrainSpam => {
-                    train_spam(&runtime, &from_name(from), text, None).await.ok();
+                    train_spam(&runtime, &from_name(from), &text, None).await.ok();
                     bot.send_message(message.chat.id, "已將該樣本寫入 spam 模型。") .await?;
                 }
                 ModerationCommand::MlCleanSpam => {
-                    train_ham(&runtime, &from_name(from), text, None).await.ok();
+                    train_ham(&runtime, &from_name(from), &text, None).await.ok();
                     bot.send_message(message.chat.id, "已將該樣本寫入 ham/clean 模型。") .await?;
                 }
                 _ => {}
@@ -1527,11 +1587,12 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "只有維護人員可以使用 /mark_ham。") .await?;
                 return Ok(());
             }
-            let Some(text) = message.reply_to_message().and_then(|m| m.text().or(m.caption())) else {
+            let text = message.reply_to_message().map(extract_full_text).unwrap_or_default();
+            if text.trim().is_empty() {
                 bot.send_message(message.chat.id, "請回覆一條訊息作為 ham 樣本。") .await?;
                 return Ok(());
-            };
-            train_ham(&runtime, &from_name(from), text, None).await.ok();
+            }
+            train_ham(&runtime, &from_name(from), &text, None).await.ok();
             bot.send_message(message.chat.id, "已將該樣本寫入 ham 模型。") .await?;
         }
         ModerationCommand::MlPurge(case_id) => {
@@ -1580,7 +1641,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
                 return Ok(());
             }
-            let rules = runtime.list_spam_rules().await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string())))?;
+            let rules = runtime.list_spam_rules().await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
             let body = if rules.is_empty() {
                 "<b>Rules</b>\n無規則".to_string()
             } else {
@@ -1601,7 +1662,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "請提供有效的規則 ID。").await?;
                 return Ok(());
             };
-            let removed = runtime.delete_spam_rule(id).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string())))?;
+            let removed = runtime.delete_spam_rule(id).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
             bot.send_message(message.chat.id, if removed { format!("已刪除規則 #{id}") } else { format!("找不到規則 #{id}") }).await?;
         }
         ModerationCommand::AddRule(rule) => {
@@ -1614,7 +1675,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "請提供 regex 規則。").await?;
                 return Ok(());
             }
-            let id = runtime.add_spam_rule(pattern, "").await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string())))?;
+            let id = runtime.add_spam_rule(pattern, "").await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
             bot.send_message(message.chat.id, format!("已新增 spam regex 規則 #{id}。")).await?;
         }
         ModerationCommand::MlThreshold(value) => {
@@ -1649,11 +1710,12 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "只有維護人員可以使用 /import。") .await?;
                 return Ok(());
             }
-            let Some(text) = message.reply_to_message().and_then(|m| m.text().or(m.caption())) else {
+            let text = message.reply_to_message().map(extract_full_text).unwrap_or_default();
+            if text.trim().is_empty() {
                 bot.send_message(message.chat.id, "請回覆一段匯出列表或輸出結果。") .await?;
                 return Ok(());
-            };
-            let payloads = import_train_payloads(text);
+            }
+            let payloads = import_train_payloads(&text);
             if payloads.is_empty() {
                 bot.send_message(message.chat.id, "沒有找到可匯入的訓練字串。") .await?;
                 return Ok(());
@@ -1702,10 +1764,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "只允許維護者在私訊中使用 /ml_debug_parse。") .await?;
                 return Ok(());
             }
-            let Some(text) = message.reply_to_message().and_then(|m| m.text().or(m.caption()).map(|s| s.to_string())) else {
+            let text = message.reply_to_message().map(extract_full_text).unwrap_or_default();
+            if text.trim().is_empty() {
                 bot.send_message(message.chat.id, "請回覆一段日誌或訊息內容。") .await?;
                 return Ok(());
-            };
+            }
             let extracted = smart_train_payloads(&text);
             let body = if extracted.is_empty() {
                 "<無法提取>".to_string()
@@ -1713,6 +1776,31 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 extracted.into_iter().map(|s| escape_html(&s)).collect::<Vec<_>>().join("\n---\n")
             };
             bot.send_message(message.chat.id, format!("提取結果：\n<blockquote>{}</blockquote>", body)).parse_mode(ParseMode::Html).await?;
+        }
+        ModerationCommand::MlScoreDebug => {
+            if !is_maintainer(&bot, &runtime.config, from_id).await {
+                bot.send_message(message.chat.id, "只有維護人員可以使用 /ml_score_debug。") .await?;
+                return Ok(());
+            }
+            let text = extract_full_text(&message);
+            if text.trim().is_empty() {
+                bot.send_message(message.chat.id, "請回覆一條消息或提供內容。") .await?;
+                return Ok(());
+            }
+            let user_name = message.from.as_ref().map(short_user).unwrap_or_else(|| "unknown".to_string());
+            let result = runtime.inspect_message(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
+            let mut out = String::new();
+            out.push_str(&format!("<b>Extracted</b>:\n<blockquote>{}</blockquote>\n", escape_html(&text)));
+            match result {
+                InspectionResult::Spam { score, matched_rule: Some(rule) } => {
+                    out.push_str(&format!("<b>Verdict</b>: spam\n<b>Score</b>: {score:.6}\n<b>Regex</b>: #{} {}\n<b>Description</b>: {}", rule.id, escape_html(&rule.pattern), escape_html(&rule.description)));
+                }
+                InspectionResult::Spam { score, .. } | InspectionResult::Ham { score } => {
+                    let report = runtime.score_debug(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
+                    out.push_str(&format!("<b>Verdict</b>: {}\n<b>Score</b>: {score:.6}\n{}", if score >= runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold) { "spam" } else { "ham" }, format_score_debug(&report)));
+                }
+            }
+            bot.send_message(message.chat.id, out).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::MlFinishMassTrain => {
             if !message.chat.is_private() || !is_maintainer(&bot, &runtime.config, from_id).await {
@@ -1892,9 +1980,10 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
     if is_group_admin(&bot, message.chat.id, user.id.0 as i64).await || is_special_user(&runtime.config, user.id.0 as i64) {
         return Ok(());
     }
-    let Some(text) = message.text().or(message.caption()) else { return Ok(()); };
+    let text = extract_full_text(&message);
+    if text.trim().is_empty() { return Ok(()); }
     let display_name = short_user(user);
-    let result = runtime.inspect_message(&display_name, text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string())))?;
+    let result = runtime.inspect_message(&display_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
     let score = match result {
         InspectionResult::Spam { score, .. } | InspectionResult::Ham { score } => score,
     };
@@ -1937,9 +2026,10 @@ async fn score_only(bot: &Bot, runtime: &Runtime, message: &Message) -> Response
     if user.is_bot {
         return Ok(());
     }
-    let Some(text) = message.text().or(message.caption()) else { return Ok(()); };
+    let text = extract_full_text(message);
+    if text.trim().is_empty() { return Ok(()); }
     let display_name = short_user(user);
-    let result = runtime.inspect_message(&display_name, text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string())))?;
+    let result = runtime.inspect_message(&display_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
     let score = match result {
         InspectionResult::Spam { score, .. } | InspectionResult::Ham { score } => score,
     };
