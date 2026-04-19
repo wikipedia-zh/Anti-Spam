@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use jieba_rs::Jieba;
+use regex::Regex;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, env, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, env, path::PathBuf, sync::{Arc, OnceLock}};
 use teloxide::{prelude::*, types::{CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, MessageId, ParseMode, UserId}};
 use url::Url;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -107,6 +109,8 @@ struct CaseRecord {
     source_message_id: Option<i32>,
     evidence_text: String,
     model_score: Option<f64>,
+    matched_rule_id: Option<i64>,
+    matched_rule_pattern: Option<String>,
     status: String,
     log_message_id: Option<i32>,
     created_at: DateTime<Utc>,
@@ -125,28 +129,64 @@ struct Runtime {
     sqlite_path: PathBuf,
     project_chat: Mutex<Option<i64>>,
     model: Mutex<ModelState>,
+    spam_rules: RwLock<Vec<SpamRule>>,
     mass_train_buffer: Mutex<HashMap<i64, Vec<String>>>,
     mass_train_mode: Mutex<HashMap<i64, String>>,
+}
+
+#[derive(Clone)]
+struct SpamRule {
+    id: i64,
+    pattern: String,
+    description: String,
+    regex: Regex,
+}
+
+#[derive(Clone)]
+struct MatchedRule {
+    id: i64,
+    pattern: String,
+    description: String,
+}
+
+struct ScoreContribution {
+    token: String,
+    spam_count: u64,
+    ham_count: u64,
+    spam_prob: f64,
+    ham_prob: f64,
+    delta: f64,
+}
+
+struct ScoreDebugReport {
+    score: f64,
+    tokens: Vec<ScoreContribution>,
+}
+
+enum InspectionResult {
+    Spam { score: f64, matched_rule: Option<MatchedRule> },
+    Ham { score: f64 },
 }
 
 impl Runtime {
     async fn load(config: Config) -> Result<Self> {
         tokio::fs::create_dir_all(&config.data_dir).await.ok();
         let sqlite_path = config.sqlite_path.clone();
-        let conn = Connection::open(&sqlite_path)?;
-        Self::init_db(&conn)?;
+        let mut conn = Connection::open(&sqlite_path)?;
+        Self::init_db(&mut conn)?;
         let model = Self::load_model(&conn)?;
         let project_chat = Self::load_project_chat(&conn)?;
-        Ok(Self { config, sqlite_path, project_chat: Mutex::new(project_chat), model: Mutex::new(model), mass_train_buffer: Mutex::new(HashMap::new()), mass_train_mode: Mutex::new(HashMap::new()) })
+        let spam_rules = Self::load_spam_rules(&conn)?;
+        Ok(Self { config, sqlite_path, project_chat: Mutex::new(project_chat), model: Mutex::new(model), spam_rules: RwLock::new(spam_rules), mass_train_buffer: Mutex::new(HashMap::new()), mass_train_mode: Mutex::new(HashMap::new()) })
     }
 
     fn open_conn(&self) -> Result<Connection> {
-        let conn = Connection::open(&self.sqlite_path)?;
-        Self::init_db(&conn)?;
+        let mut conn = Connection::open(&self.sqlite_path)?;
+        Self::init_db(&mut conn)?;
         Ok(conn)
     }
 
-    fn init_db(conn: &Connection) -> Result<()> {
+    fn init_db(conn: &mut Connection) -> Result<()> {
         conn.execute_batch(
             r#"
             PRAGMA journal_mode=WAL;
@@ -161,6 +201,8 @@ impl Runtime {
                 source_message_id INTEGER,
                 evidence_text TEXT NOT NULL,
                 model_score REAL,
+                matched_rule_id INTEGER,
+                matched_rule_pattern TEXT,
                 status TEXT NOT NULL,
                 log_message_id INTEGER,
                 created_at TEXT NOT NULL
@@ -178,12 +220,67 @@ impl Runtime {
                 count INTEGER NOT NULL,
                 PRIMARY KEY (token, label)
             );
+            CREATE TABLE IF NOT EXISTS word_frequencies (
+                word TEXT PRIMARY KEY,
+                spam_count INTEGER NOT NULL DEFAULT 0,
+                ham_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS spam_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pattern TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT ''
+            );
             CREATE TABLE IF NOT EXISTS model_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
             "#,
         )?;
+        let mut columns = std::collections::HashSet::new();
+        {
+            let mut stmt = conn.prepare("PRAGMA table_info(cases)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            for row in rows {
+                columns.insert(row?);
+            }
+        }
+        if !columns.contains("matched_rule_id") {
+            conn.execute("ALTER TABLE cases ADD COLUMN matched_rule_id INTEGER", [])?;
+        }
+        if !columns.contains("matched_rule_pattern") {
+            conn.execute("ALTER TABLE cases ADD COLUMN matched_rule_pattern TEXT", [])?;
+        }
+        let user_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if user_version < 1 {
+            Self::migrate_v0_to_v1(conn)?;
+        }
+        Ok(())
+    }
+
+    fn migrate_v0_to_v1(conn: &mut Connection) -> Result<()> {
+        let tx = conn.transaction()?;
+        let jieba = jieba();
+        {
+            let mut stmt = tx.prepare("SELECT label, text FROM training_samples ORDER BY id ASC")?;
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+            for row in rows {
+                let (label, text) = row?;
+                let words = normalize_tokens(&text, jieba);
+                for word in words {
+                    match label.as_str() {
+                        "spam" => {
+                            tx.execute("INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES (?1, 1, 0) ON CONFLICT(word) DO UPDATE SET spam_count = spam_count + 1", params![word])?;
+                        }
+                        "ham" => {
+                            tx.execute("INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES (?1, 0, 1) ON CONFLICT(word) DO UPDATE SET ham_count = ham_count + 1", params![word])?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        tx.execute("PRAGMA user_version = 1", [])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -200,18 +297,28 @@ impl Runtime {
             }
         }
 
-        let mut stmt = conn.prepare("SELECT token, label, count FROM token_counts")?;
-        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u64>(2)?)))?;
+        let mut stmt = conn.prepare("SELECT word, spam_count, ham_count FROM word_frequencies")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?, row.get::<_, u64>(2)?)))?;
         for row in rows {
-            let (token, label, count) = row?;
-            match label.as_str() {
-                "spam" => { model.spam_tokens.insert(token, count); }
-                "ham" => { model.ham_tokens.insert(token, count); }
-                _ => {}
-            }
+            let (word, spam_count, ham_count) = row?;
+            if spam_count > 0 { model.spam_tokens.insert(word.clone(), spam_count); }
+            if ham_count > 0 { model.ham_tokens.insert(word, ham_count); }
         }
 
         Ok(model)
+    }
+
+    fn load_spam_rules(conn: &Connection) -> Result<Vec<SpamRule>> {
+        let mut rules = Vec::new();
+        let mut stmt = conn.prepare("SELECT id, pattern, description FROM spam_rules ORDER BY id ASC")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?;
+        for row in rows {
+            let (id, pattern, description) = row?;
+            if let Ok(regex) = Regex::new(&pattern) {
+                rules.push(SpamRule { id, pattern, description, regex });
+            }
+        }
+        Ok(rules)
     }
 
     fn load_threshold(conn: &Connection) -> Result<Option<f64>> {
@@ -240,8 +347,8 @@ impl Runtime {
         let conn = self.open_conn()?;
         conn.execute(
             r#"
-            INSERT INTO cases (id, action, chat_id, target_user_id, target_name, actor_user_id, actor_name, source_message_id, evidence_text, model_score, status, log_message_id, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            INSERT INTO cases (id, action, chat_id, target_user_id, target_name, actor_user_id, actor_name, source_message_id, evidence_text, model_score, matched_rule_id, matched_rule_pattern, status, log_message_id, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
             ON CONFLICT(id) DO UPDATE SET
               action=excluded.action,
               chat_id=excluded.chat_id,
@@ -252,6 +359,8 @@ impl Runtime {
               source_message_id=excluded.source_message_id,
               evidence_text=excluded.evidence_text,
               model_score=excluded.model_score,
+              matched_rule_id=excluded.matched_rule_id,
+              matched_rule_pattern=excluded.matched_rule_pattern,
               status=excluded.status,
               log_message_id=excluded.log_message_id,
               created_at=excluded.created_at
@@ -267,6 +376,8 @@ impl Runtime {
                 case.source_message_id,
                 case.evidence_text,
                 case.model_score,
+                case.matched_rule_id,
+                case.matched_rule_pattern,
                 case.status,
                 case.log_message_id,
                 case.created_at.to_rfc3339(),
@@ -279,11 +390,11 @@ impl Runtime {
         let conn = self.open_conn()?;
         let result = {
             let mut stmt = conn.prepare(
-                r#"SELECT id, action, chat_id, target_user_id, target_name, actor_user_id, actor_name, source_message_id, evidence_text, model_score, status, log_message_id, created_at FROM cases WHERE id = ?1"#,
+                r#"SELECT id, action, chat_id, target_user_id, target_name, actor_user_id, actor_name, source_message_id, evidence_text, model_score, matched_rule_id, matched_rule_pattern, status, log_message_id, created_at FROM cases WHERE id = ?1"#,
             )?;
             let mut rows = stmt.query(params![case_id])?;
             if let Some(row) = rows.next()? {
-                let created_at = DateTime::parse_from_rfc3339(&row.get::<_, String>(12)?)?.with_timezone(&Utc);
+                let created_at = DateTime::parse_from_rfc3339(&row.get::<_, String>(14)?)?.with_timezone(&Utc);
                 Some(CaseRecord {
                     id: row.get(0)?,
                     action: ActionKind::from_str(&row.get::<_, String>(1)?),
@@ -295,8 +406,10 @@ impl Runtime {
                     source_message_id: row.get(7)?,
                     evidence_text: row.get(8)?,
                     model_score: row.get(9)?,
-                    status: row.get(10)?,
-                    log_message_id: row.get(11)?,
+                    matched_rule_id: row.get(10)?,
+                    matched_rule_pattern: row.get(11)?,
+                    status: row.get(12)?,
+                    log_message_id: row.get(13)?,
                     created_at,
                 })
             } else {
@@ -325,32 +438,21 @@ impl Runtime {
         let conn = self.open_conn()?;
         let rebuilt = {
             let mut rebuilt = ModelState::default();
-            let mut stmt = conn.prepare("SELECT label, text FROM training_samples ORDER BY id ASC")?;
+            let mut stmt = conn.prepare("SELECT word, spam_count, ham_count FROM word_frequencies ORDER BY word ASC")?;
             let mut rows = stmt.query([])?;
             while let Some(row) = rows.next()? {
-                let label: String = row.get(0)?;
-                let text: String = row.get(1)?;
-                match label.as_str() {
-                    "spam" => {
-                        rebuilt.spam_docs += 1;
-                        for token in tokenize(&text) {
-                            *rebuilt.spam_tokens.entry(token).or_default() += 1;
-                        }
-                    }
-                    "ham" => {
-                        rebuilt.ham_docs += 1;
-                        for token in tokenize(&text) {
-                            *rebuilt.ham_tokens.entry(token).or_default() += 1;
-                        }
-                    }
-                    _ => {}
+                let word: String = row.get(0)?;
+                let spam_count: u64 = row.get(1)?;
+                let ham_count: u64 = row.get(2)?;
+                if spam_count > 0 {
+                    rebuilt.spam_tokens.insert(word.clone(), spam_count);
+                }
+                if ham_count > 0 {
+                    rebuilt.ham_tokens.insert(word, ham_count);
                 }
             }
             rebuilt
         };
-
-        conn.execute("DELETE FROM model_meta", [])?;
-        conn.execute("DELETE FROM token_counts", [])?;
 
         {
             let mut model = self.model.lock().await;
@@ -373,13 +475,13 @@ impl Runtime {
         )?;
         for (token, count) in &model.spam_tokens {
             conn.execute(
-                "INSERT INTO token_counts (token, label, count) VALUES (?1, 'spam', ?2) ON CONFLICT(token, label) DO UPDATE SET count=excluded.count",
+                "INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES (?1, ?2, 0) ON CONFLICT(word) DO UPDATE SET spam_count=excluded.spam_count",
                 params![token, count.to_string()],
             )?;
         }
         for (token, count) in &model.ham_tokens {
             conn.execute(
-                "INSERT INTO token_counts (token, label, count) VALUES (?1, 'ham', ?2) ON CONFLICT(token, label) DO UPDATE SET count=excluded.count",
+                "INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES (?1, 0, ?2) ON CONFLICT(word) DO UPDATE SET ham_count=excluded.ham_count",
                 params![token, count.to_string()],
             )?;
         }
@@ -454,14 +556,6 @@ impl Runtime {
         *project_chat
     }
 
-    async fn training_stats(&self) -> Result<(u64, u64, u64)> {
-        let conn = self.open_conn()?;
-        let spam: u64 = conn.query_row("SELECT COUNT(*) FROM training_samples WHERE label='spam'", [], |row| row.get(0))?;
-        let ham: u64 = conn.query_row("SELECT COUNT(*) FROM training_samples WHERE label='ham'", [], |row| row.get(0))?;
-        let total: u64 = conn.query_row("SELECT COUNT(*) FROM training_samples", [], |row| row.get(0))?;
-        Ok((spam, ham, total))
-    }
-
     async fn export_training_data(&self) -> Result<String> {
         let conn = self.open_conn()?;
         let out = {
@@ -482,6 +576,157 @@ impl Runtime {
 
     async fn effective_threshold(&self) -> Result<f64> {
         self.current_threshold().await
+    }
+
+    async fn refresh_spam_rules(&self) -> Result<()> {
+        let rules = tokio::task::spawn_blocking({
+            let sqlite_path = self.sqlite_path.clone();
+            move || -> Result<Vec<SpamRule>> {
+                let conn = Connection::open(&sqlite_path)?;
+                let mut conn = conn;
+                Runtime::init_db(&mut conn)?;
+                Runtime::load_spam_rules(&conn)
+            }
+        })
+        .await??;
+        let mut cache = self.spam_rules.write().await;
+        *cache = rules;
+        Ok(())
+    }
+
+    async fn purge_training_by_text(&self, payload: &str) -> Result<usize> {
+        let payload = payload.to_string();
+        let sqlite_path = self.sqlite_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = Connection::open(&sqlite_path)?;
+            let mut conn = conn;
+            Runtime::init_db(&mut conn)?;
+            Ok(conn.execute(
+                "DELETE FROM training_samples WHERE text LIKE ?1 OR text LIKE ?2",
+                params![format!("%{payload}%"), payload],
+            )?)
+        })
+        .await?
+    }
+
+    async fn word_stats(&self) -> Result<(u64, u64, u64)> {
+        let sqlite_path = self.sqlite_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<(u64, u64, u64)> {
+            let conn = Connection::open(&sqlite_path)?;
+            let mut conn = conn;
+            Runtime::init_db(&mut conn)?;
+            let spam: u64 = conn.query_row("SELECT COALESCE(SUM(spam_count), 0) FROM word_frequencies", [], |row| row.get(0))?;
+            let ham: u64 = conn.query_row("SELECT COALESCE(SUM(ham_count), 0) FROM word_frequencies", [], |row| row.get(0))?;
+            let total: u64 = conn.query_row("SELECT COUNT(*) FROM word_frequencies", [], |row| row.get(0))?;
+            Ok((spam, ham, total))
+        })
+        .await?
+    }
+
+    async fn add_spam_rule(&self, pattern: &str, description: &str) -> Result<i64> {
+        let pattern = pattern.to_string();
+        let description = description.to_string();
+        let sqlite_path = self.sqlite_path.clone();
+        let id = tokio::task::spawn_blocking(move || -> Result<i64> {
+            let conn = Connection::open(&sqlite_path)?;
+            let mut conn = conn;
+            Runtime::init_db(&mut conn)?;
+            conn.execute(
+                "INSERT INTO spam_rules (pattern, description) VALUES (?1, ?2)",
+                params![pattern, description],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+        .await??;
+        self.refresh_spam_rules().await?;
+        Ok(id)
+    }
+
+    async fn delete_spam_rule(&self, rule_id: i64) -> Result<bool> {
+        let sqlite_path = self.sqlite_path.clone();
+        let removed = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = Connection::open(&sqlite_path)?;
+            let mut conn = conn;
+            Runtime::init_db(&mut conn)?;
+            Ok(conn.execute("DELETE FROM spam_rules WHERE id = ?1", params![rule_id])?)
+        })
+        .await??;
+        if removed > 0 {
+            self.refresh_spam_rules().await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn list_spam_rules(&self) -> Result<Vec<(i64, String, String)>> {
+        tokio::task::spawn_blocking({
+            let sqlite_path = self.sqlite_path.clone();
+            move || -> Result<Vec<(i64, String, String)>> {
+                let conn = Connection::open(&sqlite_path)?;
+                let mut conn = conn;
+                Runtime::init_db(&mut conn)?;
+                let mut stmt = conn.prepare("SELECT id, pattern, description FROM spam_rules ORDER BY id ASC")?;
+                let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                Ok(out)
+            }
+        })
+        .await?
+    }
+
+    async fn inspect_message(&self, display_name: &str, text: &str) -> Result<InspectionResult> {
+        let haystack = feature_text(display_name, text);
+        let rules = self.spam_rules.read().await;
+        for rule in rules.iter() {
+            if rule.regex.is_match(&haystack) {
+                return Ok(InspectionResult::Spam {
+                    score: 1.0,
+                    matched_rule: Some(MatchedRule {
+                        id: rule.id,
+                        pattern: rule.pattern.clone(),
+                        description: rule.description.clone(),
+                    }),
+                });
+            }
+        }
+        drop(rules);
+
+        let model = self.model.lock().await;
+        let score = score_spam(&model, display_name, text);
+        Ok(InspectionResult::Ham { score })
+    }
+
+    async fn score_debug(&self, display_name: &str, text: &str) -> Result<ScoreDebugReport> {
+        let tokens = tokenize(&feature_text(display_name, text));
+        let model = self.model.lock().await;
+        let spam_total = model.spam_tokens.values().sum::<u64>() as f64 + 1.0;
+        let ham_total = model.ham_tokens.values().sum::<u64>() as f64 + 1.0;
+        let vocab = (model.spam_tokens.len() + model.ham_tokens.len()).max(1) as f64;
+        let prior_spam = (model.spam_docs as f64 + 1.0) / ((model.spam_docs + model.ham_docs) as f64 + 2.0);
+        let prior_ham = 1.0 - prior_spam;
+
+        let mut log_spam = prior_spam.ln();
+        let mut log_ham = prior_ham.ln();
+        let mut contributions = Vec::new();
+
+        for token in tokens {
+            let spam_count = *model.spam_tokens.get(&token).unwrap_or(&0);
+            let ham_count = *model.ham_tokens.get(&token).unwrap_or(&0);
+            let spam_prob = (spam_count as f64 + 1.0) / (spam_total + vocab);
+            let ham_prob = (ham_count as f64 + 1.0) / (ham_total + vocab);
+            let delta = spam_prob.ln() - ham_prob.ln();
+            log_spam += spam_prob.ln();
+            log_ham += ham_prob.ln();
+            contributions.push(ScoreContribution { token, spam_count, ham_count, spam_prob, ham_prob, delta });
+        }
+
+        let odds = (log_spam - log_ham).exp();
+        let score = odds / (1.0 + odds);
+        Ok(ScoreDebugReport { score, tokens: contributions })
     }
 }
 
@@ -515,6 +760,9 @@ enum ModerationCommand {
     MlImport,
     MlStartMassTrainWithMode(String),
     MlDebugParse,
+    AddRule(String),
+    ListRules,
+    DelRule(String),
     Unknown,
 }
 
@@ -552,15 +800,32 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/ml_start_mass_train_plain" => ModerationCommand::MlStartMassTrainWithMode("plain".to_string()),
         "/ml_debug_parse" => ModerationCommand::MlDebugParse,
         "/ml_score_debug" => ModerationCommand::MlDebugParse,
+        "/add_rule" => ModerationCommand::AddRule(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
+        "/list_rules" => ModerationCommand::ListRules,
+        "/del_rule" => ModerationCommand::DelRule(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         _ => ModerationCommand::Unknown,
     }
 }
 
 fn tokenize(text: &str) -> Vec<String> {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
+    normalize_tokens(text, jieba())
+}
+
+fn jieba() -> &'static Jieba {
+    static JIEBA: OnceLock<Jieba> = OnceLock::new();
+    JIEBA.get_or_init(Jieba::new)
+}
+
+fn normalize_tokens(text: &str, jieba: &Jieba) -> Vec<String> {
+    static PUNCT_RE: OnceLock<Regex> = OnceLock::new();
+    let punct = PUNCT_RE.get_or_init(|| Regex::new(r"[[:punct:][:space:]]+").expect("valid punctuation regex"));
+    let lowered = text.to_lowercase();
+    let cleaned = punct.replace_all(&lowered, " ");
+    jieba
+        .cut(&cleaned, false)
+        .into_iter()
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty() && s.chars().count() > 1)
-        .map(|s| s.to_string())
         .collect()
 }
 
@@ -759,6 +1024,23 @@ fn score_spam(model: &ModelState, display_name: &str, text: &str) -> f64 {
     odds / (1.0 + odds)
 }
 
+fn format_score_debug(report: &ScoreDebugReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("<b>Score</b>: {:.6}\n", report.score));
+    for item in &report.tokens {
+        out.push_str(&format!(
+            "<code>{}</code> spam={} ham={} sp={:.6} hp={:.6} delta={:.6}\n",
+            escape_html(&item.token),
+            item.spam_count,
+            item.ham_count,
+            item.spam_prob,
+            item.ham_prob,
+            item.delta,
+        ));
+    }
+    out
+}
+
 fn public_log_link(config: &Config, message_id: i32) -> String {
     let id = config.log_channel_id.abs().to_string().trim_start_matches("100").to_string();
     format!("https://t.me/c/{id}/{message_id}")
@@ -853,10 +1135,15 @@ fn from_name(user: &teloxide::types::User) -> String {
 }
 
 async fn log_action(bot: &Bot, runtime: &Runtime, case: &CaseRecord) -> ResponseResult<i32> {
+    let action_text = if let (Some(rule_id), Some(pattern)) = (case.matched_rule_id, case.matched_rule_pattern.as_ref()) {
+        format!("Banned by Regex Rule #{} ({})", rule_id, escape_html(pattern))
+    } else {
+        format!("{:?}", case.action)
+    };
     let text = format!(
-        "<b>Case</b>: <code>{}</code>\n<b>Action</b>: {:?}\n<b>Chat</b>: <code>{}</code>\n<b>Target</b>: <code>{}</code> {}\n<b>Actor</b>: {}\n<b>Score</b>: {}\n<b>Evidence</b>:\n<blockquote>{}</blockquote>\n<b>At</b>: {}",
+        "<b>Case</b>: <code>{}</code>\n<b>Action</b>: {}\n<b>Chat</b>: <code>{}</code>\n<b>Target</b>: <code>{}</code> {}\n<b>Actor</b>: {}\n<b>Score</b>: {}\n<b>Evidence</b>:\n<blockquote>{}</blockquote>\n<b>At</b>: {}",
         case.id,
-        case.action,
+        action_text,
         case.chat_id,
         case.target_user_id,
         escape_html(&case.target_name),
@@ -886,8 +1173,14 @@ async fn log_callback_error(bot: &Bot, runtime: &Runtime, case: &CaseRecord, sta
 
 async fn notify_group(bot: &Bot, runtime: &Runtime, case: &CaseRecord, log_message_id: i32, header: &str) -> Result<()> {
     let link = public_log_link(&runtime.config, log_message_id);
+    let action_text = if let (Some(rule_id), Some(pattern)) = (case.matched_rule_id, case.matched_rule_pattern.as_ref()) {
+        format!("Banned by Regex Rule #{} ({})", rule_id, escape_html(pattern))
+    } else {
+        format!("{:?}", case.action)
+    };
     let text = format!(
-        "{header}\n\n<b>對象</b>: <code>{}</code> {}\n<b>證據</b>: <a href=\"{}\">查看日誌</a>\n<b>Case</b>: <code>{}</code>",
+        "{header}\n\n<b>Action</b>: {}\n<b>對象</b>: <code>{}</code> {}\n<b>證據</b>: <a href=\"{}\">查看日誌</a>\n<b>Case</b>: <code>{}</code>",
+        action_text,
         case.target_user_id, escape_html(&case.target_name), link, case.id
     );
     bot.send_message(ChatId(case.chat_id), text).parse_mode(ParseMode::Html).await?;
@@ -912,24 +1205,40 @@ async fn kick_user(bot: &Bot, chat_id: ChatId, user_id: i64) -> Result<()> {
 }
 
 async fn train_spam(runtime: &Runtime, display_name: &str, text: &str, case_id: Option<&str>) -> Result<()> {
+    let tokens = tokenize(&feature_text(display_name, text));
     {
         let mut model = runtime.model.lock().await;
         model.spam_docs += 1;
-        for token in tokenize(&feature_text(display_name, text)) {
-            *model.spam_tokens.entry(token).or_default() += 1;
+        for token in &tokens {
+            *model.spam_tokens.entry(token.clone()).or_default() += 1;
         }
+    }
+    let conn = runtime.open_conn()?;
+    for token in tokens {
+        conn.execute(
+            "INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES (?1, 1, 0) ON CONFLICT(word) DO UPDATE SET spam_count = spam_count + 1",
+            params![token],
+        )?;
     }
     runtime.insert_training_sample("spam", text, case_id).await?;
     runtime.update_model_meta().await
 }
 
 async fn train_ham(runtime: &Runtime, display_name: &str, text: &str, case_id: Option<&str>) -> Result<()> {
+    let tokens = tokenize(&feature_text(display_name, text));
     {
         let mut model = runtime.model.lock().await;
         model.ham_docs += 1;
-        for token in tokenize(&feature_text(display_name, text)) {
-            *model.ham_tokens.entry(token).or_default() += 1;
+        for token in &tokens {
+            *model.ham_tokens.entry(token.clone()).or_default() += 1;
         }
+    }
+    let conn = runtime.open_conn()?;
+    for token in tokens {
+        conn.execute(
+            "INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES (?1, 0, 1) ON CONFLICT(word) DO UPDATE SET ham_count = ham_count + 1",
+            params![token],
+        )?;
     }
     runtime.insert_training_sample("ham", text, case_id).await?;
     runtime.update_model_meta().await
@@ -1004,11 +1313,24 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 return Ok(());
             }
             let user_name = message.from.as_ref().map(short_user).unwrap_or_else(|| "unknown".to_string());
-            let model = runtime.model.lock().await;
-            let score = score_spam(&model, &user_name, &text);
-            drop(model);
-            let threshold = runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold);
-            bot.send_message(message.chat.id, format!("<b>Score</b>: {score:.4}\n<b>Threshold</b>: {threshold:.4}\n<b>Verdict</b>: {}", if score >= threshold { "spam" } else { "ham" })).parse_mode(ParseMode::Html).await?;
+            let result = runtime.inspect_message(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string())))?;
+            let response = match &result {
+                InspectionResult::Spam { score, matched_rule: Some(rule) } => format!(
+                    "<b>Verdict</b>: spam\n<b>Score</b>: {score:.6}\n<b>Regex</b>: #{} {}\n<b>Description</b>: {}",
+                    rule.id,
+                    escape_html(&rule.pattern),
+                    escape_html(&rule.description),
+                ),
+                InspectionResult::Spam { score, .. } => {
+                    let report = runtime.score_debug(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string())))?;
+                    format!("<b>Verdict</b>: spam\n<b>Score</b>: {score:.6}\n{}", format_score_debug(&report))
+                }
+                InspectionResult::Ham { score } => {
+                    let report = runtime.score_debug(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string())))?;
+                    format!("<b>Verdict</b>: ham\n<b>Score</b>: {score:.6}\n{}", format_score_debug(&report))
+                }
+            };
+            bot.send_message(message.chat.id, response).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::SetChat(chat_id) => {
             if !is_maintainer(&bot, &runtime.config, from_id).await {
@@ -1076,6 +1398,8 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 source_message_id: Some(source_id),
                 evidence_text: evidence_text.clone(),
                 model_score: None,
+                matched_rule_id: None,
+                matched_rule_pattern: None,
                 status: "done".to_string(),
                 log_message_id: None,
                 created_at: Utc::now(),
@@ -1119,6 +1443,8 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 source_message_id: Some(source_id),
                 evidence_text: evidence_text.clone(),
                 model_score: None,
+                matched_rule_id: None,
+                matched_rule_pattern: None,
                 status: "pending_review".to_string(),
                 log_message_id: None,
                 created_at: Utc::now(),
@@ -1227,19 +1553,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "請提供要清除的原文片段。").await?;
                 return Ok(());
             }
-            match runtime.open_conn() {
-                Ok(conn) => {
-                    let removed = conn.execute(
-                        "DELETE FROM training_samples WHERE text LIKE ?1 OR text LIKE ?2",
-                        params![format!("%{payload}%"), payload],
-                    ).unwrap_or(0);
-                    let _ = runtime.rebuild_model().await;
-                    bot.send_message(message.chat.id, format!("已依文字清除 {removed} 筆訓練樣本，並重建模型。")) .await?;
-                }
-                Err(err) => {
-                    bot.send_message(message.chat.id, format!("清除失敗：{err}")).await?;
-                }
-            }
+            let removed = runtime.purge_training_by_text(payload).await.unwrap_or(0);
+            let _ = runtime.rebuild_model().await;
+            bot.send_message(message.chat.id, format!("已依文字清除 {removed} 筆訓練樣本，並重建模型。")) .await?;
         }
         ModerationCommand::MlRebuild => {
             if !is_maintainer(&bot, &runtime.config, from_id).await {
@@ -1254,10 +1570,52 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
                 return Ok(());
             }
-            let (spam, ham, total) = runtime.training_stats().await.unwrap_or((0, 0, 0));
+            let (spam, ham, total) = runtime.word_stats().await.unwrap_or((0, 0, 0));
             let threshold = runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold);
             let text = format!("<b>模型統計</b>\nspam: {spam}\nham: {ham}\n總樣本: {total}\n有效門檻: {threshold:.2}");
             bot.send_message(message.chat.id, text).parse_mode(ParseMode::Html).await?;
+        }
+        ModerationCommand::ListRules => {
+            if !is_maintainer(&bot, &runtime.config, from_id).await {
+                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
+                return Ok(());
+            }
+            let rules = runtime.list_spam_rules().await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string())))?;
+            let body = if rules.is_empty() {
+                "<b>Rules</b>\n無規則".to_string()
+            } else {
+                let mut out = String::from("<b>Rules</b>\n");
+                for (id, pattern, description) in rules {
+                    out.push_str(&format!("#{} {} {}\n", id, escape_html(&pattern), escape_html(&description)));
+                }
+                out
+            };
+            bot.send_message(message.chat.id, body).parse_mode(ParseMode::Html).await?;
+        }
+        ModerationCommand::DelRule(rule_id) => {
+            if !is_maintainer(&bot, &runtime.config, from_id).await {
+                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
+                return Ok(());
+            }
+            let Some(id) = rule_id.parse::<i64>().ok() else {
+                bot.send_message(message.chat.id, "請提供有效的規則 ID。").await?;
+                return Ok(());
+            };
+            let removed = runtime.delete_spam_rule(id).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string())))?;
+            bot.send_message(message.chat.id, if removed { format!("已刪除規則 #{id}") } else { format!("找不到規則 #{id}") }).await?;
+        }
+        ModerationCommand::AddRule(rule) => {
+            if !is_maintainer(&bot, &runtime.config, from_id).await {
+                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
+                return Ok(());
+            }
+            let pattern = rule.trim();
+            if pattern.is_empty() {
+                bot.send_message(message.chat.id, "請提供 regex 規則。").await?;
+                return Ok(());
+            }
+            let id = runtime.add_spam_rule(pattern, "").await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string())))?;
+            bot.send_message(message.chat.id, format!("已新增 spam regex 規則 #{id}。")).await?;
         }
         ModerationCommand::MlThreshold(value) => {
             if !is_maintainer(&bot, &runtime.config, from_id).await {
@@ -1535,11 +1893,11 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
         return Ok(());
     }
     let Some(text) = message.text().or(message.caption()) else { return Ok(()); };
-
-    let model = runtime.model.lock().await;
     let display_name = short_user(user);
-    let score = score_spam(&model, &display_name, text);
-    drop(model);
+    let result = runtime.inspect_message(&display_name, text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string())))?;
+    let score = match result {
+        InspectionResult::Spam { score, .. } | InspectionResult::Ham { score } => score,
+    };
 
     let threshold = runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold);
     if score < threshold {
@@ -1558,6 +1916,8 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
         source_message_id: Some(message.id.0),
         evidence_text: text.to_string(),
         model_score: Some(score),
+        matched_rule_id: None,
+        matched_rule_pattern: None,
         status: "auto_banned".to_string(),
         log_message_id: None,
         created_at: Utc::now(),
@@ -1578,10 +1938,11 @@ async fn score_only(bot: &Bot, runtime: &Runtime, message: &Message) -> Response
         return Ok(());
     }
     let Some(text) = message.text().or(message.caption()) else { return Ok(()); };
-    let model = runtime.model.lock().await;
     let display_name = short_user(user);
-    let score = score_spam(&model, &display_name, text);
-    drop(model);
+    let result = runtime.inspect_message(&display_name, text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string())))?;
+    let score = match result {
+        InspectionResult::Spam { score, .. } | InspectionResult::Ham { score } => score,
+    };
     let threshold = runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold);
     let verdict = if score >= threshold { "spam" } else { "ham" };
     let reply = format!("<b>Score</b>: {score:.4}\n<b>Threshold</b>: {threshold:.4}\n<b>Verdict</b>: {verdict}");

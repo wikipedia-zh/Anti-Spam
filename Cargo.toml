@@ -13,3 +13,6 @@ teloxide = { version = "0.13", features = ["macros", "ctrlc_handler"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 url = "2"
+jieba-rs = "0.7"
+regex = "1"
+log = "0.4"
