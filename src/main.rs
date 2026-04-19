@@ -5,10 +5,12 @@ use regex::Regex;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, env, path::PathBuf, sync::{Arc, OnceLock}};
-use teloxide::{prelude::*, types::{CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, MessageId, ParseMode, UserId}};
+use teloxide::{error_handlers::LoggingErrorHandler, prelude::*, types::{CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, MessageId, ParseMode, UserId}};
 use url::Url;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
+
+mod raw_listener;
 
 #[derive(Clone)]
 struct Config {
@@ -2071,6 +2073,11 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     let bot = Bot::new(config.bot_token.clone());
     let runtime = Arc::new(Runtime::load(config).await?);
+    let raw_rules = {
+        let rules = runtime.spam_rules.read().await;
+        rules.iter().map(|rule| rule.regex.clone()).collect::<Vec<_>>()
+    };
+    let listener = raw_listener::RawJsonPolling::new(bot.clone(), runtime.config.bot_token.clone(), raw_rules);
 
     let message_handler = Update::filter_message().endpoint({
         let runtime = runtime.clone();
@@ -2129,7 +2136,7 @@ async fn main() -> Result<()> {
     Dispatcher::builder(bot, handler)
         .enable_ctrlc_handler()
         .build()
-        .dispatch()
+        .dispatch_with_listener(listener, LoggingErrorHandler::with_custom_text("raw update listener error"))
         .await;
 
     Ok(())
