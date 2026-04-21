@@ -961,6 +961,7 @@ enum ModerationCommand {
     Module(String, String),
     White(String),
     Unwhite(String),
+    HelpOp,
     Check(String),
     Unknown,
 }
@@ -1011,6 +1012,7 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/list_rules" => ModerationCommand::ListRules,
         "/del_rule" => ModerationCommand::DelRule(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/unwhite" => ModerationCommand::Unwhite(text.split_whitespace().nth(1).unwrap_or("").to_string()),
+        "/help_op" => ModerationCommand::HelpOp,
         "/module" | "/moudle" => {
             let mut parts = text.split_whitespace();
             let _ = parts.next();
@@ -1284,12 +1286,12 @@ fn import_train_payloads(input: &str) -> Vec<String> {
     out
 }
 
-fn help_text(is_maintainer: bool) -> String {
-    let mut text = String::from("<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n<code>/white</code>：加入本群白名單\n<code>/unwhite</code>：移出本群白名單\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n");
-    if is_maintainer {
-        text.push_str("\n<b>項目組指令（僅 maintainer 可見）：</b>\n<code>/ml_train_spam</code>、<code>/ml_clean_spam</code>：單筆訓練/洗樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>、<code>/ml_purge_text &lt;文字片段&gt;</code>：清除誤樣本\n<code>/ml_rebuild</code>：重建模型\n<code>/ml_stats</code>：查看樣本與門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整自動封禁門檻\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_start_mass_train_smart</code>：貼原始日志，自動抽正文全當 spam\n<code>/ml_start_mass_train_plain</code>：逐條手工標註 spam\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果\n");
-    }
-    text
+fn help_text() -> String {
+    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n<code>/white</code>：加入本群白名單\n<code>/unwhite</code>：移出本群白名單\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n".to_string()
+}
+
+fn help_op_text() -> String {
+    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整自動封禁門檻\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat &lt;chat_id&gt;</code>：設定工作群組\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
 }
 
 fn format_score_debug(report: &ScoreDebugReport) -> String {
@@ -1367,7 +1369,7 @@ fn format_public_reason(reason: &str, link: Option<&str>) -> String {
 }
 
 fn build_blacklist_reason_text(_runtime: &Runtime) -> String {
-    "<b>封禁代號說明</b>\n\n本訊息由 /updateBL 更新。\n群組與查詢只顯示代號。\n\n<b>代號</b>\n- N: 無\n- SP: 特殊\n- NLDIGIT: 英名含數字\n- NL10: 英名多段且總長度 >= 10\n- NLTAIL: 英名多段且尾段過長\n- NLSINGLE: 英名單段且長度 >= 11\n- ARABIC: 偵測到清真\n- REGEX: 觸發正則規則\n".to_string()
+    "<b>❖ 封禁代號說明</b>\n\n- <code>NLDIGIT</code>: 英名含數字\n- <code>NL10</code>: 英名多段且總長度 >= 10\n- <code>NLTAIL</code>: 英名多段且尾段過長\n- <code>NLSINGLE</code>: 英名單段且長度 >= 11\n- <code>ARABIC</code>: 偵測到清真\n- <code>REGEX</code>: 觸發正則規則\n\n申訴找 @SEELE_01_BOT".to_string()
 }
 
 fn format_case_lookup(case: &CaseRecord, link: &str, reason_link: &str) -> String {
@@ -1784,8 +1786,14 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
 
     match cmd {
         ModerationCommand::Start | ModerationCommand::Help => {
-            let is_maintainer = is_maintainer(&bot, &runtime.config, from_id).await;
-            bot.send_message(message.chat.id, help_text(is_maintainer)).parse_mode(ParseMode::Html).await?;
+            bot.send_message(message.chat.id, help_text()).parse_mode(ParseMode::Html).await?;
+        }
+        ModerationCommand::HelpOp => {
+            if !is_maintainer(&bot, &runtime.config, from_id).await {
+                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
+                return Ok(());
+            }
+            bot.send_message(message.chat.id, help_op_text()).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::MyId => {
             let requester = message.from.as_ref();
@@ -2470,7 +2478,6 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         }
         ModerationCommand::Unknown => {
             if message.chat.is_private() {
-                let is_maintainer = is_maintainer(&bot, &runtime.config, from_id).await;
                 if let Some(pattern) = runtime.pending_rule_addition(from_id).await {
                     let name = text.trim();
                     if !name.is_empty() {
@@ -2480,7 +2487,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                         return Ok(());
                     }
                 }
-                bot.send_message(message.chat.id, help_text(is_maintainer)).parse_mode(ParseMode::Html).await?;
+                bot.send_message(message.chat.id, help_text()).parse_mode(ParseMode::Html).await?;
             }
         }
     }
