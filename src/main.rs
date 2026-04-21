@@ -862,7 +862,7 @@ impl Runtime {
         }
 
         if settings.no_halal && !is_special_user(&self.config, user.id.0 as i64) {
-            let r = evaluate_module_checks(user, bio, message_text);
+            let r = evaluate_module_checks(user, user.username.as_deref(), bio, message_text);
             if !r.is_empty() {
                 reasons.extend(r.clone());
                 no_halal = r;
@@ -1050,7 +1050,7 @@ fn clean_name_parts(text: &str) -> (String, Vec<String>) {
     (clean, parts)
 }
 
-fn evaluate_name_guard(full_name: &str, username: Option<&str>) -> Vec<String> {
+fn evaluate_name_guard(full_name: &str) -> Vec<String> {
     if full_name.chars().any(|c| !c.is_ascii()) {
         return Vec::new();
     }
@@ -1076,23 +1076,23 @@ fn evaluate_name_guard(full_name: &str, username: Option<&str>) -> Vec<String> {
     if parts.len() == 1 && total_len >= 11 {
         reasons.push("NLSINGLE".to_string());
     }
-    if let Some(u) = username {
-        if u.contains('-') {
-            reasons.push("NLDASH".to_string());
-        }
-    }
     reasons
 }
 
 fn evaluate_no_long_name(user: &teloxide::types::User) -> Vec<String> {
-    evaluate_name_guard(&short_user(user), user.username.as_deref())
+    evaluate_name_guard(&short_user(user))
 }
 
-fn evaluate_module_checks(user: &teloxide::types::User, bio: Option<&str>, message_text: Option<&str>) -> Vec<String> {
+fn evaluate_module_checks(user: &teloxide::types::User, username: Option<&str>, bio: Option<&str>, message_text: Option<&str>) -> Vec<String> {
     let mut reasons = Vec::new();
     let name = short_user(user);
     if contains_arabic_script(&name) {
         reasons.push("ARABIC".to_string());
+    }
+    if let Some(username) = username {
+        if contains_arabic_script(username) {
+            reasons.push("ARABIC".to_string());
+        }
     }
     if let Some(bio) = bio {
         if contains_arabic_script(bio) {
@@ -1348,17 +1348,24 @@ fn build_reason_link(reason: &str, link: &str) -> String {
     format!("<a href=\"{link}\">{reason}</a>")
 }
 
-fn build_blacklist_reason_text(_runtime: &Runtime) -> String {
-    "<b>封禁代號說明</b>\n\n本訊息由 /updateBL 更新。\n群組與查詢只顯示代號。\n\n<b>代號</b>\n- N: 無\n- SP: 特殊\n- NLDIGIT: 英名含數字\n- NL10: 英名多段且總長度 >= 10\n- NLTAIL: 英名多段且尾段過長\n- NLSINGLE: 英名單段且長度 >= 11\n- ARABIC: 偵測到清真\n- REGEX: 觸發正則規則\n".to_string()
+fn format_code_link(code: &str, link: Option<&str>) -> String {
+    match link {
+        Some(link) => build_reason_link(&escape_html(code), link),
+        None => escape_html(code),
+    }
 }
 
-fn format_public_reason(reason: &str, link: &str) -> String {
+fn format_public_reason(reason: &str, link: Option<&str>) -> String {
     reason
         .split('；')
         .filter(|part| !part.trim().is_empty())
-        .map(|part| build_reason_link(&escape_html(part.trim()), link))
+        .map(|part| format_code_link(part.trim(), link))
         .collect::<Vec<_>>()
         .join("；")
+}
+
+fn build_blacklist_reason_text(_runtime: &Runtime) -> String {
+    "<b>封禁代號說明</b>\n\n本訊息由 /updateBL 更新。\n群組與查詢只顯示代號。\n\n<b>代號</b>\n- N: 無\n- SP: 特殊\n- NLDIGIT: 英名含數字\n- NL10: 英名多段且總長度 >= 10\n- NLTAIL: 英名多段且尾段過長\n- NLSINGLE: 英名單段且長度 >= 11\n- ARABIC: 偵測到清真\n- REGEX: 觸發正則規則\n".to_string()
 }
 
 fn format_case_lookup(case: &CaseRecord, link: &str, reason_link: &str) -> String {
@@ -1369,7 +1376,7 @@ fn format_case_lookup(case: &CaseRecord, link: &str, reason_link: &str) -> Strin
         escape_html(&case.status),
         escape_html(&case.target_name),
         case.target_user_id,
-        format_public_reason(&chinese_case_reason(case), reason_link),
+        format_public_reason(&chinese_case_reason(case), Some(reason_link)),
         link,
         escape_html(&case.evidence_text),
     )
@@ -1444,8 +1451,14 @@ async fn notify_bot_added(bot: &Bot, runtime: &Runtime, message: &Message) -> bo
             continue;
         }
 
-        let reasons = if enabled.no_long_name { evaluate_name_guard(&short_user(user), user.username.as_deref()) } else { Vec::new() };
-        let mut arabic_reasons = if enabled.no_halal { evaluate_module_checks(user, None, None) } else { Vec::new() };
+        let reasons = if enabled.no_long_name { evaluate_name_guard(&short_user(user)) } else { Vec::new() };
+        let mut arabic_reasons = if enabled.no_halal {
+            let profile = runtime.load_user_profile(bot, user.id.0 as i64).await.ok();
+            let bio = profile.as_ref().and_then(|p| p.bio.as_deref());
+            evaluate_module_checks(user, user.username.as_deref(), bio, None)
+        } else {
+            Vec::new()
+        };
         let mut all_reasons = reasons;
         all_reasons.append(&mut arabic_reasons);
 
@@ -1542,7 +1555,7 @@ async fn notify_group(bot: &Bot, runtime: &Runtime, case: &CaseRecord, log_messa
         "{header}\n\n<b>操作</b>: {}\n<b>對象</b>: <code>{}</code>\n<b>原因</b>: {}\n<b>證據</b>: <a href=\"{}\">查看日誌</a>\n<b>案例</b>: <code>{}</code>",
         chinese_case_action(case),
         case.target_user_id,
-        format_public_reason(reason, &reason_link),
+        format_public_reason(reason, Some(&reason_link)),
         link,
         case.id
     );
@@ -1810,8 +1823,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let result = runtime.inspect_message(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
             let response = match &result {
                 InspectionResult::Spam { score, matched_rule: Some(rule) } => format!(
-                    "<b>判定</b>: 垃圾\n<b>分數</b>: {score:.6}\n<b>規則</b>: {}\n<b>說明</b>: {}",
-                    "REGEX",
+                    "<b>判定</b>: 垃圾\n<b>分數</b>: {score:.6}\n<b>規則</b>: REGEX\n<b>說明</b>: {}",
                     escape_html(&rule.description),
                 ),
                 InspectionResult::Spam { score, .. } => {
@@ -2202,12 +2214,16 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                             }, profile.bio.as_deref(), None).await;
                             match result {
                                 Ok(result) => {
+                                    let hit = if result.reasons.is_empty() { "無".to_string() } else { result.reasons.join("；") };
+                                    let name = if result.name_guard.is_empty() { "無".to_string() } else { result.name_guard.join("；") };
+                                    let halal = if result.no_halal.is_empty() { "無".to_string() } else { result.no_halal.join("；") };
+                                    let reason_link = runtime.blacklist_reason_link().await;
                                     let body = format!(
-                                        "<b>檢查</b>\n<b>人</b>: {}\n<b>因</b>: {}\n<b>名</b>: {}\n<b>清</b>: {}",
+                                        "<b>檢查結果</b>\n<b>對象</b>: {}\n<b>命中</b>: {}\n<b>名稱規則</b>: {}\n<b>清真規則</b>: {}",
                                         escape_html(&profile.display_name),
-                                        escape_html(&if result.reasons.is_empty() { "無".to_string() } else { result.reasons.join("；") }),
-                                        escape_html(&if result.name_guard.is_empty() { "無".to_string() } else { result.name_guard.join("；") }),
-                                        escape_html(&if result.no_halal.is_empty() { "無".to_string() } else { result.no_halal.join("；") }),
+                                        format_public_reason(&hit, reason_link.as_deref()),
+                                        format_public_reason(&name, reason_link.as_deref()),
+                                        format_public_reason(&halal, reason_link.as_deref()),
                                     );
                                     bot.send_message(message.chat.id, body).parse_mode(ParseMode::Html).await?;
                                 }
@@ -2234,12 +2250,16 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let result = runtime.check_group_modules(&bot, message.chat.id.0, user, None, Some(&text)).await;
             match result {
                 Ok(result) => {
+                    let hit = if result.reasons.is_empty() { "無".to_string() } else { result.reasons.join("；") };
+                    let name = if result.name_guard.is_empty() { "無".to_string() } else { result.name_guard.join("；") };
+                    let halal = if result.no_halal.is_empty() { "無".to_string() } else { result.no_halal.join("；") };
+                    let reason_link = runtime.blacklist_reason_link().await;
                     let body = format!(
-                        "<b>檢查</b>\n<b>人</b>: {}\n<b>因</b>: {}\n<b>名</b>: {}\n<b>清</b>: {}",
+                        "<b>檢查結果</b>\n<b>對象</b>: {}\n<b>命中</b>: {}\n<b>名稱規則</b>: {}\n<b>清真規則</b>: {}",
                         escape_html(&short_user(user)),
-                        escape_html(&if result.reasons.is_empty() { "無".to_string() } else { result.reasons.join("；") }),
-                        escape_html(&if result.name_guard.is_empty() { "無".to_string() } else { result.name_guard.join("；") }),
-                        escape_html(&if result.no_halal.is_empty() { "無".to_string() } else { result.no_halal.join("；") }),
+                        format_public_reason(&hit, reason_link.as_deref()),
+                        format_public_reason(&name, reason_link.as_deref()),
+                        format_public_reason(&halal, reason_link.as_deref()),
                     );
                     bot.send_message(message.chat.id, body).parse_mode(ParseMode::Html).await?;
                 }
@@ -2366,7 +2386,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             out.push_str(&format!("<b>提</b>:\n<blockquote>{}</blockquote>\n", escape_html(&text)));
             match result {
                 InspectionResult::Spam { score, matched_rule: Some(rule) } => {
-                    out.push_str(&format!("<b>判</b>: 垃圾\n<b>分</b>: {score:.6}\n<b>規</b>: {}\n<b>說</b>: {}", "REGEX", escape_html(&rule.description)));
+                    out.push_str(&format!("<b>判</b>: 垃圾\n<b>分</b>: {score:.6}\n<b>規</b>: REGEX\n<b>說</b>: {}", escape_html(&rule.description)));
                 }
                 InspectionResult::Spam { score, .. } | InspectionResult::Ham { score } => {
                     let report = runtime.score_debug(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
