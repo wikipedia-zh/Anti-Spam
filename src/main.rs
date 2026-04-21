@@ -8,6 +8,7 @@ use std::{collections::HashMap, env, path::PathBuf, sync::{Arc, OnceLock}};
 use teloxide::{prelude::*, types::{CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, MessageId, ParseMode, UserId}};
 use url::Url;
 use tokio::sync::{Mutex, RwLock};
+use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -132,6 +133,7 @@ struct Runtime {
     spam_rules: RwLock<Vec<SpamRule>>,
     mass_train_buffer: Mutex<HashMap<i64, Vec<String>>>,
     mass_train_mode: Mutex<HashMap<i64, String>>,
+    pending_rule_additions: Mutex<HashMap<i64, String>>,
 }
 
 #[derive(Clone, Default)]
@@ -158,15 +160,12 @@ struct UserProfileInfo {
 #[derive(Clone)]
 struct SpamRule {
     id: i64,
-    pattern: String,
     description: String,
     regex: Regex,
 }
 
 #[derive(Clone)]
 struct MatchedRule {
-    id: i64,
-    pattern: String,
     description: String,
 }
 
@@ -198,7 +197,7 @@ impl Runtime {
         let model = Self::load_model(&conn)?;
         let project_chat = Self::load_project_chat(&conn)?;
         let spam_rules = Self::load_spam_rules(&conn)?;
-        Ok(Self { config, sqlite_path, project_chat: Mutex::new(project_chat), model: Mutex::new(model), spam_rules: RwLock::new(spam_rules), mass_train_buffer: Mutex::new(HashMap::new()), mass_train_mode: Mutex::new(HashMap::new()) })
+        Ok(Self { config, sqlite_path, project_chat: Mutex::new(project_chat), model: Mutex::new(model), spam_rules: RwLock::new(spam_rules), mass_train_buffer: Mutex::new(HashMap::new()), mass_train_mode: Mutex::new(HashMap::new()), pending_rule_additions: Mutex::new(HashMap::new()) })
     }
 
     fn open_conn(&self) -> Result<Connection> {
@@ -348,7 +347,7 @@ impl Runtime {
         for row in rows {
             let (id, pattern, description) = row?;
             if let Ok(regex) = Regex::new(&pattern) {
-                rules.push(SpamRule { id, pattern, description, regex });
+                rules.push(SpamRule { id, description, regex });
             }
         }
         Ok(rules)
@@ -584,6 +583,49 @@ impl Runtime {
         *project_chat = Some(chat_id);
     }
 
+    async fn blacklist_reason_message_id(&self) -> Result<Option<i32>> {
+        let conn = self.open_conn() ?;
+        let mut stmt = conn.prepare("SELECT value FROM model_meta WHERE key = 'blacklist_reason_message_id'")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let value: String = row.get(0)?;
+            Ok(value.parse::<i32>().ok())
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn set_blacklist_reason_message_id(&self, message_id: i32) -> Result<()> {
+        let conn = self.open_conn()?;
+        conn.execute(
+            "INSERT INTO model_meta (key, value) VALUES ('blacklist_reason_message_id', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![message_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    async fn blacklist_reason_link(&self) -> Option<String> {
+        match self.blacklist_reason_message_id().await {
+            Ok(Some(message_id)) => Some(public_log_link(&self.config, message_id)),
+            _ => None,
+        }
+    }
+
+    async fn start_pending_rule_addition(&self, user_id: i64, pattern: String) {
+        let mut pending = self.pending_rule_additions.lock().await;
+        pending.insert(user_id, pattern);
+    }
+
+    async fn take_pending_rule_addition(&self, user_id: i64) -> Option<String> {
+        let mut pending = self.pending_rule_additions.lock().await;
+        pending.remove(&user_id)
+    }
+
+    async fn pending_rule_addition(&self, user_id: i64) -> Option<String> {
+        let pending = self.pending_rule_additions.lock().await;
+        pending.get(&user_id).cloned()
+    }
+
     async fn project_chat(&self) -> Option<i64> {
         let project_chat = self.project_chat.lock().await;
         *project_chat
@@ -673,6 +715,24 @@ impl Runtime {
         .await??;
         self.refresh_spam_rules().await?;
         Ok(id)
+    }
+
+    async fn update_spam_rule_pattern(&self, rule_id: i64, pattern: &str) -> Result<bool> {
+        let pattern = pattern.to_string();
+        let sqlite_path = self.sqlite_path.clone();
+        let updated = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = Connection::open(&sqlite_path)?;
+            let mut conn = conn;
+            Runtime::init_db(&mut conn)?;
+            Ok(conn.execute("UPDATE spam_rules SET pattern = ?2 WHERE id = ?1", params![rule_id, pattern])?)
+        })
+        .await??;
+        if updated > 0 {
+            self.refresh_spam_rules().await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     async fn delete_spam_rule(&self, rule_id: i64) -> Result<bool> {
@@ -814,15 +874,15 @@ impl Runtime {
         let mut regex_hits = Vec::new();
         if !text.trim().is_empty() {
             if let Some(display_name_hit) = rules.iter().find(|rule| rule.regex.is_match(&short_user(user))) {
-                regex_hits.push(format!("display_name_regex#{}:{}", display_name_hit.id, display_name_hit.pattern));
+                regex_hits.push(format!("REGEX@{}", display_name_hit.id));
             }
             if let Some(bio) = bio {
                 if let Some(bio_hit) = rules.iter().find(|rule| rule.regex.is_match(bio)) {
-                    regex_hits.push(format!("bio_regex#{}:{}", bio_hit.id, bio_hit.pattern));
+                    regex_hits.push(format!("REGEX@{}", bio_hit.id));
                 }
             }
             if let Some(text_hit) = rules.iter().find(|rule| rule.regex.is_match(text)) {
-                regex_hits.push(format!("text_regex#{}:{}", text_hit.id, text_hit.pattern));
+                regex_hits.push(format!("REGEX@{}", text_hit.id));
             }
         }
         reasons.extend(regex_hits);
@@ -840,8 +900,6 @@ impl Runtime {
                 return Ok(InspectionResult::Spam {
                     score: 1.0,
                     matched_rule: Some(MatchedRule {
-                        id: rule.id,
-                        pattern: rule.pattern.clone(),
                         description: rule.description.clone(),
                     }),
                 });
@@ -896,6 +954,8 @@ enum ModerationCommand {
     MlDebugParse,
     MlScoreDebug,
     AddRule(String),
+    EditRule(String, String),
+    UpdateBL,
     ListRules,
     DelRule(String),
     Module(String, String),
@@ -939,6 +999,14 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/ml_debug_parse" => ModerationCommand::MlDebugParse,
         "/ml_score_debug" => ModerationCommand::MlScoreDebug,
         "/add_rule" => ModerationCommand::AddRule(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
+        "/edit_rule" => {
+            let mut parts = text.split_whitespace();
+            let _ = parts.next();
+            let rule_id = parts.next().unwrap_or("").to_string();
+            let pattern = parts.collect::<Vec<_>>().join(" ");
+            ModerationCommand::EditRule(rule_id, pattern)
+        }
+        "/updatebl" => ModerationCommand::UpdateBL,
         "/list_rules" => ModerationCommand::ListRules,
         "/del_rule" => ModerationCommand::DelRule(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/module" | "/moudle" => {
@@ -997,20 +1065,20 @@ fn evaluate_name_guard(full_name: &str, username: Option<&str>) -> Vec<String> {
     let mut reasons = Vec::new();
 
     if has_digits && total_len >= 7 {
-        reasons.push("英文名含數字且長度 >= 7".to_string());
+        reasons.push("NLDIGIT".to_string());
     }
     if parts.len() >= 2 && total_len >= 10 {
-        reasons.push("英文名多段且總長度 >= 10".to_string());
+        reasons.push("NL10".to_string());
     }
     if parts.len() >= 2 && parts.last().map(|s| s.len() >= 5).unwrap_or(false) {
-        reasons.push("英文名多段且尾段過長".to_string());
+        reasons.push("NLTAIL".to_string());
     }
     if parts.len() == 1 && total_len >= 11 {
-        reasons.push("英文名單段且長度 >= 11".to_string());
+        reasons.push("NLSINGLE".to_string());
     }
     if let Some(u) = username {
         if u.contains('-') {
-            reasons.push(format!("username={}", u));
+            reasons.push("NLDASH".to_string());
         }
     }
     reasons
@@ -1024,16 +1092,16 @@ fn evaluate_module_checks(user: &teloxide::types::User, bio: Option<&str>, messa
     let mut reasons = Vec::new();
     let name = short_user(user);
     if contains_arabic_script(&name) {
-        reasons.push("偵測到清真。".to_string());
+        reasons.push("ARABIC".to_string());
     }
     if let Some(bio) = bio {
         if contains_arabic_script(bio) {
-            reasons.push("偵測到清真。".to_string());
+            reasons.push("ARABIC".to_string());
         }
     }
     if let Some(text) = message_text {
         if contains_arabic_script(text) {
-            reasons.push("偵測到清真。".to_string());
+            reasons.push("ARABIC".to_string());
         }
     }
     reasons
@@ -1276,23 +1344,24 @@ fn chinese_case_reason(case: &CaseRecord) -> String {
     case.matched_rule_pattern.as_ref().map(|s| s.clone()).unwrap_or_else(|| "-".to_string())
 }
 
-fn format_chinese_case(case: &CaseRecord) -> String {
-    format!(
-        "案例: {}\n操作: {}\n群組: {}\n對象: {} {}\n處理者: {}\n分數: {}\n原因: {}\n證據:\n{}\n時間: {}",
-        case.id,
-        chinese_case_action(case),
-        case.chat_id,
-        case.target_user_id,
-        escape_html(&case.target_name),
-        case.actor_user_id.map(|id| id.to_string()).unwrap_or_else(|| "system".to_string()),
-        case.model_score.map(|s| format!("{s:.4}")).unwrap_or_else(|| "-".to_string()),
-        escape_html(&chinese_case_reason(case)),
-        escape_html(&case.evidence_text),
-        utc8_display(case.created_at),
-    )
+fn build_reason_link(reason: &str, link: &str) -> String {
+    format!("<a href=\"{link}\">{reason}</a>")
 }
 
-fn format_case_lookup(case: &CaseRecord, link: &str) -> String {
+fn build_blacklist_reason_text(_runtime: &Runtime) -> String {
+    "<b>封禁代號說明</b>\n\n本訊息由 /updateBL 更新。\n群組與查詢只顯示代號。\n\n<b>代號</b>\n- N: 無\n- SP: 特殊\n- NLDIGIT: 英名含數字\n- NL10: 英名多段且總長度 >= 10\n- NLTAIL: 英名多段且尾段過長\n- NLSINGLE: 英名單段且長度 >= 11\n- ARABIC: 偵測到清真\n- REGEX: 觸發正則規則\n".to_string()
+}
+
+fn format_public_reason(reason: &str, link: &str) -> String {
+    reason
+        .split('；')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| build_reason_link(&escape_html(part.trim()), link))
+        .collect::<Vec<_>>()
+        .join("；")
+}
+
+fn format_case_lookup(case: &CaseRecord, link: &str, reason_link: &str) -> String {
     format!(
         "<b>案例</b>: <code>{}</code>\n<b>操作</b>: {}\n<b>狀態</b>: {}\n<b>對象</b>: {} ({})\n<b>原因</b>: {}\n<b>日誌</b>: {}\n<b>證據</b>: <blockquote>{}</blockquote>",
         case.id,
@@ -1300,7 +1369,7 @@ fn format_case_lookup(case: &CaseRecord, link: &str) -> String {
         escape_html(&case.status),
         escape_html(&case.target_name),
         case.target_user_id,
-        escape_html(&chinese_case_reason(case)),
+        format_public_reason(&chinese_case_reason(case), reason_link),
         link,
         escape_html(&case.evidence_text),
     )
@@ -1467,12 +1536,24 @@ async fn log_callback_error(bot: &Bot, runtime: &Runtime, case: &CaseRecord, sta
 
 async fn notify_group(bot: &Bot, runtime: &Runtime, case: &CaseRecord, log_message_id: i32, header: &str) -> Result<()> {
     let link = public_log_link(&runtime.config, log_message_id);
+    let reason_link = runtime.blacklist_reason_link().await.unwrap_or_else(|| link.clone());
+    let reason = case.matched_rule_pattern.as_deref().unwrap_or("N");
     let text = format!(
-        "{header}\n\n<b>操作</b>: {}\n<b>對象</b>: <code>{}</code> {}\n<b>證據</b>: <a href=\"{}\">查看日誌</a>\n<b>案例</b>: <code>{}</code>",
+        "{header}\n\n<b>操作</b>: {}\n<b>對象</b>: <code>{}</code>\n<b>原因</b>: {}\n<b>證據</b>: <a href=\"{}\">查看日誌</a>\n<b>案例</b>: <code>{}</code>",
         chinese_case_action(case),
-        case.target_user_id, escape_html(&case.target_name), link, case.id
+        case.target_user_id,
+        format_public_reason(reason, &reason_link),
+        link,
+        case.id
     );
-    bot.send_message(ChatId(case.chat_id), text).parse_mode(ParseMode::Html).await?;
+    let sent = bot.send_message(ChatId(case.chat_id), text).parse_mode(ParseMode::Html).await?;
+    let bot = bot.clone();
+    let chat_id = ChatId(case.chat_id);
+    let message_id = sent.id;
+    tokio::spawn(async move {
+        sleep(Duration::from_secs(180)).await;
+        let _ = bot.delete_message(chat_id, message_id).await;
+    });
     Ok(())
 }
 
@@ -1729,9 +1810,8 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let result = runtime.inspect_message(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
             let response = match &result {
                 InspectionResult::Spam { score, matched_rule: Some(rule) } => format!(
-                    "<b>判定</b>: 垃圾\n<b>分數</b>: {score:.6}\n<b>規則</b>: #{} {}\n<b>說明</b>: {}",
-                    rule.id,
-                    escape_html(&rule.pattern),
+                    "<b>判定</b>: 垃圾\n<b>分數</b>: {score:.6}\n<b>規則</b>: {}\n<b>說明</b>: {}",
+                    "REGEX",
                     escape_html(&rule.description),
                 ),
                 InspectionResult::Spam { score, .. } => {
@@ -1903,7 +1983,8 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             match runtime.load_case(&case_id).await {
                 Ok(Some(case)) => {
                     let link = case.log_message_id.map(|id| public_log_link(&runtime.config, id)).unwrap_or_else(|| "-".to_string());
-                    let text = format_case_lookup(&case, &link);
+                    let reason_link = runtime.blacklist_reason_link().await.unwrap_or_else(|| link.clone());
+                    let text = format_case_lookup(&case, &link, &reason_link);
                     bot.send_message(message.chat.id, text).parse_mode(ParseMode::Html).await?;
                 }
                 _ => {
@@ -1996,11 +2077,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             }
             let rules = runtime.list_spam_rules().await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
             let body = if rules.is_empty() {
-                "<b>Rules</b>\n無規則".to_string()
+                "<b>規則</b>\n無".to_string()
             } else {
-                let mut out = String::from("<b>Rules</b>\n");
-                for (id, pattern, description) in rules {
-                    out.push_str(&format!("#{} {} {}\n", id, escape_html(&pattern), escape_html(&description)));
+                let mut out = String::from("<b>規則</b>\n");
+                for (id, _pattern, description) in rules {
+                    out.push_str(&format!("@{} {}\n", id, escape_html(&description)));
                 }
                 out
             };
@@ -2025,11 +2106,42 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             }
             let pattern = rule.trim();
             if pattern.is_empty() {
-                bot.send_message(message.chat.id, "請提供 regex 規則。").await?;
+                bot.send_message(message.chat.id, "請提供正則。").await?;
                 return Ok(());
             }
-            let id = runtime.add_spam_rule(pattern, "").await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
-            bot.send_message(message.chat.id, format!("已新增 spam regex 規則 #{id}。")).await?;
+            runtime.start_pending_rule_addition(from_id, pattern.to_string()).await;
+            bot.send_message(message.chat.id, "好的，這組正則要叫什麼？").await?;
+        }
+        ModerationCommand::EditRule(rule_id, pattern) => {
+            if !is_maintainer(&bot, &runtime.config, from_id).await {
+                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
+                return Ok(());
+            }
+            let Some(id) = rule_id.parse::<i64>().ok() else {
+                bot.send_message(message.chat.id, "請提供有效的規則 ID。").await?;
+                return Ok(());
+            };
+            if pattern.trim().is_empty() {
+                bot.send_message(message.chat.id, "請提供正則。").await?;
+                return Ok(());
+            }
+            let updated = runtime.update_spam_rule_pattern(id, pattern.trim()).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
+            if updated {
+                bot.send_message(message.chat.id, format!("已更新規則 @{id}。名稱不變。\n")).await?;
+            } else {
+                bot.send_message(message.chat.id, format!("找不到規則 @{id}。")).await?;
+            }
+        }
+        ModerationCommand::UpdateBL => {
+            if !is_maintainer(&bot, &runtime.config, from_id).await {
+                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
+                return Ok(());
+            }
+            let text = build_blacklist_reason_text(&runtime);
+            let sent = bot.send_message(ChatId(runtime.config.log_channel_id), text).parse_mode(ParseMode::Html).await?;
+            let _ = bot.pin_chat_message(ChatId(runtime.config.log_channel_id), sent.id).await;
+            let _ = runtime.set_blacklist_reason_message_id(sent.id.0).await;
+            bot.send_message(message.chat.id, format!("已更新封禁代號說明：<code>{}</code>", sent.id.0)).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::Module(module, state) => {
             if !message.chat.is_group() && !message.chat.is_supergroup() {
@@ -2090,11 +2202,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                             }, profile.bio.as_deref(), None).await;
                             match result {
                                 Ok(result) => {
-            let body = format!(
-                "<b>檢查結果</b>\n<b>使用者</b>: {}\n<b>原因</b>: {}\n<b>名稱規則</b>: {}\n<b>清真規則</b>: {}",
-                escape_html(&profile.display_name),
-                escape_html(&if result.reasons.is_empty() { "無".to_string() } else { result.reasons.join("；") }),
-                escape_html(&if result.name_guard.is_empty() { "無".to_string() } else { result.name_guard.join("；") }),
+                                    let body = format!(
+                                        "<b>檢查</b>\n<b>人</b>: {}\n<b>因</b>: {}\n<b>名</b>: {}\n<b>清</b>: {}",
+                                        escape_html(&profile.display_name),
+                                        escape_html(&if result.reasons.is_empty() { "無".to_string() } else { result.reasons.join("；") }),
+                                        escape_html(&if result.name_guard.is_empty() { "無".to_string() } else { result.name_guard.join("；") }),
                                         escape_html(&if result.no_halal.is_empty() { "無".to_string() } else { result.no_halal.join("；") }),
                                     );
                                     bot.send_message(message.chat.id, body).parse_mode(ParseMode::Html).await?;
@@ -2123,7 +2235,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             match result {
                 Ok(result) => {
                     let body = format!(
-                        "<b>檢查結果</b>\n<b>使用者</b>: {}\n<b>原因</b>: {}\n<b>名稱規則</b>: {}\n<b>清真規則</b>: {}",
+                        "<b>檢查</b>\n<b>人</b>: {}\n<b>因</b>: {}\n<b>名</b>: {}\n<b>清</b>: {}",
                         escape_html(&short_user(user)),
                         escape_html(&if result.reasons.is_empty() { "無".to_string() } else { result.reasons.join("；") }),
                         escape_html(&if result.name_guard.is_empty() { "無".to_string() } else { result.name_guard.join("；") }),
@@ -2235,7 +2347,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             } else {
                 extracted.into_iter().map(|s| escape_html(&s)).collect::<Vec<_>>().join("\n---\n")
             };
-            bot.send_message(message.chat.id, format!("提取結果：\n<blockquote>{}</blockquote>", body)).parse_mode(ParseMode::Html).await?;
+            bot.send_message(message.chat.id, format!("<b>提</b>:\n<blockquote>{}</blockquote>", body)).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::MlScoreDebug => {
             if !is_maintainer(&bot, &runtime.config, from_id).await {
@@ -2251,14 +2363,14 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let user_name = message.from.as_ref().map(short_user).unwrap_or_else(|| "unknown".to_string());
             let result = runtime.inspect_message(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
             let mut out = String::new();
-            out.push_str(&format!("<b>提取結果</b>:\n<blockquote>{}</blockquote>\n", escape_html(&text)));
+            out.push_str(&format!("<b>提</b>:\n<blockquote>{}</blockquote>\n", escape_html(&text)));
             match result {
                 InspectionResult::Spam { score, matched_rule: Some(rule) } => {
-                    out.push_str(&format!("<b>判定</b>: spam\n<b>分數</b>: {score:.6}\n<b>規則</b>: #{} {}\n<b>說明</b>: {}", rule.id, escape_html(&rule.pattern), escape_html(&rule.description)));
+                    out.push_str(&format!("<b>判</b>: 垃圾\n<b>分</b>: {score:.6}\n<b>規</b>: {}\n<b>說</b>: {}", "REGEX", escape_html(&rule.description)));
                 }
                 InspectionResult::Spam { score, .. } | InspectionResult::Ham { score } => {
                     let report = runtime.score_debug(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
-                    out.push_str(&format!("<b>判定</b>: {}\n<b>分數</b>: {score:.6}\n{}", if score >= runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold) { "spam" } else { "ham" }, format_score_debug(&report)));
+                    out.push_str(&format!("<b>判</b>: {}\n<b>分</b>: {score:.6}\n{}", if score >= runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold) { "垃圾" } else { "正常" }, format_score_debug(&report)));
                 }
             }
             bot.send_message(message.chat.id, out).parse_mode(ParseMode::Html).await?;
@@ -2321,6 +2433,15 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         ModerationCommand::Unknown => {
             if message.chat.is_private() {
                 let is_maintainer = is_maintainer(&bot, &runtime.config, from_id).await;
+                if let Some(pattern) = runtime.pending_rule_addition(from_id).await {
+                    let name = text.trim();
+                    if !name.is_empty() {
+                        let id = runtime.add_spam_rule(&pattern, name).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
+                        runtime.take_pending_rule_addition(from_id).await;
+                        bot.send_message(message.chat.id, format!("已建立規則 @{}。", id)).await?;
+                        return Ok(());
+                    }
+                }
                 bot.send_message(message.chat.id, help_text(is_maintainer)).parse_mode(ParseMode::Html).await?;
             }
         }
@@ -2527,10 +2648,10 @@ async fn score_only(bot: &Bot, runtime: &Runtime, message: &Message) -> Response
     };
     let threshold = runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold);
     let verdict = if score >= threshold { "spam" } else { "ham" };
-    let reply = format!("<b>分數</b>: {score:.4}\n<b>門檻</b>: {threshold:.4}\n<b>判定</b>: {verdict}");
-    bot.send_message(message.chat.id, reply).parse_mode(ParseMode::Html).await?;
-    Ok(())
-}
+            let reply = format!("<b>分</b>: {score:.4}\n<b>門</b>: {threshold:.4}\n<b>判</b>: {verdict}");
+            bot.send_message(message.chat.id, reply).parse_mode(ParseMode::Html).await?;
+            Ok(())
+        }
 
 async fn ensure_bot_can_moderate(bot: &Bot, _runtime: &Runtime, chat_id: ChatId) -> ResponseResult<bool> {
     let me = bot.get_me().await?;
