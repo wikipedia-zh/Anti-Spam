@@ -1224,10 +1224,10 @@ fn help_text(is_maintainer: bool) -> String {
 
 fn format_score_debug(report: &ScoreDebugReport) -> String {
     let mut out = String::new();
-    out.push_str(&format!("<b>Score</b>: {:.6}\n", report.score));
+    out.push_str(&format!("<b>分數</b>: {:.6}\n", report.score));
     for item in &report.tokens {
         out.push_str(&format!(
-            "<code>{}</code> spam={} ham={} sp={:.6} hp={:.6} delta={:.6}\n",
+            "<code>{}</code> 垃圾={} 正常={} 垃圾機率={:.6} 正常機率={:.6} 差值={:.6}\n",
             escape_html(&item.token),
             item.spam_count,
             item.ham_count,
@@ -1345,65 +1345,70 @@ fn is_special_user(config: &Config, user_id: i64) -> bool {
     config.maintainer_ids.contains(&user_id)
 }
 
-async fn notify_bot_added(bot: &Bot, runtime: &Runtime, message: &Message) {
-    if let Some(users) = message.new_chat_members() {
-        if users.iter().any(|u| u.is_bot) {
-            let title = message.chat.title().unwrap_or("unknown");
-            let text = format!(
-                "<b>機器人已加入</b>\n<b>群組</b>: <code>{}</code>\n<b>標題</b>: {}\n<b>來源</b>: <code>{}</code>",
-                message.chat.id.0,
-                escape_html(title),
-                message.from.as_ref().map(short_user).unwrap_or_else(|| "unknown".to_string())
-            );
-            let _ = bot.send_message(ChatId(runtime.config.report_channel_id), text).parse_mode(ParseMode::Html).await;
+async fn notify_bot_added(bot: &Bot, runtime: &Runtime, message: &Message) -> bool {
+    let Some(users) = message.new_chat_members() else { return false; };
+    if users.is_empty() {
+        return false;
+    }
+
+    if users.iter().any(|u| u.is_bot) {
+        let title = message.chat.title().unwrap_or("unknown");
+        let text = format!(
+            "<b>機器人已加入</b>\n<b>群組</b>: <code>{}</code>\n<b>標題</b>: {}\n<b>來源</b>: <code>{}</code>",
+            message.chat.id.0,
+            escape_html(title),
+            message.from.as_ref().map(short_user).unwrap_or_else(|| "unknown".to_string())
+        );
+        let _ = bot.send_message(ChatId(runtime.config.report_channel_id), text).parse_mode(ParseMode::Html).await;
+    }
+
+    for user in users {
+        if is_special_user(&runtime.config, user.id.0 as i64) {
+            continue;
+        }
+        if runtime.is_group_whitelisted(message.chat.id.0, user.id.0 as i64).await.unwrap_or(false) {
+            continue;
         }
 
-        for user in users {
-            if is_special_user(&runtime.config, user.id.0 as i64) {
-                continue;
-            }
+        let enabled = runtime.get_group_modules(message.chat.id.0).await.unwrap_or_default();
+        if !enabled.no_long_name && !enabled.no_halal {
+            continue;
+        }
 
-            let enabled = runtime.get_group_modules(message.chat.id.0).await.unwrap_or_default();
-            if !enabled.no_long_name && !enabled.no_halal {
-                continue;
-            }
+        let reasons = if enabled.no_long_name { evaluate_name_guard(&short_user(user), user.username.as_deref()) } else { Vec::new() };
+        let mut arabic_reasons = if enabled.no_halal { evaluate_module_checks(user, None, None) } else { Vec::new() };
+        let mut all_reasons = reasons;
+        all_reasons.append(&mut arabic_reasons);
 
-            let reasons = if enabled.no_long_name { evaluate_name_guard(&short_user(user), user.username.as_deref()) } else { Vec::new() };
-
-            let mut arabic_reasons = if enabled.no_halal {
-                evaluate_module_checks(user, None, None)
-            } else {
-                Vec::new()
+        if !all_reasons.is_empty() {
+            let _ = bot.delete_message(message.chat.id, message.id).await;
+            let _ = ban_user(bot, message.chat.id, user.id.0 as i64).await;
+            let case = CaseRecord {
+                id: Uuid::new_v4().to_string(),
+                action: ActionKind::AutoBan,
+                chat_id: message.chat.id.0,
+                target_user_id: user.id.0 as i64,
+                target_name: short_user(user),
+                actor_user_id: None,
+                actor_name: None,
+                source_message_id: Some(message.id.0),
+                evidence_text: extract_full_text(&message),
+                model_score: None,
+                matched_rule_id: None,
+                matched_rule_pattern: Some(all_reasons.join("；")),
+                status: "auto_banned".to_string(),
+                log_message_id: None,
+                created_at: Utc::now(),
             };
-
-            let mut all_reasons = reasons;
-            all_reasons.append(&mut arabic_reasons);
-
-            if !all_reasons.is_empty() {
-                let _ = ban_user(bot, message.chat.id, user.id.0 as i64).await;
-                let _ = bot.delete_message(message.chat.id, message.id).await;
-                let case = CaseRecord {
-                    id: Uuid::new_v4().to_string(),
-                    action: ActionKind::AutoBan,
-                    chat_id: message.chat.id.0,
-                    target_user_id: user.id.0 as i64,
-                    target_name: short_user(user),
-                    actor_user_id: None,
-                    actor_name: None,
-                    source_message_id: Some(message.id.0),
-                    evidence_text: extract_full_text(&message),
-                    model_score: None,
-                    matched_rule_id: None,
-                    matched_rule_pattern: Some(all_reasons.join("；")),
-                    status: "auto_banned".to_string(),
-                    log_message_id: None,
-                    created_at: Utc::now(),
-                };
-                let case_text = format_chinese_case(&case);
-                let _ = bot.send_message(ChatId(runtime.config.log_channel_id), case_text).await;
-            }
+            let log_message_id = log_action(bot, runtime, &case).await.unwrap_or_default();
+            let mut updated = case.clone();
+            updated.log_message_id = Some(log_message_id);
+            let _ = store_case(runtime, &updated).await;
+            let _ = notify_group(bot, runtime, &updated, log_message_id, "<b>自動模組封禁</b>").await;
         }
     }
+
+    true
 }
 
 fn parse_leave_args(args: &str) -> (Option<i64>, String) {
@@ -1724,18 +1729,18 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let result = runtime.inspect_message(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
             let response = match &result {
                 InspectionResult::Spam { score, matched_rule: Some(rule) } => format!(
-                    "<b>Verdict</b>: spam\n<b>Score</b>: {score:.6}\n<b>Regex</b>: #{} {}\n<b>Description</b>: {}",
+                    "<b>判定</b>: 垃圾\n<b>分數</b>: {score:.6}\n<b>規則</b>: #{} {}\n<b>說明</b>: {}",
                     rule.id,
                     escape_html(&rule.pattern),
                     escape_html(&rule.description),
                 ),
                 InspectionResult::Spam { score, .. } => {
                     let report = runtime.score_debug(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
-                    format!("<b>Verdict</b>: spam\n<b>Score</b>: {score:.6}\n{}", format_score_debug(&report))
+                    format!("<b>判定</b>: 垃圾\n<b>分數</b>: {score:.6}\n{}", format_score_debug(&report))
                 }
                 InspectionResult::Ham { score } => {
                     let report = runtime.score_debug(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
-                    format!("<b>Verdict</b>: ham\n<b>Score</b>: {score:.6}\n{}", format_score_debug(&report))
+                    format!("<b>判定</b>: 正常\n<b>分數</b>: {score:.6}\n{}", format_score_debug(&report))
                 }
             };
             bot.send_message(message.chat.id, response).parse_mode(ParseMode::Html).await?;
@@ -2085,11 +2090,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                             }, profile.bio.as_deref(), None).await;
                             match result {
                                 Ok(result) => {
-                                    let body = format!(
-                                        "<b>檢查結果</b>\n<b>User</b>: {}\n<b>Reasons</b>: {}\n<b>Name Guard</b>: {}\n<b>NoHalal</b>: {}",
-                                        escape_html(&profile.display_name),
-                                        escape_html(&if result.reasons.is_empty() { "無".to_string() } else { result.reasons.join("；") }),
-                                        escape_html(&if result.name_guard.is_empty() { "無".to_string() } else { result.name_guard.join("；") }),
+            let body = format!(
+                "<b>檢查結果</b>\n<b>使用者</b>: {}\n<b>原因</b>: {}\n<b>名稱規則</b>: {}\n<b>清真規則</b>: {}",
+                escape_html(&profile.display_name),
+                escape_html(&if result.reasons.is_empty() { "無".to_string() } else { result.reasons.join("；") }),
+                escape_html(&if result.name_guard.is_empty() { "無".to_string() } else { result.name_guard.join("；") }),
                                         escape_html(&if result.no_halal.is_empty() { "無".to_string() } else { result.no_halal.join("；") }),
                                     );
                                     bot.send_message(message.chat.id, body).parse_mode(ParseMode::Html).await?;
@@ -2246,14 +2251,14 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let user_name = message.from.as_ref().map(short_user).unwrap_or_else(|| "unknown".to_string());
             let result = runtime.inspect_message(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
             let mut out = String::new();
-            out.push_str(&format!("<b>Extracted</b>:\n<blockquote>{}</blockquote>\n", escape_html(&text)));
+            out.push_str(&format!("<b>提取結果</b>:\n<blockquote>{}</blockquote>\n", escape_html(&text)));
             match result {
                 InspectionResult::Spam { score, matched_rule: Some(rule) } => {
-                    out.push_str(&format!("<b>Verdict</b>: spam\n<b>Score</b>: {score:.6}\n<b>Regex</b>: #{} {}\n<b>Description</b>: {}", rule.id, escape_html(&rule.pattern), escape_html(&rule.description)));
+                    out.push_str(&format!("<b>判定</b>: spam\n<b>分數</b>: {score:.6}\n<b>規則</b>: #{} {}\n<b>說明</b>: {}", rule.id, escape_html(&rule.pattern), escape_html(&rule.description)));
                 }
                 InspectionResult::Spam { score, .. } | InspectionResult::Ham { score } => {
                     let report = runtime.score_debug(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
-                    out.push_str(&format!("<b>Verdict</b>: {}\n<b>Score</b>: {score:.6}\n{}", if score >= runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold) { "spam" } else { "ham" }, format_score_debug(&report)));
+                    out.push_str(&format!("<b>判定</b>: {}\n<b>分數</b>: {score:.6}\n{}", if score >= runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold) { "spam" } else { "ham" }, format_score_debug(&report)));
                 }
             }
             bot.send_message(message.chat.id, out).parse_mode(ParseMode::Html).await?;
@@ -2522,7 +2527,7 @@ async fn score_only(bot: &Bot, runtime: &Runtime, message: &Message) -> Response
     };
     let threshold = runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold);
     let verdict = if score >= threshold { "spam" } else { "ham" };
-    let reply = format!("<b>Score</b>: {score:.4}\n<b>Threshold</b>: {threshold:.4}\n<b>Verdict</b>: {verdict}");
+    let reply = format!("<b>分數</b>: {score:.4}\n<b>門檻</b>: {threshold:.4}\n<b>判定</b>: {verdict}");
     bot.send_message(message.chat.id, reply).parse_mode(ParseMode::Html).await?;
     Ok(())
 }
@@ -2556,7 +2561,9 @@ async fn main() -> Result<()> {
         move |bot: Bot, message: Message| {
             let runtime = runtime.clone();
             async move {
-                notify_bot_added(&bot, &runtime, &message).await;
+                if notify_bot_added(&bot, &runtime, &message).await {
+                    return Ok(());
+                }
                 if let Some(text) = message.text() {
                     if text.trim_start().starts_with('/') {
                         if !matches!(parse_command(text), ModerationCommand::Unknown) {
