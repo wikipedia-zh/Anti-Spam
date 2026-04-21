@@ -134,6 +134,27 @@ struct Runtime {
     mass_train_mode: Mutex<HashMap<i64, String>>,
 }
 
+#[derive(Clone, Default)]
+struct GroupModuleSettings {
+    no_long_name: bool,
+    no_halal: bool,
+}
+
+#[derive(Clone)]
+struct ModuleCheckResult {
+    reasons: Vec<String>,
+    name_guard: Vec<String>,
+    no_halal: Vec<String>,
+}
+
+#[derive(Clone)]
+struct UserProfileInfo {
+    user_id: i64,
+    display_name: String,
+    username: Option<String>,
+    bio: Option<String>,
+}
+
 #[derive(Clone)]
 struct SpamRule {
     id: i64,
@@ -229,6 +250,18 @@ impl Runtime {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 pattern TEXT NOT NULL,
                 description TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS group_module_settings (
+                chat_id INTEGER PRIMARY KEY,
+                no_long_name INTEGER NOT NULL DEFAULT 0,
+                no_halal INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS group_whitelist (
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                added_by INTEGER,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, user_id)
             );
             CREATE TABLE IF NOT EXISTS model_meta (
                 key TEXT PRIMARY KEY,
@@ -678,6 +711,125 @@ impl Runtime {
         .await?
     }
 
+    async fn get_group_modules(&self, chat_id: i64) -> Result<GroupModuleSettings> {
+        let conn = self.open_conn()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO group_module_settings (chat_id) VALUES (?1)",
+            params![chat_id],
+        )?;
+        let mut stmt = conn.prepare("SELECT no_long_name, no_halal FROM group_module_settings WHERE chat_id = ?1")?;
+        let mut rows = stmt.query(params![chat_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(GroupModuleSettings {
+                no_long_name: row.get::<_, i64>(0)? != 0,
+                no_halal: row.get::<_, i64>(1)? != 0,
+            })
+        } else {
+            Ok(GroupModuleSettings::default())
+        }
+    }
+
+    async fn set_group_module(&self, chat_id: i64, module: &str, enabled: bool) -> Result<()> {
+        let conn = self.open_conn()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO group_module_settings (chat_id) VALUES (?1)",
+            params![chat_id],
+        )?;
+        match module {
+            "nolongname" => {
+                conn.execute(
+                    "UPDATE group_module_settings SET no_long_name = ?2 WHERE chat_id = ?1",
+                    params![chat_id, if enabled { 1 } else { 0 }],
+                )?;
+            }
+            "nohalal" => {
+                conn.execute(
+                    "UPDATE group_module_settings SET no_halal = ?2 WHERE chat_id = ?1",
+                    params![chat_id, if enabled { 1 } else { 0 }],
+                )?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn is_group_whitelisted(&self, chat_id: i64, user_id: i64) -> Result<bool> {
+        let conn = self.open_conn()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM group_whitelist WHERE chat_id = ?1 AND user_id = ?2",
+            params![chat_id, user_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    async fn set_group_whitelist(&self, chat_id: i64, user_id: i64, enabled: bool, added_by: Option<i64>) -> Result<()> {
+        let conn = self.open_conn()?;
+        if enabled {
+            conn.execute(
+                "INSERT OR IGNORE INTO group_whitelist (chat_id, user_id, added_by, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![chat_id, user_id, added_by, Utc::now().to_rfc3339()],
+            )?;
+        } else {
+            conn.execute(
+                "DELETE FROM group_whitelist WHERE chat_id = ?1 AND user_id = ?2",
+                params![chat_id, user_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    async fn load_user_profile(&self, bot: &Bot, user_id: i64) -> Result<UserProfileInfo> {
+        let chat = bot.get_chat(ChatId(user_id)).await?;
+        let display_name = chat.title().map(|s| s.to_string()).or_else(|| chat.first_name().map(|s| s.to_string())).unwrap_or_else(|| format!("User{user_id}"));
+        let username = chat.username().map(|s| s.to_string());
+        let bio = chat.bio().map(|s| s.to_string());
+        Ok(UserProfileInfo { user_id, display_name, username, bio })
+    }
+
+    async fn check_group_modules(&self, _bot: &Bot, chat_id: i64, user: &teloxide::types::User, bio: Option<&str>, message_text: Option<&str>) -> Result<ModuleCheckResult> {
+        let settings = self.get_group_modules(chat_id).await?;
+        let mut reasons = Vec::new();
+        let mut name_guard = Vec::new();
+        let mut no_halal = Vec::new();
+
+        if settings.no_long_name && !is_special_user(&self.config, user.id.0 as i64) {
+            let r = evaluate_no_long_name(user);
+            if !r.is_empty() {
+                reasons.extend(r.clone());
+                name_guard = r;
+            }
+        }
+
+        if settings.no_halal && !is_special_user(&self.config, user.id.0 as i64) {
+            let r = evaluate_module_checks(user, bio, message_text);
+            if !r.is_empty() {
+                reasons.extend(r.clone());
+                no_halal = r;
+            }
+        }
+
+        let text = message_text.unwrap_or("");
+        let rules = self.spam_rules.read().await;
+        let mut regex_hits = Vec::new();
+        if !text.trim().is_empty() {
+            if let Some(display_name_hit) = rules.iter().find(|rule| rule.regex.is_match(&short_user(user))) {
+                regex_hits.push(format!("display_name_regex#{}:{}", display_name_hit.id, display_name_hit.pattern));
+            }
+            if let Some(bio) = bio {
+                if let Some(bio_hit) = rules.iter().find(|rule| rule.regex.is_match(bio)) {
+                    regex_hits.push(format!("bio_regex#{}:{}", bio_hit.id, bio_hit.pattern));
+                }
+            }
+            if let Some(text_hit) = rules.iter().find(|rule| rule.regex.is_match(text)) {
+                regex_hits.push(format!("text_regex#{}:{}", text_hit.id, text_hit.pattern));
+            }
+        }
+        reasons.extend(regex_hits);
+
+        Ok(ModuleCheckResult { reasons, name_guard, no_halal })
+    }
+
     async fn inspect_message(&self, _display_name: &str, text: &str) -> Result<InspectionResult> {
         let rules = self.spam_rules.read().await;
         if tokenize(text).is_empty() {
@@ -746,6 +898,9 @@ enum ModerationCommand {
     AddRule(String),
     ListRules,
     DelRule(String),
+    Module(String, String),
+    White(String),
+    Check(String),
     Unknown,
 }
 
@@ -786,12 +941,102 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/add_rule" => ModerationCommand::AddRule(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
         "/list_rules" => ModerationCommand::ListRules,
         "/del_rule" => ModerationCommand::DelRule(text.split_whitespace().nth(1).unwrap_or("").to_string()),
+        "/module" | "/moudle" => {
+            let mut parts = text.split_whitespace();
+            let _ = parts.next();
+            let module = parts.next().unwrap_or("").to_string();
+            let state = parts.next().unwrap_or("").to_string();
+            ModerationCommand::Module(module, state)
+        }
+        "/white" => ModerationCommand::White(text.split_whitespace().nth(1).unwrap_or("").to_string()),
+        "/check" => ModerationCommand::Check(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
         _ => ModerationCommand::Unknown,
     }
 }
 
 fn tokenize(text: &str) -> Vec<String> {
     normalize_tokens(text, jieba())
+}
+
+fn contains_arabic_script(text: &str) -> bool {
+    if text.trim().is_empty() {
+        return false;
+    }
+    text.chars().any(|c| ('\u{0600}'..='\u{06FF}').contains(&c)
+        || ('\u{0750}'..='\u{077F}').contains(&c)
+        || ('\u{08A0}'..='\u{08FF}').contains(&c)
+        || ('\u{FB50}'..='\u{FDFF}').contains(&c)
+        || ('\u{FE70}'..='\u{FEFF}').contains(&c))
+}
+
+fn clean_name_parts(text: &str) -> (String, Vec<String>) {
+    let clean = text
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == ' ' || *c == '-')
+        .collect::<String>();
+    let parts = clean
+        .split([' ', '-'])
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
+        .collect::<Vec<_>>();
+    (clean, parts)
+}
+
+fn evaluate_name_guard(full_name: &str, username: Option<&str>) -> Vec<String> {
+    if full_name.chars().any(|c| !c.is_ascii()) {
+        return Vec::new();
+    }
+
+    let (clean, parts) = clean_name_parts(full_name);
+    if clean.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let has_digits = clean.chars().any(|c| c.is_ascii_digit());
+    let total_len = clean.chars().filter(|c| c.is_ascii_alphanumeric()).count();
+    let mut reasons = Vec::new();
+
+    if has_digits && total_len >= 7 {
+        reasons.push("英文名含數字且長度 >= 7".to_string());
+    }
+    if parts.len() >= 2 && total_len >= 10 {
+        reasons.push("英文名多段且總長度 >= 10".to_string());
+    }
+    if parts.len() >= 2 && parts.last().map(|s| s.len() >= 5).unwrap_or(false) {
+        reasons.push("英文名多段且尾段過長".to_string());
+    }
+    if parts.len() == 1 && total_len >= 11 {
+        reasons.push("英文名單段且長度 >= 11".to_string());
+    }
+    if let Some(u) = username {
+        if u.contains('-') {
+            reasons.push(format!("username={}", u));
+        }
+    }
+    reasons
+}
+
+fn evaluate_no_long_name(user: &teloxide::types::User) -> Vec<String> {
+    evaluate_name_guard(&short_user(user), user.username.as_deref())
+}
+
+fn evaluate_module_checks(user: &teloxide::types::User, bio: Option<&str>, message_text: Option<&str>) -> Vec<String> {
+    let mut reasons = Vec::new();
+    let name = short_user(user);
+    if contains_arabic_script(&name) {
+        reasons.push("偵測到清真。".to_string());
+    }
+    if let Some(bio) = bio {
+        if contains_arabic_script(bio) {
+            reasons.push("偵測到清真。".to_string());
+        }
+    }
+    if let Some(text) = message_text {
+        if contains_arabic_script(text) {
+            reasons.push("偵測到清真。".to_string());
+        }
+    }
+    reasons
 }
 
 fn jieba() -> &'static Jieba {
@@ -1060,6 +1305,47 @@ async fn notify_bot_added(bot: &Bot, runtime: &Runtime, message: &Message) {
                 message.from.as_ref().map(short_user).unwrap_or_else(|| "unknown".to_string())
             );
             let _ = bot.send_message(ChatId(runtime.config.report_channel_id), text).parse_mode(ParseMode::Html).await;
+        }
+
+        for user in users {
+            if is_special_user(&runtime.config, user.id.0 as i64) {
+                continue;
+            }
+
+            let enabled = runtime.get_group_modules(message.chat.id.0).await.unwrap_or_default();
+            if !enabled.no_long_name && !enabled.no_halal {
+                continue;
+            }
+
+            let reasons = if enabled.no_long_name { evaluate_name_guard(&short_user(user), user.username.as_deref()) } else { Vec::new() };
+
+            let mut arabic_reasons = if enabled.no_halal {
+                evaluate_module_checks(user, None, None)
+            } else {
+                Vec::new()
+            };
+
+            let mut all_reasons = reasons;
+            all_reasons.append(&mut arabic_reasons);
+
+            if !all_reasons.is_empty() {
+                let _ = ban_user(bot, message.chat.id, user.id.0 as i64).await;
+                let _ = bot.delete_message(message.chat.id, message.id).await;
+                let tracking_id = Uuid::new_v4().simple().to_string().chars().take(8).collect::<String>().to_uppercase();
+                let _ = bot.send_message(ChatId(runtime.config.log_channel_id), format!(
+                    "<b>自動封禁 (完整記錄)</b>\n用戶ID: <code>{}</code>\n用戶名稱: {}\n用戶名: {}\n群組ID: <code>{}</code>\n群組: {}\n觸發規則: Join Name Heuristic | username={} | name={} | reasons={}\n追蹤編號: {}\n時間: {}",
+                    user.id.0,
+                    escape_html(&short_user(user)),
+                    escape_html(user.username.as_deref().unwrap_or("-")),
+                    message.chat.id.0,
+                    escape_html(message.chat.title().unwrap_or("unknown")),
+                    escape_html(user.username.as_deref().unwrap_or("-")),
+                    escape_html(&short_user(user)),
+                    escape_html(&all_reasons.join("；")),
+                    tracking_id,
+                    utc8_display(Utc::now()),
+                )).parse_mode(ParseMode::Html).await;
+            }
         }
     }
 }
@@ -1694,6 +1980,111 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let id = runtime.add_spam_rule(pattern, "").await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
             bot.send_message(message.chat.id, format!("已新增 spam regex 規則 #{id}。")).await?;
         }
+        ModerationCommand::Module(module, state) => {
+            if !message.chat.is_group() && !message.chat.is_supergroup() {
+                bot.send_message(message.chat.id, "請在群組中使用 /module。") .await?;
+                return Ok(());
+            }
+            if !is_group_admin(&bot, message.chat.id, from_id).await {
+                bot.send_message(message.chat.id, "只有群組管理員可以設定模組。") .await?;
+                return Ok(());
+            }
+            let enabled = matches!(state.to_lowercase().as_str(), "on" | "enable" | "enabled");
+            let key = module.trim().to_lowercase();
+            match key.as_str() {
+                "nolongname" => { runtime.set_group_module(message.chat.id.0, "nolongname", enabled).await.ok(); }
+                "nohalal" => { runtime.set_group_module(message.chat.id.0, "nohalal", enabled).await.ok(); }
+                _ => {
+                    bot.send_message(message.chat.id, "模組名稱僅支援 NoLongName / NoHalal。") .await?;
+                    return Ok(());
+                }
+            }
+            bot.send_message(message.chat.id, format!("已將 {module} 設為 {}", if enabled { "on" } else { "off" })).await?;
+        }
+        ModerationCommand::White(target) => {
+            if !message.chat.is_group() && !message.chat.is_supergroup() {
+                bot.send_message(message.chat.id, "請在群組中使用 /white。") .await?;
+                return Ok(());
+            }
+            if !is_group_admin(&bot, message.chat.id, from_id).await {
+                bot.send_message(message.chat.id, "只有群組管理員可以設定白名單。") .await?;
+                return Ok(());
+            }
+            let Some(user_id) = target.parse::<i64>().ok().or_else(|| message.reply_to_message().and_then(|m| m.from.as_ref()).map(|u| u.id.0 as i64)) else {
+                bot.send_message(message.chat.id, "請提供 userid 或回覆一位用戶。") .await?;
+                return Ok(());
+            };
+            runtime.set_group_whitelist(message.chat.id.0, user_id, true, Some(from_id)).await.ok();
+            bot.send_message(message.chat.id, format!("已將 <code>{user_id}</code> 加入本群白名單。",)).parse_mode(ParseMode::Html).await?;
+        }
+        ModerationCommand::Check(target) => {
+            if !message.chat.is_group() && !message.chat.is_supergroup() {
+                bot.send_message(message.chat.id, "請在群組中使用 /check。") .await?;
+                return Ok(());
+            }
+            let Some(target_msg) = message.reply_to_message() else {
+                if let Ok(user_id) = target.parse::<i64>() {
+                    let profile = runtime.load_user_profile(&bot, user_id).await;
+                    match profile {
+                        Ok(profile) => {
+                            let result = runtime.check_group_modules(&bot, message.chat.id.0, &teloxide::types::User {
+                                id: UserId(profile.user_id as u64),
+                                is_bot: false,
+                                first_name: profile.display_name.clone(),
+                                last_name: None,
+                                username: profile.username.clone(),
+                                language_code: None,
+                                is_premium: false,
+                                added_to_attachment_menu: false,
+                            }, profile.bio.as_deref(), None).await;
+                            match result {
+                                Ok(result) => {
+                                    let body = format!(
+                                        "<b>檢查結果</b>\n<b>User</b>: {}\n<b>Reasons</b>: {}\n<b>Name Guard</b>: {}\n<b>NoHalal</b>: {}",
+                                        escape_html(&profile.display_name),
+                                        escape_html(&if result.reasons.is_empty() { "無".to_string() } else { result.reasons.join("；") }),
+                                        escape_html(&if result.name_guard.is_empty() { "無".to_string() } else { result.name_guard.join("；") }),
+                                        escape_html(&if result.no_halal.is_empty() { "無".to_string() } else { result.no_halal.join("；") }),
+                                    );
+                                    bot.send_message(message.chat.id, body).parse_mode(ParseMode::Html).await?;
+                                }
+                                Err(err) => {
+                                    bot.send_message(message.chat.id, format!("檢查失敗：{err}")).await?;
+                                }
+                            }
+                            return Ok(());
+                        }
+                        Err(err) => {
+                            bot.send_message(message.chat.id, format!("檢查失敗：{err}")).await?;
+                            return Ok(());
+                        }
+                    }
+                }
+                bot.send_message(message.chat.id, "請回覆一位用戶後再使用 /check。") .await?;
+                return Ok(());
+            };
+            let Some(user) = target_msg.from.as_ref() else {
+                bot.send_message(message.chat.id, "找不到可檢查的目標用戶。") .await?;
+                return Ok(());
+            };
+            let text = extract_full_text(target_msg);
+            let result = runtime.check_group_modules(&bot, message.chat.id.0, user, None, Some(&text)).await;
+            match result {
+                Ok(result) => {
+                    let body = format!(
+                        "<b>檢查結果</b>\n<b>User</b>: {}\n<b>Reasons</b>: {}\n<b>Name Guard</b>: {}\n<b>NoHalal</b>: {}",
+                        escape_html(&short_user(user)),
+                        escape_html(&if result.reasons.is_empty() { "無".to_string() } else { result.reasons.join("；") }),
+                        escape_html(&if result.name_guard.is_empty() { "無".to_string() } else { result.name_guard.join("；") }),
+                        escape_html(&if result.no_halal.is_empty() { "無".to_string() } else { result.no_halal.join("；") }),
+                    );
+                    bot.send_message(message.chat.id, body).parse_mode(ParseMode::Html).await?;
+                }
+                Err(err) => {
+                    bot.send_message(message.chat.id, format!("檢查失敗：{err}")).await?;
+                }
+            }
+        }
         ModerationCommand::MlThreshold(value) => {
             if !is_maintainer(&bot, &runtime.config, from_id).await {
                 bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
@@ -1996,13 +2387,45 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
     if user.is_bot {
         return Ok(());
     }
+    if runtime.is_group_whitelisted(message.chat.id.0, user.id.0 as i64).await.unwrap_or(false) {
+        return Ok(());
+    }
     if is_group_admin(&bot, message.chat.id, user.id.0 as i64).await || is_special_user(&runtime.config, user.id.0 as i64) {
         return Ok(());
     }
+    if let Ok(check) = runtime.check_group_modules(&bot, message.chat.id.0, user, None, message.text().or(message.caption())).await {
+        if !check.reasons.is_empty() {
+            let _ = bot.delete_message(message.chat.id, message.id).await;
+            let _ = ban_user(&bot, message.chat.id, user.id.0 as i64).await;
+            let case_id = Uuid::new_v4().to_string();
+            let case = CaseRecord {
+                id: case_id,
+                action: ActionKind::AutoBan,
+                chat_id: message.chat.id.0,
+                target_user_id: user.id.0 as i64,
+                target_name: short_user(user),
+                actor_user_id: None,
+                actor_name: None,
+                source_message_id: Some(message.id.0),
+                evidence_text: extract_full_text(&message),
+                model_score: None,
+                matched_rule_id: None,
+                matched_rule_pattern: Some(check.reasons.join("；")),
+                status: "auto_banned".to_string(),
+                log_message_id: None,
+                created_at: Utc::now(),
+            };
+            let log_message_id = log_action(&bot, &runtime, &case).await.unwrap_or_default();
+            let mut updated = case.clone();
+            updated.log_message_id = Some(log_message_id);
+            let _ = store_case(&runtime, &updated).await;
+            let _ = notify_group(&bot, &runtime, &updated, log_message_id, "<b>自動模組封禁</b>").await;
+            return Ok(());
+        }
+    }
     let text = extract_full_text(&message);
     if text.trim().is_empty() { return Ok(()); }
-    let display_name = short_user(user);
-    let result = runtime.inspect_message(&display_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
+    let result = runtime.inspect_message(&short_user(user), &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
     let score = match result {
         InspectionResult::Spam { score, .. } | InspectionResult::Ham { score } => score,
     };
@@ -2047,8 +2470,7 @@ async fn score_only(bot: &Bot, runtime: &Runtime, message: &Message) -> Response
     }
     let text = extract_full_text(message);
     if text.trim().is_empty() { return Ok(()); }
-    let display_name = short_user(user);
-    let result = runtime.inspect_message(&display_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
+    let result = runtime.inspect_message(&short_user(user), &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
     let score = match result {
         InspectionResult::Spam { score, .. } | InspectionResult::Ham { score } => score,
     };
