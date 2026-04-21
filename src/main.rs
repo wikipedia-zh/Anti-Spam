@@ -1331,20 +1331,17 @@ async fn notify_bot_added(bot: &Bot, runtime: &Runtime, message: &Message) {
             if !all_reasons.is_empty() {
                 let _ = ban_user(bot, message.chat.id, user.id.0 as i64).await;
                 let _ = bot.delete_message(message.chat.id, message.id).await;
-                let tracking_id = Uuid::new_v4().simple().to_string().chars().take(8).collect::<String>().to_uppercase();
-                let _ = bot.send_message(ChatId(runtime.config.log_channel_id), format!(
-                    "<b>自動封禁 (完整記錄)</b>\n用戶ID: <code>{}</code>\n用戶名稱: {}\n用戶名: {}\n群組ID: <code>{}</code>\n群組: {}\n觸發規則: Join Name Heuristic | username={} | name={} | reasons={}\n追蹤編號: {}\n時間: {}",
+                let reason_text = all_reasons.join("；");
+                let case_text = format!(
+                    "Case: {}\n操作: 自動封禁\nChat: {}\nTarget: {} ({})\nActor: system\nScore: -\n原因: {}\nEvidence:\n\nAt: {}",
+                    Uuid::new_v4(),
+                    message.chat.id.0,
                     user.id.0,
                     escape_html(&short_user(user)),
-                    escape_html(user.username.as_deref().unwrap_or("-")),
-                    message.chat.id.0,
-                    escape_html(message.chat.title().unwrap_or("unknown")),
-                    escape_html(user.username.as_deref().unwrap_or("-")),
-                    escape_html(&short_user(user)),
-                    escape_html(&all_reasons.join("；")),
-                    tracking_id,
+                    escape_html(&reason_text),
                     utc8_display(Utc::now()),
-                )).parse_mode(ParseMode::Html).await;
+                );
+                let _ = bot.send_message(ChatId(runtime.config.log_channel_id), case_text).await;
             }
         }
     }
@@ -1370,13 +1367,23 @@ fn project_chat_link(chat_id: i64) -> String {
 }
 
 async fn log_action(bot: &Bot, runtime: &Runtime, case: &CaseRecord) -> ResponseResult<i32> {
-    let action_text = if let (Some(rule_id), Some(pattern)) = (case.matched_rule_id, case.matched_rule_pattern.as_ref()) {
-        format!("Banned by Regex Rule #{} ({})", rule_id, escape_html(pattern))
+    let action_text = if let Some(rule_id) = case.matched_rule_id {
+        format!("Regex #{}", rule_id)
     } else {
-        format!("{:?}", case.action)
+        match case.action {
+            ActionKind::AutoDelete => "自動刪除".to_string(),
+            ActionKind::AutoBan => "自動封禁".to_string(),
+            ActionKind::SpamBan => "封禁".to_string(),
+            ActionKind::Mute => "禁言".to_string(),
+            ActionKind::Kick => "踢出".to_string(),
+            ActionKind::PendingReport => "待審核".to_string(),
+            ActionKind::ReportApproved => "受理封禁".to_string(),
+            ActionKind::ReportRejected => "拒絕受理".to_string(),
+        }
     };
+    let reason_text = case.matched_rule_pattern.as_ref().map(|s| escape_html(s)).unwrap_or_else(|| "-".to_string());
     let text = format!(
-        "<b>Case</b>: <code>{}</code>\n<b>Action</b>: {}\n<b>Chat</b>: <code>{}</code>\n<b>Target</b>: <code>{}</code> {}\n<b>Actor</b>: {}\n<b>Score</b>: {}\n<b>Evidence</b>:\n<blockquote>{}</blockquote>\n<b>At</b>: {}",
+        "<b>Case</b>: <code>{}</code>\n<b>操作</b>: {}\n<b>Chat</b>: <code>{}</code>\n<b>Target</b>: <code>{}</code> {}\n<b>Actor</b>: {}\n<b>Score</b>: {}\n<b>原因</b>: {}\n<b>Evidence</b>:\n<blockquote>{}</blockquote>\n<b>At</b>: {}",
         case.id,
         action_text,
         case.chat_id,
@@ -1384,6 +1391,7 @@ async fn log_action(bot: &Bot, runtime: &Runtime, case: &CaseRecord) -> Response
         escape_html(&case.target_name),
         case.actor_user_id.map(|id| id.to_string()).unwrap_or_else(|| "system".to_string()),
         case.model_score.map(|s| format!("{s:.4}")).unwrap_or_else(|| "-".to_string()),
+        reason_text,
         escape_html(&case.evidence_text),
         utc8_display(case.created_at),
     );
@@ -2072,7 +2080,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             match result {
                 Ok(result) => {
                     let body = format!(
-                        "<b>檢查結果</b>\n<b>User</b>: {}\n<b>Reasons</b>: {}\n<b>Name Guard</b>: {}\n<b>NoHalal</b>: {}",
+                        "<b>檢查結果</b>\n<b>使用者</b>: {}\n<b>原因</b>: {}\n<b>名稱規則</b>: {}\n<b>清真規則</b>: {}",
                         escape_html(&short_user(user)),
                         escape_html(&if result.reasons.is_empty() { "無".to_string() } else { result.reasons.join("；") }),
                         escape_html(&if result.name_guard.is_empty() { "無".to_string() } else { result.name_guard.join("；") }),
