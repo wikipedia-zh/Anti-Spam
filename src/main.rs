@@ -2099,11 +2099,12 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             }
             let rules = runtime.list_spam_rules().await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
             let body = if rules.is_empty() {
-                "<b>規則</b>\n無".to_string()
+                "<b>規則清單</b>\n\n╚• 無".to_string()
             } else {
-                let mut out = String::from("<b>規則</b>\n");
-                for (id, _pattern, description) in rules {
-                    out.push_str(&format!("@{} {}\n", id, escape_html(&description)));
+                let mut out = String::from("<b>規則清單</b>\n\n<b>已載入規則</b>\n");
+                for (idx, (id, pattern, description)) in rules.into_iter().enumerate() {
+                    let branch = if idx + 1 == 1 { "╠" } else { "╚" };
+                    out.push_str(&format!("{branch}• <code>@{}</code> {}\n   <code>{}</code>\n", id, escape_html(&description), escape_html(&pattern)));
                 }
                 out
             };
