@@ -960,6 +960,7 @@ enum ModerationCommand {
     DelRule(String),
     Module(String, String),
     White(String),
+    Unwhite(String),
     Check(String),
     Unknown,
 }
@@ -1009,6 +1010,7 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/updatebl" => ModerationCommand::UpdateBL,
         "/list_rules" => ModerationCommand::ListRules,
         "/del_rule" => ModerationCommand::DelRule(text.split_whitespace().nth(1).unwrap_or("").to_string()),
+        "/unwhite" => ModerationCommand::Unwhite(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/module" | "/moudle" => {
             let mut parts = text.split_whitespace();
             let _ = parts.next();
@@ -1283,7 +1285,7 @@ fn import_train_payloads(input: &str) -> Vec<String> {
 }
 
 fn help_text(is_maintainer: bool) -> String {
-    let mut text = String::from("<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n");
+    let mut text = String::from("<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n<code>/white</code>：加入本群白名單\n<code>/unwhite</code>：移出本群白名單\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n");
     if is_maintainer {
         text.push_str("\n<b>項目組指令（僅 maintainer 可見）：</b>\n<code>/ml_train_spam</code>、<code>/ml_clean_spam</code>：單筆訓練/洗樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>、<code>/ml_purge_text &lt;文字片段&gt;</code>：清除誤樣本\n<code>/ml_rebuild</code>：重建模型\n<code>/ml_stats</code>：查看樣本與門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整自動封禁門檻\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_start_mass_train_smart</code>：貼原始日志，自動抽正文全當 spam\n<code>/ml_start_mass_train_plain</code>：逐條手工標註 spam\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果\n");
     }
@@ -2191,6 +2193,22 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             };
             runtime.set_group_whitelist(message.chat.id.0, user_id, true, Some(from_id)).await.ok();
             bot.send_message(message.chat.id, format!("已將 <code>{user_id}</code> 加入本群白名單。",)).parse_mode(ParseMode::Html).await?;
+        }
+        ModerationCommand::Unwhite(target) => {
+            if !message.chat.is_group() && !message.chat.is_supergroup() {
+                bot.send_message(message.chat.id, "請在群組中使用 /unwhite。") .await?;
+                return Ok(());
+            }
+            if !is_group_admin(&bot, message.chat.id, from_id).await {
+                bot.send_message(message.chat.id, "只有群組管理員可以設定白名單。") .await?;
+                return Ok(());
+            }
+            let Some(user_id) = target.parse::<i64>().ok().or_else(|| message.reply_to_message().and_then(|m| m.from.as_ref()).map(|u| u.id.0 as i64)) else {
+                bot.send_message(message.chat.id, "請提供 userid 或回覆一位用戶。") .await?;
+                return Ok(());
+            };
+            runtime.set_group_whitelist(message.chat.id.0, user_id, false, Some(from_id)).await.ok();
+            bot.send_message(message.chat.id, format!("已將 <code>{user_id}</code> 移出本群白名單。",)).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::Check(target) => {
             if !message.chat.is_group() && !message.chat.is_supergroup() {
