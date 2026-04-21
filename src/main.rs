@@ -1255,6 +1255,43 @@ fn utc8_display(dt: DateTime<Utc>) -> String {
     (dt + chrono::TimeDelta::hours(8)).format("%Y-%m-%d %H:%M:%S UTC+8").to_string()
 }
 
+fn chinese_case_action(case: &CaseRecord) -> String {
+    if let Some(rule_id) = case.matched_rule_id {
+        format!("規則 #{}", rule_id)
+    } else {
+        match case.action {
+            ActionKind::AutoDelete => "自動刪除".to_string(),
+            ActionKind::AutoBan => "自動封禁".to_string(),
+            ActionKind::SpamBan => "封禁".to_string(),
+            ActionKind::Mute => "禁言".to_string(),
+            ActionKind::Kick => "踢出".to_string(),
+            ActionKind::PendingReport => "待審核".to_string(),
+            ActionKind::ReportApproved => "受理封禁".to_string(),
+            ActionKind::ReportRejected => "拒絕受理".to_string(),
+        }
+    }
+}
+
+fn chinese_case_reason(case: &CaseRecord) -> String {
+    case.matched_rule_pattern.as_ref().map(|s| s.clone()).unwrap_or_else(|| "-".to_string())
+}
+
+fn format_chinese_case(case: &CaseRecord) -> String {
+    format!(
+        "Case: {}\n操作: {}\nChat: {}\nTarget: {} {}\nActor: {}\nScore: {}\n原因: {}\nEvidence:\n{}\nAt: {}",
+        case.id,
+        chinese_case_action(case),
+        case.chat_id,
+        case.target_user_id,
+        escape_html(&case.target_name),
+        case.actor_user_id.map(|id| id.to_string()).unwrap_or_else(|| "system".to_string()),
+        case.model_score.map(|s| format!("{s:.4}")).unwrap_or_else(|| "-".to_string()),
+        escape_html(&chinese_case_reason(case)),
+        escape_html(&case.evidence_text),
+        utc8_display(case.created_at),
+    )
+}
+
 async fn is_maintainer(bot: &Bot, config: &Config, user_id: i64) -> bool {
     if config.maintainer_ids.contains(&user_id) {
         return true;
@@ -1331,16 +1368,24 @@ async fn notify_bot_added(bot: &Bot, runtime: &Runtime, message: &Message) {
             if !all_reasons.is_empty() {
                 let _ = ban_user(bot, message.chat.id, user.id.0 as i64).await;
                 let _ = bot.delete_message(message.chat.id, message.id).await;
-                let reason_text = all_reasons.join("；");
-                let case_text = format!(
-                    "Case: {}\n操作: 自動封禁\nChat: {}\nTarget: {} ({})\nActor: system\nScore: -\n原因: {}\nEvidence:\n\nAt: {}",
-                    Uuid::new_v4(),
-                    message.chat.id.0,
-                    user.id.0,
-                    escape_html(&short_user(user)),
-                    escape_html(&reason_text),
-                    utc8_display(Utc::now()),
-                );
+                let case = CaseRecord {
+                    id: Uuid::new_v4().to_string(),
+                    action: ActionKind::AutoBan,
+                    chat_id: message.chat.id.0,
+                    target_user_id: user.id.0 as i64,
+                    target_name: short_user(user),
+                    actor_user_id: None,
+                    actor_name: None,
+                    source_message_id: Some(message.id.0),
+                    evidence_text: extract_full_text(&message),
+                    model_score: None,
+                    matched_rule_id: None,
+                    matched_rule_pattern: Some(all_reasons.join("；")),
+                    status: "auto_banned".to_string(),
+                    log_message_id: None,
+                    created_at: Utc::now(),
+                };
+                let case_text = format_chinese_case(&case);
                 let _ = bot.send_message(ChatId(runtime.config.log_channel_id), case_text).await;
             }
         }
@@ -1367,21 +1412,8 @@ fn project_chat_link(chat_id: i64) -> String {
 }
 
 async fn log_action(bot: &Bot, runtime: &Runtime, case: &CaseRecord) -> ResponseResult<i32> {
-    let action_text = if let Some(rule_id) = case.matched_rule_id {
-        format!("Regex #{}", rule_id)
-    } else {
-        match case.action {
-            ActionKind::AutoDelete => "自動刪除".to_string(),
-            ActionKind::AutoBan => "自動封禁".to_string(),
-            ActionKind::SpamBan => "封禁".to_string(),
-            ActionKind::Mute => "禁言".to_string(),
-            ActionKind::Kick => "踢出".to_string(),
-            ActionKind::PendingReport => "待審核".to_string(),
-            ActionKind::ReportApproved => "受理封禁".to_string(),
-            ActionKind::ReportRejected => "拒絕受理".to_string(),
-        }
-    };
-    let reason_text = case.matched_rule_pattern.as_ref().map(|s| escape_html(s)).unwrap_or_else(|| "-".to_string());
+    let action_text = chinese_case_action(case);
+    let reason_text = escape_html(&chinese_case_reason(case));
     let text = format!(
         "<b>Case</b>: <code>{}</code>\n<b>操作</b>: {}\n<b>Chat</b>: <code>{}</code>\n<b>Target</b>: <code>{}</code> {}\n<b>Actor</b>: {}\n<b>Score</b>: {}\n<b>原因</b>: {}\n<b>Evidence</b>:\n<blockquote>{}</blockquote>\n<b>At</b>: {}",
         case.id,
@@ -1416,14 +1448,9 @@ async fn log_callback_error(bot: &Bot, runtime: &Runtime, case: &CaseRecord, sta
 
 async fn notify_group(bot: &Bot, runtime: &Runtime, case: &CaseRecord, log_message_id: i32, header: &str) -> Result<()> {
     let link = public_log_link(&runtime.config, log_message_id);
-    let action_text = if let (Some(rule_id), Some(pattern)) = (case.matched_rule_id, case.matched_rule_pattern.as_ref()) {
-        format!("Banned by Regex Rule #{} ({})", rule_id, escape_html(pattern))
-    } else {
-        format!("{:?}", case.action)
-    };
     let text = format!(
-        "{header}\n\n<b>Action</b>: {}\n<b>對象</b>: <code>{}</code> {}\n<b>證據</b>: <a href=\"{}\">查看日誌</a>\n<b>Case</b>: <code>{}</code>",
-        action_text,
+        "{header}\n\n<b>操作</b>: {}\n<b>對象</b>: <code>{}</code> {}\n<b>證據</b>: <a href=\"{}\">查看日誌</a>\n<b>Case</b>: <code>{}</code>",
+        chinese_case_action(case),
         case.target_user_id, escape_html(&case.target_name), link, case.id
     );
     bot.send_message(ChatId(case.chat_id), text).parse_mode(ParseMode::Html).await?;
