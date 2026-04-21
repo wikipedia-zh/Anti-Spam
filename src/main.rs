@@ -1278,7 +1278,7 @@ fn chinese_case_reason(case: &CaseRecord) -> String {
 
 fn format_chinese_case(case: &CaseRecord) -> String {
     format!(
-        "Case: {}\n操作: {}\nChat: {}\nTarget: {} {}\nActor: {}\nScore: {}\n原因: {}\nEvidence:\n{}\nAt: {}",
+        "案例: {}\n操作: {}\n群組: {}\n對象: {} {}\n處理者: {}\n分數: {}\n原因: {}\n證據:\n{}\n時間: {}",
         case.id,
         chinese_case_action(case),
         case.chat_id,
@@ -1289,6 +1289,20 @@ fn format_chinese_case(case: &CaseRecord) -> String {
         escape_html(&chinese_case_reason(case)),
         escape_html(&case.evidence_text),
         utc8_display(case.created_at),
+    )
+}
+
+fn format_case_lookup(case: &CaseRecord, link: &str) -> String {
+    format!(
+        "<b>案例</b>: <code>{}</code>\n<b>操作</b>: {}\n<b>狀態</b>: {}\n<b>對象</b>: {} ({})\n<b>原因</b>: {}\n<b>日誌</b>: {}\n<b>證據</b>: <blockquote>{}</blockquote>",
+        case.id,
+        chinese_case_action(case),
+        escape_html(&case.status),
+        escape_html(&case.target_name),
+        case.target_user_id,
+        escape_html(&chinese_case_reason(case)),
+        link,
+        escape_html(&case.evidence_text),
     )
 }
 
@@ -1336,7 +1350,7 @@ async fn notify_bot_added(bot: &Bot, runtime: &Runtime, message: &Message) {
         if users.iter().any(|u| u.is_bot) {
             let title = message.chat.title().unwrap_or("unknown");
             let text = format!(
-                "<b>Bot Added</b>\n<b>Chat</b>: <code>{}</code>\n<b>Title</b>: {}\n<b>By</b>: <code>{}</code>",
+                "<b>機器人已加入</b>\n<b>群組</b>: <code>{}</code>\n<b>標題</b>: {}\n<b>來源</b>: <code>{}</code>",
                 message.chat.id.0,
                 escape_html(title),
                 message.from.as_ref().map(short_user).unwrap_or_else(|| "unknown".to_string())
@@ -1415,7 +1429,7 @@ async fn log_action(bot: &Bot, runtime: &Runtime, case: &CaseRecord) -> Response
     let action_text = chinese_case_action(case);
     let reason_text = escape_html(&chinese_case_reason(case));
     let text = format!(
-        "<b>Case</b>: <code>{}</code>\n<b>操作</b>: {}\n<b>Chat</b>: <code>{}</code>\n<b>Target</b>: <code>{}</code> {}\n<b>Actor</b>: {}\n<b>Score</b>: {}\n<b>原因</b>: {}\n<b>Evidence</b>:\n<blockquote>{}</blockquote>\n<b>At</b>: {}",
+        "<b>案例</b>: <code>{}</code>\n<b>操作</b>: {}\n<b>群組</b>: <code>{}</code>\n<b>對象</b>: <code>{}</code> {}\n<b>處理者</b>: {}\n<b>分數</b>: {}\n<b>原因</b>: {}\n<b>證據</b>:\n<blockquote>{}</blockquote>\n<b>時間</b>: {}",
         case.id,
         action_text,
         case.chat_id,
@@ -1437,7 +1451,7 @@ async fn log_action(bot: &Bot, runtime: &Runtime, case: &CaseRecord) -> Response
 async fn log_callback_error(bot: &Bot, runtime: &Runtime, case: &CaseRecord, stage: &str, err: &str) {
     eprintln!("[callback-error] stage={stage} case={} chat={} err={err}", case.id, case.chat_id);
     let text = format!(
-        "<b>Callback Error</b>\n<b>Stage</b>: <code>{}</code>\n<b>Case</b>: <code>{}</code>\n<b>Chat</b>: <code>{}</code>\n<b>Err</b>:\n<blockquote>{}</blockquote>",
+        "<b>回調錯誤</b>\n<b>階段</b>: <code>{}</code>\n<b>案例</b>: <code>{}</code>\n<b>群組</b>: <code>{}</code>\n<b>錯誤</b>:\n<blockquote>{}</blockquote>",
         escape_html(stage),
         case.id,
         case.chat_id,
@@ -1449,7 +1463,7 @@ async fn log_callback_error(bot: &Bot, runtime: &Runtime, case: &CaseRecord, sta
 async fn notify_group(bot: &Bot, runtime: &Runtime, case: &CaseRecord, log_message_id: i32, header: &str) -> Result<()> {
     let link = public_log_link(&runtime.config, log_message_id);
     let text = format!(
-        "{header}\n\n<b>操作</b>: {}\n<b>對象</b>: <code>{}</code> {}\n<b>證據</b>: <a href=\"{}\">查看日誌</a>\n<b>Case</b>: <code>{}</code>",
+        "{header}\n\n<b>操作</b>: {}\n<b>對象</b>: <code>{}</code> {}\n<b>證據</b>: <a href=\"{}\">查看日誌</a>\n<b>案例</b>: <code>{}</code>",
         chinese_case_action(case),
         case.target_user_id, escape_html(&case.target_name), link, case.id
     );
@@ -1850,7 +1864,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             ]]);
 
             let text = format!(
-                "<b>新的 /spam 申請</b>\n\n<b>對象</b>: {} ({})\n<b>發起人</b>: {}\n<b>內容</b>: <blockquote>{}</blockquote>\n<b>Case</b>: <code>{}</code>",
+                "<b>新的 /spam 申請</b>\n\n<b>對象</b>: {} ({})\n<b>發起人</b>: {}\n<b>內容</b>: <blockquote>{}</blockquote>\n<b>案例</b>: <code>{}</code>",
                 target_name,
                 target_id,
                 short_user(from),
@@ -1865,7 +1879,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 .await?;
 
             let trace = format!(
-                "<b>Report Assigned</b>\n<b>Case</b>: <code>{}</code>\n<b>Handled by</b>: <code>{}</code>\n<b>Source</b>: <code>{}</code>",
+                "<b>已分派舉報</b>\n<b>案例</b>: <code>{}</code>\n<b>處理者</b>: <code>{}</code>\n<b>來源</b>: <code>{}</code>",
                 case_id,
                 short_user(from),
                 short_user(from)
@@ -1884,10 +1898,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             match runtime.load_case(&case_id).await {
                 Ok(Some(case)) => {
                     let link = case.log_message_id.map(|id| public_log_link(&runtime.config, id)).unwrap_or_else(|| "-".to_string());
-                    let text = format!(
-                        "<b>Case</b>: <code>{}</code>\n<b>Status</b>: {}\n<b>Action</b>: {:?}\n<b>Target</b>: {} ({})\n<b>Evidence</b>: <blockquote>{}</blockquote>\n<b>Log</b>: {}",
-                        case.id, case.status, case.action, case.target_name, case.target_user_id, case.evidence_text, link
-                    );
+                    let text = format_case_lookup(&case, &link);
                     bot.send_message(message.chat.id, text).parse_mode(ParseMode::Html).await?;
                 }
                 _ => {
@@ -2374,7 +2385,7 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
                 log_callback_error(&bot, &runtime, &case, "store_case", &err.to_string()).await;
             }
             let body = format!(
-                "<b>新的 /spam 申請</b>\n\n<b>對象</b>: {} ({})\n<b>發起人</b>: {}\n<b>內容</b>: <blockquote>{}</blockquote>\n<b>Case</b>: <code>{}</code>\n<b>狀態</b>: 已受理並封禁\n<b>處理者</b>: <code>{}</code>",
+                "<b>新的 /spam 申請</b>\n\n<b>對象</b>: {} ({})\n<b>發起人</b>: {}\n<b>內容</b>: <blockquote>{}</blockquote>\n<b>案例</b>: <code>{}</code>\n<b>狀態</b>: 已受理並封禁\n<b>處理者</b>: <code>{}</code>",
                 escape_html(&case.target_name),
                 case.target_user_id,
                 escape_html(&short_user(&from)),
@@ -2399,7 +2410,7 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
                 log_callback_error(&bot, &runtime, &case, "store_case", &err.to_string()).await;
             }
             let body = format!(
-                "<b>新的 /spam 申請</b>\n\n<b>對象</b>: {} ({})\n<b>發起人</b>: {}\n<b>內容</b>: <blockquote>{}</blockquote>\n<b>Case</b>: <code>{}</code>\n<b>狀態</b>: 已拒絕受理\n<b>處理者</b>: <code>{}</code>",
+                "<b>新的 /spam 申請</b>\n\n<b>對象</b>: {} ({})\n<b>發起人</b>: {}\n<b>內容</b>: <blockquote>{}</blockquote>\n<b>案例</b>: <code>{}</code>\n<b>狀態</b>: 已拒絕受理\n<b>處理者</b>: <code>{}</code>",
                 escape_html(&case.target_name),
                 case.target_user_id,
                 escape_html(&short_user(&from)),
