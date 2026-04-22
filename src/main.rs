@@ -262,6 +262,11 @@ impl Runtime {
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (chat_id, user_id)
             );
+            CREATE TABLE IF NOT EXISTS global_whitelist (
+                user_id INTEGER PRIMARY KEY,
+                added_by INTEGER,
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS model_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -839,6 +844,32 @@ impl Runtime {
         Ok(())
     }
 
+    async fn is_global_whitelisted(&self, user_id: i64) -> Result<bool> {
+        let conn = self.open_conn()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM global_whitelist WHERE user_id = ?1",
+            params![user_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    async fn set_global_whitelist(&self, user_id: i64, enabled: bool, added_by: Option<i64>) -> Result<()> {
+        let conn = self.open_conn()?;
+        if enabled {
+            conn.execute(
+                "INSERT OR IGNORE INTO global_whitelist (user_id, added_by, created_at) VALUES (?1, ?2, ?3)",
+                params![user_id, added_by, Utc::now().to_rfc3339()],
+            )?;
+        } else {
+            conn.execute(
+                "DELETE FROM global_whitelist WHERE user_id = ?1",
+                params![user_id],
+            )?;
+        }
+        Ok(())
+    }
+
     async fn load_user_profile(&self, bot: &Bot, user_id: i64) -> Result<UserProfileInfo> {
         let chat = bot.get_chat(ChatId(user_id)).await?;
         let display_name = chat.title().map(|s| s.to_string()).or_else(|| chat.first_name().map(|s| s.to_string())).unwrap_or_else(|| format!("User{user_id}"));
@@ -848,6 +879,9 @@ impl Runtime {
     }
 
     async fn check_group_modules(&self, _bot: &Bot, chat_id: i64, user: &teloxide::types::User, bio: Option<&str>, message_text: Option<&str>) -> Result<ModuleCheckResult> {
+        if self.is_global_whitelisted(user.id.0 as i64).await.unwrap_or(false) {
+            return Ok(ModuleCheckResult { reasons: Vec::new(), name_guard: Vec::new(), no_halal: Vec::new() });
+        }
         let settings = self.get_group_modules(chat_id).await?;
         let mut reasons = Vec::new();
         let mut name_guard = Vec::new();
@@ -961,6 +995,8 @@ enum ModerationCommand {
     Module(String, String),
     White(String),
     Unwhite(String),
+    WhiteGlobal(String),
+    UnwhiteGlobal(String),
     HelpOp,
     Check(String),
     Unknown,
@@ -1011,7 +1047,17 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/updatebl" => ModerationCommand::UpdateBL,
         "/list_rules" => ModerationCommand::ListRules,
         "/del_rule" => ModerationCommand::DelRule(text.split_whitespace().nth(1).unwrap_or("").to_string()),
-        "/unwhite" => ModerationCommand::Unwhite(text.split_whitespace().nth(1).unwrap_or("").to_string()),
+        "/unwhite" => {
+            let mut parts = text.split_whitespace();
+            let _ = parts.next();
+            let target = parts.next().unwrap_or("").to_string();
+            let flag = parts.next().unwrap_or("");
+            if flag == "-global" {
+                ModerationCommand::UnwhiteGlobal(target)
+            } else {
+                ModerationCommand::Unwhite(target)
+            }
+        }
         "/help_op" => ModerationCommand::HelpOp,
         "/module" | "/moudle" => {
             let mut parts = text.split_whitespace();
@@ -1020,7 +1066,17 @@ fn parse_command(text: &str) -> ModerationCommand {
             let state = parts.next().unwrap_or("").to_string();
             ModerationCommand::Module(module, state)
         }
-        "/white" => ModerationCommand::White(text.split_whitespace().nth(1).unwrap_or("").to_string()),
+        "/white" => {
+            let mut parts = text.split_whitespace();
+            let _ = parts.next();
+            let target = parts.next().unwrap_or("").to_string();
+            let flag = parts.next().unwrap_or("");
+            if flag == "-global" {
+                ModerationCommand::WhiteGlobal(target)
+            } else {
+                ModerationCommand::White(target)
+            }
+        }
         "/check" => ModerationCommand::Check(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
         _ => ModerationCommand::Unknown,
     }
@@ -1287,7 +1343,7 @@ fn import_train_payloads(input: &str) -> Vec<String> {
 }
 
 fn help_text() -> String {
-    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n<code>/white</code>：加入本群白名單\n<code>/unwhite</code>：移出本群白名單\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n".to_string()
+    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n<code>/white</code>：加入本群白名單\n<code>/white -global</code>：加入全域白名單\n<code>/unwhite</code>：移出本群白名單\n<code>/unwhite -global</code>：移出全域白名單\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n".to_string()
 }
 
 fn help_op_text() -> String {
@@ -1368,6 +1424,10 @@ fn format_public_reason(reason: &str, link: Option<&str>) -> String {
         .join("；")
 }
 
+fn global_whitelist_check_text() -> String {
+    "<b>檢查結果</b>\n<b>對象</b>: 全域白名單\n<b>命中</b>: 無\n<b>名稱規則</b>: 無\n<b>清真規則</b>: 無".to_string()
+}
+
 fn build_blacklist_reason_text(_runtime: &Runtime) -> String {
     "<b>❖ 封禁代號說明</b>\n\n- <code>NLDIGIT</code>: 英名含數字\n- <code>NL10</code>: 英名多段且總長度 >= 10\n- <code>NLTAIL</code>: 英名多段且尾段過長\n- <code>NLSINGLE</code>: 英名單段且長度 >= 11\n- <code>ARABIC</code>: 偵測到清真\n- <code>REGEX</code>: 觸發正則規則\n\n申訴找 @SEELE_01_BOT".to_string()
 }
@@ -1444,6 +1504,9 @@ async fn notify_bot_added(bot: &Bot, runtime: &Runtime, message: &Message) -> bo
 
     for user in users {
         if is_special_user(&runtime.config, user.id.0 as i64) {
+            continue;
+        }
+        if runtime.is_global_whitelisted(user.id.0 as i64).await.unwrap_or(false) {
             continue;
         }
         if runtime.is_group_whitelisted(message.chat.id.0, user.id.0 as i64).await.unwrap_or(false) {
@@ -2209,6 +2272,18 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             runtime.set_group_whitelist(message.chat.id.0, user_id, true, Some(from_id)).await.ok();
             bot.send_message(message.chat.id, format!("已將 <code>{user_id}</code> 加入本群白名單。",)).parse_mode(ParseMode::Html).await?;
         }
+        ModerationCommand::WhiteGlobal(target) => {
+            if !is_maintainer(&bot, &runtime.config, from_id).await {
+                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
+                return Ok(());
+            }
+            let Some(user_id) = target.parse::<i64>().ok().or_else(|| message.reply_to_message().and_then(|m| m.from.as_ref()).map(|u| u.id.0 as i64)) else {
+                bot.send_message(message.chat.id, "請提供 userid 或回覆一位用戶。") .await?;
+                return Ok(());
+            };
+            runtime.set_global_whitelist(user_id, true, Some(from_id)).await.ok();
+            bot.send_message(message.chat.id, format!("已將 <code>{user_id}</code> 加入全域白名單。",)).parse_mode(ParseMode::Html).await?;
+        }
         ModerationCommand::Unwhite(target) => {
             if !message.chat.is_group() && !message.chat.is_supergroup() {
                 bot.send_message(message.chat.id, "請在群組中使用 /unwhite。") .await?;
@@ -2225,6 +2300,18 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             runtime.set_group_whitelist(message.chat.id.0, user_id, false, Some(from_id)).await.ok();
             bot.send_message(message.chat.id, format!("已將 <code>{user_id}</code> 移出本群白名單。",)).parse_mode(ParseMode::Html).await?;
         }
+        ModerationCommand::UnwhiteGlobal(target) => {
+            if !is_maintainer(&bot, &runtime.config, from_id).await {
+                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
+                return Ok(());
+            }
+            let Some(user_id) = target.parse::<i64>().ok().or_else(|| message.reply_to_message().and_then(|m| m.from.as_ref()).map(|u| u.id.0 as i64)) else {
+                bot.send_message(message.chat.id, "請提供 userid 或回覆一位用戶。") .await?;
+                return Ok(());
+            };
+            runtime.set_global_whitelist(user_id, false, Some(from_id)).await.ok();
+            bot.send_message(message.chat.id, format!("已將 <code>{user_id}</code> 移出全域白名單。",)).parse_mode(ParseMode::Html).await?;
+        }
         ModerationCommand::Check(target) => {
             if !message.chat.is_group() && !message.chat.is_supergroup() {
                 bot.send_message(message.chat.id, "請在群組中使用 /check。") .await?;
@@ -2232,6 +2319,10 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             }
             let Some(target_msg) = message.reply_to_message() else {
                 if let Ok(user_id) = target.parse::<i64>() {
+                    if runtime.is_global_whitelisted(user_id).await.unwrap_or(false) {
+                        bot.send_message(message.chat.id, global_whitelist_check_text()).parse_mode(ParseMode::Html).await?;
+                        return Ok(());
+                    }
                     let profile = runtime.load_user_profile(&bot, user_id).await;
                     match profile {
                         Ok(profile) => {
@@ -2279,6 +2370,10 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "找不到可檢查的目標用戶。") .await?;
                 return Ok(());
             };
+            if runtime.is_global_whitelisted(user.id.0 as i64).await.unwrap_or(false) {
+                bot.send_message(message.chat.id, global_whitelist_check_text()).parse_mode(ParseMode::Html).await?;
+                return Ok(());
+            }
             let text = extract_full_text(target_msg);
             let result = runtime.check_group_modules(&bot, message.chat.id.0, user, None, Some(&text)).await;
             match result {
@@ -2609,6 +2704,9 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
 async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> ResponseResult<()> {
     let Some(user) = message.from.as_ref() else { return Ok(()); };
     if user.is_bot {
+        return Ok(());
+    }
+    if runtime.is_global_whitelisted(user.id.0 as i64).await.unwrap_or(false) {
         return Ok(());
     }
     if runtime.is_group_whitelisted(message.chat.id.0, user.id.0 as i64).await.unwrap_or(false) {
