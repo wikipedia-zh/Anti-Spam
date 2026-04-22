@@ -2103,8 +2103,14 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             } else {
                 let mut out = String::from("<b>規則清單</b>\n\n<b>已載入規則</b>\n");
                 for (idx, (id, pattern, description)) in rules.into_iter().enumerate() {
-                    let branch = if idx + 1 == 1 { "╠" } else { "╚" };
-                    out.push_str(&format!("{branch}• <blockquote><code>{}</code></blockquote>\n   <code>@{}</code> {}\n", escape_html(&pattern), id, escape_html(&description)));
+                    if idx > 0 {
+                        out.push('\n');
+                    }
+                    if description.trim().is_empty() {
+                        out.push_str(&format!("<code>@{}</code>\n╚• <code>{}</code>\n", id, escape_html(&pattern)));
+                    } else {
+                        out.push_str(&format!("<code>@{}</code> {}\n╚• <code>{}</code>\n", id, escape_html(&description), escape_html(&pattern)));
+                    }
                 }
                 out
             };
