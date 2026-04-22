@@ -1048,14 +1048,13 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/list_rules" => ModerationCommand::ListRules,
         "/del_rule" => ModerationCommand::DelRule(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/unwhite" => {
-            let mut parts = text.split_whitespace();
-            let _ = parts.next();
-            let target = parts.next().unwrap_or("").to_string();
-            let flag = parts.next().unwrap_or("");
-            if flag == "-global" {
-                ModerationCommand::UnwhiteGlobal(target)
+            let args = text.split_whitespace().skip(1).collect::<Vec<_>>();
+            if args.first() == Some(&"-global") {
+                ModerationCommand::UnwhiteGlobal(args.get(1).unwrap_or(&"").to_string())
+            } else if args.get(1) == Some(&"-global") {
+                ModerationCommand::UnwhiteGlobal(args.first().unwrap_or(&"").to_string())
             } else {
-                ModerationCommand::Unwhite(target)
+                ModerationCommand::Unwhite(args.first().unwrap_or(&"").to_string())
             }
         }
         "/help_op" => ModerationCommand::HelpOp,
@@ -1067,14 +1066,13 @@ fn parse_command(text: &str) -> ModerationCommand {
             ModerationCommand::Module(module, state)
         }
         "/white" => {
-            let mut parts = text.split_whitespace();
-            let _ = parts.next();
-            let target = parts.next().unwrap_or("").to_string();
-            let flag = parts.next().unwrap_or("");
-            if flag == "-global" {
-                ModerationCommand::WhiteGlobal(target)
+            let args = text.split_whitespace().skip(1).collect::<Vec<_>>();
+            if args.first() == Some(&"-global") {
+                ModerationCommand::WhiteGlobal(args.get(1).unwrap_or(&"").to_string())
+            } else if args.get(1) == Some(&"-global") {
+                ModerationCommand::WhiteGlobal(args.first().unwrap_or(&"").to_string())
             } else {
-                ModerationCommand::White(target)
+                ModerationCommand::White(args.first().unwrap_or(&"").to_string())
             }
         }
         "/check" => ModerationCommand::Check(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
