@@ -1125,8 +1125,8 @@ fn evaluate_name_guard(full_name: &str) -> Vec<String> {
     if has_digits && total_len >= 7 {
         reasons.push("NLDIGIT".to_string());
     }
-    if parts.len() >= 2 && total_len >= 10 {
-        reasons.push("NL10".to_string());
+    if parts.len() >= 2 && total_len >= 13 {
+        reasons.push("NL13".to_string());
     }
     if parts.len() >= 2 && parts.last().map(|s| s.len() >= 5).unwrap_or(false) {
         reasons.push("NLTAIL".to_string());
@@ -1138,7 +1138,16 @@ fn evaluate_name_guard(full_name: &str) -> Vec<String> {
 }
 
 fn evaluate_no_long_name(user: &teloxide::types::User) -> Vec<String> {
-    evaluate_name_guard(&short_user(user))
+    evaluate_name_guard(&display_name_only(user))
+}
+
+fn display_name_only(user: &teloxide::types::User) -> String {
+    let mut name = user.first_name.clone();
+    if let Some(last) = &user.last_name {
+        name.push(' ');
+        name.push_str(last);
+    }
+    name
 }
 
 fn evaluate_module_checks(user: &teloxide::types::User, username: Option<&str>, bio: Option<&str>, message_text: Option<&str>) -> Vec<String> {
@@ -1427,7 +1436,7 @@ fn global_whitelist_check_text() -> String {
 }
 
 fn build_blacklist_reason_text(_runtime: &Runtime) -> String {
-    "<b>❖ 封禁代號說明</b>\n\n- <code>NLDIGIT</code>: 英名含數字\n- <code>NL10</code>: 英名多段且總長度 >= 10\n- <code>NLTAIL</code>: 英名多段且尾段過長\n- <code>NLSINGLE</code>: 英名單段且長度 >= 11\n- <code>ARABIC</code>: 偵測到清真\n- <code>REGEX</code>: 觸發正則規則\n\n申訴找 @SEELE_01_BOT".to_string()
+    "<b>❖ 封禁代號說明</b>\n\n- <code>NLDIGIT</code>: 英名含數字\n- <code>NL13</code>: 英名多段且總長度 >= 13\n- <code>NLTAIL</code>: 英名多段且尾段過長\n- <code>NLSINGLE</code>: 英名單段且長度 >= 11\n- <code>ARABIC</code>: 偵測到清真\n- <code>REGEX</code>: 觸發正則規則\n\n申訴找 @SEELE_01_BOT".to_string()
 }
 
 fn format_case_lookup(case: &CaseRecord, link: &str, reason_link: &str) -> String {
@@ -1516,7 +1525,7 @@ async fn notify_bot_added(bot: &Bot, runtime: &Runtime, message: &Message) -> bo
             continue;
         }
 
-        let reasons = if enabled.no_long_name { evaluate_name_guard(&short_user(user)) } else { Vec::new() };
+        let reasons = if enabled.no_long_name { evaluate_name_guard(&display_name_only(user)) } else { Vec::new() };
         let mut arabic_reasons = if enabled.no_halal {
             let profile = runtime.load_user_profile(bot, user.id.0 as i64).await.ok();
             let bio = profile.as_ref().and_then(|p| p.bio.as_deref());
