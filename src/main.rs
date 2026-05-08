@@ -2518,14 +2518,14 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let user_name = message.from.as_ref().map(short_user).unwrap_or_else(|| "unknown".to_string());
             let result = runtime.inspect_message(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
             let mut out = String::new();
-            out.push_str(&format!("<b>提</b>:\n<blockquote>{}</blockquote>\n", escape_html(&text)));
+            out.push_str(&format!("<b>文本</b>:\n<blockquote>{}</blockquote>\n", escape_html(&text)));
             match result {
                 InspectionResult::Spam { score, matched_rule: Some(rule) } => {
-                    out.push_str(&format!("<b>判</b>: 垃圾\n<b>分</b>: {score:.6}\n<b>規</b>: REGEX\n<b>說</b>: {}", escape_html(&rule.description)));
+                    out.push_str(&format!("<b>判定</b>: 垃圾\n<b>分數</b>: {score:.6}\n<b>規則</b>: REGEX\n<b>說明</b>: {}", escape_html(&rule.description)));
                 }
                 InspectionResult::Spam { score, .. } | InspectionResult::Ham { score } => {
                     let report = runtime.score_debug(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
-                    out.push_str(&format!("<b>判</b>: {}\n<b>分</b>: {score:.6}\n{}", if score >= runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold) { "垃圾" } else { "正常" }, format_score_debug(&report)));
+                    out.push_str(&format!("<b>判定</b>: {}\n<b>分數</b>: {score:.6}\n{}", if score >= runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold) { "垃圾" } else { "正常" }, format_score_debug(&report)));
                 }
             }
             bot.send_message(message.chat.id, out).parse_mode(ParseMode::Html).await?;
@@ -2805,9 +2805,14 @@ async fn score_only(bot: &Bot, runtime: &Runtime, message: &Message) -> Response
     };
     let threshold = runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold);
     let verdict = if score >= threshold { "spam" } else { "ham" };
-            let reply = format!("<b>分</b>: {score:.4}\n<b>門</b>: {threshold:.4}\n<b>判</b>: {verdict}");
-            bot.send_message(message.chat.id, reply).parse_mode(ParseMode::Html).await?;
-            Ok(())
+    let reply = format!(
+        "<b>判定</b>: {}\n<b>分數</b>: {:.4}\n<b>門檻</b>: {:.4}",
+        if verdict == "spam" { "垃圾" } else { "正常" },
+        score,
+        threshold,
+    );
+    bot.send_message(message.chat.id, reply).parse_mode(ParseMode::Html).await?;
+    Ok(())
         }
 
 async fn ensure_bot_can_moderate(bot: &Bot, _runtime: &Runtime, chat_id: ChatId) -> ResponseResult<bool> {
