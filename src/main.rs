@@ -141,6 +141,7 @@ struct Runtime {
 struct GroupModuleSettings {
     no_long_name: bool,
     no_halal: bool,
+    no_service_messages: bool,
 }
 
 #[derive(Clone)]
@@ -254,7 +255,8 @@ impl Runtime {
             CREATE TABLE IF NOT EXISTS group_module_settings (
                 chat_id INTEGER PRIMARY KEY,
                 no_long_name INTEGER NOT NULL DEFAULT 0,
-                no_halal INTEGER NOT NULL DEFAULT 0
+                no_halal INTEGER NOT NULL DEFAULT 0,
+                no_service_messages INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS group_whitelist (
                 chat_id INTEGER NOT NULL,
@@ -288,6 +290,20 @@ impl Runtime {
         if !columns.contains("matched_rule_pattern") {
             conn.execute("ALTER TABLE cases ADD COLUMN matched_rule_pattern TEXT", [])?;
         }
+        
+        // Check and add no_service_messages column if needed
+        let mut gms_columns = std::collections::HashSet::new();
+        {
+            let mut stmt = conn.prepare("PRAGMA table_info(group_module_settings)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            for row in rows {
+                gms_columns.insert(row?);
+            }
+        }
+        if !gms_columns.contains("no_service_messages") {
+            conn.execute("ALTER TABLE group_module_settings ADD COLUMN no_service_messages INTEGER NOT NULL DEFAULT 0", [])?;
+        }
+        
         let user_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if user_version < 1 {
             Self::migrate_v0_to_v1(conn)?;
@@ -807,12 +823,13 @@ impl Runtime {
             "INSERT OR IGNORE INTO group_module_settings (chat_id) VALUES (?1)",
             params![chat_id],
         )?;
-        let mut stmt = conn.prepare("SELECT no_long_name, no_halal FROM group_module_settings WHERE chat_id = ?1")?;
+        let mut stmt = conn.prepare("SELECT no_long_name, no_halal, no_service_messages FROM group_module_settings WHERE chat_id = ?1")?;
         let mut rows = stmt.query(params![chat_id])?;
         if let Some(row) = rows.next()? {
             Ok(GroupModuleSettings {
                 no_long_name: row.get::<_, i64>(0)? != 0,
                 no_halal: row.get::<_, i64>(1)? != 0,
+                no_service_messages: row.get::<_, i64>(2)? != 0,
             })
         } else {
             Ok(GroupModuleSettings::default())
@@ -835,6 +852,12 @@ impl Runtime {
             "nohalal" => {
                 conn.execute(
                     "UPDATE group_module_settings SET no_halal = ?2 WHERE chat_id = ?1",
+                    params![chat_id, if enabled { 1 } else { 0 }],
+                )?;
+            }
+            "nosm" => {
+                conn.execute(
+                    "UPDATE group_module_settings SET no_service_messages = ?2 WHERE chat_id = ?1",
                     params![chat_id, if enabled { 1 } else { 0 }],
                 )?;
             }
@@ -1885,6 +1908,43 @@ fn score_debug_from_text(model: &ModelState, text: &str) -> ScoreDebugReport {
     ScoreDebugReport { score, tokens: contributions }
 }
 
+// Check if a message is a service message and delete it if no_service_messages is enabled
+async fn delete_service_message_if_enabled(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) -> ResponseResult<bool> {
+    // Only apply in groups/supergroups
+    if !message.chat.is_group() && !message.chat.is_supergroup() {
+        return Ok(false);
+    }
+
+    let chat_id = message.chat.id.0;
+    let settings = runtime.get_group_modules(chat_id).await.unwrap_or_default();
+    
+    if !settings.no_service_messages {
+        return Ok(false);
+    }
+
+    let is_service = message.new_chat_members().is_some()
+        || message.left_chat_member().is_some()
+        || message.new_chat_title().is_some()
+        || message.new_chat_photo().is_some()
+        || message.delete_chat_photo().is_some()
+        || message.group_chat_created().is_some()
+        || message.channel_chat_created().is_some()
+        || message.migrate_to_chat_id().is_some()
+        || message.migrate_from_chat_id().is_some()
+        || message.pinned_message().is_some()
+        || message.message_auto_delete_timer_changed().is_some()
+        || message.video_chat_started().is_some()
+        || message.video_chat_ended().is_some()
+        || message.video_chat_participants_invited().is_some();
+
+    if is_service {
+        let _ = bot.delete_message(message.chat.id, message.id).await;
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
 async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> ResponseResult<()> {
     let Some(text) = message.text() else { return Ok(()); };
     let cmd = parse_command(text);
@@ -2330,8 +2390,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             match key.as_str() {
                 "nolongname" => { runtime.set_group_module(message.chat.id.0, "nolongname", enabled).await.ok(); }
                 "nohalal" => { runtime.set_group_module(message.chat.id.0, "nohalal", enabled).await.ok(); }
+                "nosm" => { runtime.set_group_module(message.chat.id.0, "nosm", enabled).await.ok(); }
                 _ => {
-                    bot.send_message(message.chat.id, "模組名稱僅支援 NoLongName / NoHalal。") .await?;
+                    bot.send_message(message.chat.id, "模組名稱僅支援 NoLongName / NoHalal / NoSM。") .await?;
                     return Ok(());
                 }
             }
@@ -2930,6 +2991,11 @@ async fn main() -> Result<()> {
         move |bot: Bot, message: Message| {
             let runtime = runtime.clone();
             async move {
+                // First, check and delete service messages if enabled
+                if delete_service_message_if_enabled(&bot, &runtime, &message).await? {
+                    return Ok(());
+                }
+
                 if notify_bot_added(&bot, &runtime, &message).await {
                     return Ok(());
                 }
