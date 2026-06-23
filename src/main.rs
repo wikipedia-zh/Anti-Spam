@@ -907,8 +907,29 @@ impl Runtime {
         if self.is_global_whitelisted(user.id.0 as i64).await.unwrap_or(false) {
             return Ok(ModuleCheckResult { reasons: Vec::new(), name_guard: Vec::new(), no_halal: Vec::new() });
         }
-        let settings = self.get_group_modules(chat_id).await?;
+
+        // Priority check: Display name regex matching (highest priority)
+        let rules = self.spam_rules.read().await;
+        let display_name = short_user(user);
         let mut reasons = Vec::new();
+        let mut display_name_hits = Vec::new();
+
+        for rule in rules.iter() {
+            if regex_is_match(&rule.regex, &display_name) {
+                display_name_hits.push(format!("REGEX@{}", rule.id));
+                reasons.push(format!("REGEX@{}", rule.id));
+            }
+        }
+
+        // If display name matches any rule, ban immediately (highest priority takes precedence)
+        if !display_name_hits.is_empty() {
+            drop(rules);
+            return Ok(ModuleCheckResult { reasons, name_guard: display_name_hits, no_halal: Vec::new() });
+        }
+
+        drop(rules);
+        
+        let settings = self.get_group_modules(chat_id).await?;
         let mut name_guard = Vec::new();
         let mut no_halal = Vec::new();
 
@@ -928,13 +949,11 @@ impl Runtime {
             }
         }
 
+        // Check message text and bio against regex rules
         let text = message_text.unwrap_or("");
         let rules = self.spam_rules.read().await;
         let mut regex_hits = Vec::new();
         if !text.trim().is_empty() {
-            if let Some(display_name_hit) = rules.iter().find(|rule| regex_is_match(&rule.regex, &short_user(user))) {
-                regex_hits.push(format!("REGEX@{}", display_name_hit.id));
-            }
             if let Some(bio) = bio {
                 if let Some(bio_hit) = rules.iter().find(|rule| regex_is_match(&rule.regex, bio)) {
                     regex_hits.push(format!("REGEX@{}", bio_hit.id));
@@ -2040,6 +2059,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             case.log_message_id = Some(log_message_id);
             store_case(&runtime, &case).await.ok();
             notify_group(&bot, &runtime, &case, log_message_id, "<b>已執行管理操作</b>").await.ok();
+            
+            // Delete the command message to minimize group disruption
+            let _ = bot.delete_message(message.chat.id, message.id).await;
         }
         ModerationCommand::SpamReport => {
             let Some((target_id, target_name, source_id, evidence_text)) = extract_reply_context(&message).await else {
@@ -2330,6 +2352,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             };
             runtime.set_group_whitelist(message.chat.id.0, user_id, true, Some(from_id)).await.ok();
             bot.send_message(message.chat.id, format!("已將 <code>{user_id}</code> 加入本群白名單。",)).parse_mode(ParseMode::Html).await?;
+            
+            // Delete the command message to minimize group disruption
+            let _ = bot.delete_message(message.chat.id, message.id).await;
         }
         ModerationCommand::WhiteGlobal(target) => {
             if !is_maintainer(&bot, &runtime.config, from_id).await {
@@ -2342,6 +2367,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             };
             runtime.set_global_whitelist(user_id, true, Some(from_id)).await.ok();
             bot.send_message(message.chat.id, format!("已將 <code>{user_id}</code> 加入全域白名單。",)).parse_mode(ParseMode::Html).await?;
+            
+            // Delete the command message to minimize group disruption
+            let _ = bot.delete_message(message.chat.id, message.id).await;
         }
         ModerationCommand::Unwhite(target) => {
             if !message.chat.is_group() && !message.chat.is_supergroup() {
@@ -2358,6 +2386,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             };
             runtime.set_group_whitelist(message.chat.id.0, user_id, false, Some(from_id)).await.ok();
             bot.send_message(message.chat.id, format!("已將 <code>{user_id}</code> 移出本群白名單。",)).parse_mode(ParseMode::Html).await?;
+            
+            // Delete the command message to minimize group disruption
+            let _ = bot.delete_message(message.chat.id, message.id).await;
         }
         ModerationCommand::UnwhiteGlobal(target) => {
             if !is_maintainer(&bot, &runtime.config, from_id).await {
@@ -2370,6 +2401,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             };
             runtime.set_global_whitelist(user_id, false, Some(from_id)).await.ok();
             bot.send_message(message.chat.id, format!("已將 <code>{user_id}</code> 移出全域白名單。",)).parse_mode(ParseMode::Html).await?;
+            
+            // Delete the command message to minimize group disruption
+            let _ = bot.delete_message(message.chat.id, message.id).await;
         }
         ModerationCommand::Check(target) => {
             if !message.chat.is_group() && !message.chat.is_supergroup() {
