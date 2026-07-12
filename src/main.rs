@@ -551,6 +551,48 @@ impl Runtime {
         Ok(())
     }
 
+    async fn set_token_probability(&self, token: &str, target_spam_prob: f64) -> Result<(u64, u64)> {
+        let token = token.trim().to_string();
+        let target = target_spam_prob.clamp(0.000001, 0.999999);
+        let sqlite_path = self.sqlite_path.clone();
+        let updated = tokio::task::spawn_blocking(move || -> Result<(u64, u64)> {
+            let conn = Connection::open(&sqlite_path)?;
+            let mut conn = conn;
+            Runtime::init_db(&mut conn)?;
+
+            let (spam_total, ham_total, vocab): (u64, u64, u64) = conn.query_row(
+                "SELECT COALESCE(SUM(spam_count), 0), COALESCE(SUM(ham_count), 0), COUNT(*) FROM word_frequencies",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+
+            let (current_spam, current_ham): (u64, u64) = conn.query_row(
+                "SELECT COALESCE(spam_count, 0), COALESCE(ham_count, 0) FROM word_frequencies WHERE word = ?1",
+                params![&token],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap_or((0, 0));
+
+            let spam_other = spam_total.saturating_sub(current_spam) as f64;
+            let ham_other = ham_total.saturating_sub(current_ham) as f64;
+            let vocab = vocab.max(1) as f64;
+
+            let spam_count = (((target * (spam_other + vocab)) - 1.0) / (1.0 - target)).ceil().max(0.0) as u64;
+            let ham_target = 1.0 - target;
+            let ham_count = (((ham_target * (ham_other + vocab)) - 1.0) / (1.0 - ham_target)).ceil().max(0.0) as u64;
+
+            conn.execute(
+                "INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES (?1, ?2, ?3) ON CONFLICT(word) DO UPDATE SET spam_count = excluded.spam_count, ham_count = excluded.ham_count",
+                params![&token, spam_count, ham_count],
+            )?;
+
+            Ok((spam_count, ham_count))
+        })
+        .await??;
+
+        let _ = self.rebuild_model().await?;
+        Ok(updated)
+    }
+
     async fn current_threshold(&self) -> Result<f64> {
         let conn = self.open_conn()?;
         if let Some(value) = Self::load_threshold(&conn)? {
@@ -1042,6 +1084,7 @@ enum ModerationCommand {
     MarkHam,
     MlStats,
     MlThreshold(String),
+    MlSetToken(String, String),
     MlExport,
     MlPurge(String),
     MlPurgeText(String),
@@ -1091,6 +1134,10 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/mark_ham" => ModerationCommand::MarkHam,
         "/ml_stats" => ModerationCommand::MlStats,
         "/ml_threshold" => ModerationCommand::MlThreshold(text.split_whitespace().nth(1).unwrap_or("").to_string()),
+        "/set" => ModerationCommand::MlSetToken(
+            text.split_whitespace().nth(1).unwrap_or("").to_string(),
+            text.split_whitespace().nth(2).unwrap_or("").to_string(),
+        ),
         "/ml_export" => ModerationCommand::MlExport,
         "/ml_purge" => ModerationCommand::MlPurge(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/ml_purge_text" => ModerationCommand::MlPurgeText(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
@@ -1427,7 +1474,7 @@ fn help_text() -> String {
 }
 
 fn help_op_text() -> String {
-    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整自動封禁門檻\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat &lt;chat_id&gt;</code>：設定工作群組\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
+    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整自動封禁門檻\n<code>/set 0x&lt;token&gt; &lt;0~1&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat &lt;chat_id&gt;</code>：設定工作群組\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
 }
 
 fn format_score_debug(report: &ScoreDebugReport) -> String {
@@ -2562,6 +2609,42 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             } else {
                 bot.send_message(message.chat.id, "請提供 0.50 到 0.99 的數值。").await?;
             }
+        }
+        ModerationCommand::MlSetToken(token_arg, value) => {
+            if !is_maintainer(&bot, &runtime.config, from_id).await {
+                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
+                return Ok(());
+            }
+
+            let token = token_arg.strip_prefix("0x").unwrap_or(&token_arg).trim();
+            if token.is_empty() {
+                bot.send_message(message.chat.id, "請提供 token，例如 /set 0x80sun 0.9999。").await?;
+                return Ok(());
+            }
+
+            let Ok(target) = value.parse::<f64>() else {
+                bot.send_message(message.chat.id, "請提供 0.0 到 1.0 的數值。").await?;
+                return Ok(());
+            };
+
+            let target = target.clamp(0.000001, 0.999999);
+            let (spam_count, ham_count) = runtime
+                .set_token_probability(token, target)
+                .await
+                .map_err(|err| teloxide::RequestError::Io(std::io::Error::other(err.to_string()).into()))?;
+
+            bot.send_message(
+                message.chat.id,
+                format!(
+                    "已調整 token <code>{}</code>：目標 spam_prob={:.4}，spam_count={}，ham_count={}",
+                    escape_html(token),
+                    target,
+                    spam_count,
+                    ham_count,
+                ),
+            )
+            .parse_mode(ParseMode::Html)
+            .await?;
         }
         ModerationCommand::MlExport => {
             if !is_maintainer(&bot, &runtime.config, from_id).await {
