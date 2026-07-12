@@ -2176,14 +2176,6 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 .reply_markup(keyboard)
                 .await?;
 
-            let trace = format!(
-                "<b>已分派舉報</b>\n<b>案例</b>: <code>{}</code>\n<b>處理者</b>: <code>{}</code>\n<b>來源</b>: <code>{}</code>",
-                case_id,
-                short_user(from),
-                short_user(from)
-            );
-            let _ = bot.send_message(ChatId(runtime.config.report_channel_id), trace).parse_mode(ParseMode::Html).await;
-
             let mut stored = case.clone();
             stored.log_message_id = Some(sent.id.0);
             stored.status = "pending_review".to_string();
