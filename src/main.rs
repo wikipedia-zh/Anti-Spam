@@ -1694,6 +1694,14 @@ async fn log_callback_error(bot: &Bot, runtime: &Runtime, case: &CaseRecord, sta
     let _ = bot.send_message(ChatId(runtime.config.log_channel_id), text).parse_mode(ParseMode::Html).await;
 }
 
+async fn delete_message_if_exists(bot: &Bot, chat_id: ChatId, message_id: MessageId) -> Result<()> {
+    match bot.delete_message(chat_id, message_id).await {
+        Ok(_) => Ok(()),
+        Err(err) if err.to_string().contains("message to delete not found") => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 async fn notify_group(bot: &Bot, runtime: &Runtime, case: &CaseRecord, log_message_id: i32, header: &str) -> Result<()> {
     let link = public_log_link(&runtime.config, log_message_id);
     let reason_link = runtime.blacklist_reason_link().await.unwrap_or_else(|| link.clone());
@@ -2796,7 +2804,7 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
                 return Ok(());
             }
             if let Some(source_id) = case.source_message_id {
-                if let Err(err) = bot.delete_message(ChatId(case.chat_id), MessageId(source_id)).await {
+                if let Err(err) = delete_message_if_exists(&bot, ChatId(case.chat_id), MessageId(source_id)).await {
                     log_callback_error(&bot, &runtime, &case, "delete_message", &err.to_string()).await;
                 }
             }
@@ -2810,6 +2818,20 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
             updated.actor_name = Some(short_user(&from));
             if let Err(err) = store_case(&runtime, &updated).await {
                 log_callback_error(&bot, &runtime, &case, "store_case", &err.to_string()).await;
+            }
+            let log_message_id = match log_action(&bot, &runtime, &updated).await {
+                Ok(id) => id,
+                Err(err) => {
+                    log_callback_error(&bot, &runtime, &case, "log_action", &err.to_string()).await;
+                    0
+                }
+            };
+            if log_message_id != 0 {
+                let mut logged = updated.clone();
+                logged.log_message_id = Some(log_message_id);
+                if let Err(err) = store_case(&runtime, &logged).await {
+                    log_callback_error(&bot, &runtime, &case, "store_case", &err.to_string()).await;
+                }
             }
             let body = format!(
                 "<b>新的 /spam 申請</b>\n\n<b>對象</b>: {} ({})\n<b>發起人</b>: {}\n<b>內容</b>: <blockquote>{}</blockquote>\n<b>案例</b>: <code>{}</code>\n<b>狀態</b>: 已受理並封禁\n<b>處理者</b>: <code>{}</code>",
