@@ -812,6 +812,68 @@ impl Runtime {
         .await?
     }
 
+    async fn undo_clean_training_sample_by_text(&self, text: &str) -> Result<usize> {
+        let text = text.to_string();
+        let sqlite_path = self.sqlite_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let mut conn = Connection::open(&sqlite_path)?;
+            Runtime::init_db(&mut conn)?;
+            let tx = conn.transaction()?;
+
+            let maybe_sample = {
+                let mut stmt = tx.prepare(
+                    "SELECT id, text FROM training_samples WHERE label = 'ham' AND text = ?1 ORDER BY id DESC LIMIT 1",
+                )?;
+                let mut rows = stmt.query(params![&text])?;
+                if let Some(row) = rows.next()? {
+                    Some((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                } else {
+                    None
+                }
+            };
+
+            let Some((sample_id, sample_text)) = maybe_sample else {
+                tx.commit()?;
+                return Ok(0);
+            };
+
+            let tokens = tokenize(&sample_text);
+            for token in tokens {
+                let counts = tx.query_row(
+                    "SELECT spam_count, ham_count FROM word_frequencies WHERE word = ?1",
+                    params![&token],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                );
+                if let Ok((spam_count, ham_count)) = counts {
+                    let new_ham = (ham_count - 1).max(0);
+                    if spam_count == 0 && new_ham == 0 {
+                        tx.execute("DELETE FROM word_frequencies WHERE word = ?1", params![&token])?;
+                    } else {
+                        tx.execute(
+                            "UPDATE word_frequencies SET ham_count = ?2 WHERE word = ?1",
+                            params![&token, new_ham],
+                        )?;
+                    }
+                }
+            }
+
+            let ham_docs: i64 = tx.query_row(
+                "SELECT COALESCE(CAST(value AS INTEGER), 0) FROM model_meta WHERE key = 'ham_docs'",
+                [],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO model_meta (key, value) VALUES ('ham_docs', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![(ham_docs - 1).max(0).to_string()],
+            )?;
+
+            tx.execute("DELETE FROM training_samples WHERE id = ?1", params![sample_id])?;
+            tx.commit()?;
+            Ok(1)
+        })
+        .await?
+    }
+
     async fn word_stats(&self) -> Result<(u64, u64, u64)> {
         let sqlite_path = self.sqlite_path.clone();
         tokio::task::spawn_blocking(move || -> Result<(u64, u64, u64)> {
@@ -2618,6 +2680,30 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                                     );
                                     bot.send_message(message.chat.id, body).parse_mode(ParseMode::Html).await?;
                                 }
+                            ModerationCommand::MlUndoCleanSpam => {
+                                if !is_maintainer(&bot, &runtime.config, from_id).await {
+                                    bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
+                                    return Ok(());
+                                }
+                                let Some(target_msg) = message.reply_to_message() else {
+                                    bot.send_message(message.chat.id, "請回覆一條先前寫入 ham/clean 的樣本訊息。").await?;
+                                    return Ok(());
+                                };
+                                let text = extract_full_text(target_msg);
+                                if text.trim().is_empty() {
+                                    bot.send_message(message.chat.id, "請回覆一條先前寫入 ham/clean 的樣本訊息。").await?;
+                                    return Ok(());
+                                }
+
+                                let removed = runtime.undo_clean_training_sample_by_text(&text).await.unwrap_or(0);
+                                if removed == 0 {
+                                    bot.send_message(message.chat.id, "找不到可撤銷的 ham/clean 樣本。") .await?;
+                                    return Ok(());
+                                }
+
+                                let _ = runtime.rebuild_model().await;
+                                bot.send_message(message.chat.id, "已撤銷該 ham/clean 樣本並重建模型。").await?;
+                            }
                                 Err(err) => {
                                     bot.send_message(message.chat.id, format!("檢查失敗：{err}")).await?;
                                 }
