@@ -492,6 +492,16 @@ impl Runtime {
         let conn = self.open_conn()?;
         let rebuilt = {
             let mut rebuilt = ModelState::default();
+            let mut stmt = conn.prepare("SELECT key, value FROM model_meta")?;
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+            for row in rows {
+                let (key, value) = row?;
+                match key.as_str() {
+                    "spam_docs" => rebuilt.spam_docs = value.parse().unwrap_or(0),
+                    "ham_docs" => rebuilt.ham_docs = value.parse().unwrap_or(0),
+                    _ => {}
+                }
+            }
             let mut stmt = conn.prepare("SELECT word, spam_count, ham_count FROM word_frequencies ORDER BY word ASC")?;
             let mut rows = stmt.query([])?;
             while let Some(row) = rows.next()? {
@@ -740,6 +750,60 @@ impl Runtime {
             let conn = Connection::open(&sqlite_path)?;
             let mut conn = conn;
             Runtime::init_db(&mut conn)?;
+
+            let mut samples = Vec::new();
+            {
+                let mut stmt = conn.prepare("SELECT label, text FROM training_samples WHERE text LIKE ?1 OR text LIKE ?2")?;
+                let rows = stmt.query_map(params![format!("%{payload}%"), payload], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+                for row in rows {
+                    samples.push(row?);
+                }
+            }
+
+            let mut spam_docs: i64 = conn.query_row("SELECT COALESCE(value, '0') FROM model_meta WHERE key = 'spam_docs'", [], |row| row.get::<_, String>(0))?.parse().unwrap_or(0);
+            let mut ham_docs: i64 = conn.query_row("SELECT COALESCE(value, '0') FROM model_meta WHERE key = 'ham_docs'", [], |row| row.get::<_, String>(0))?.parse().unwrap_or(0);
+
+            for (label, text) in &samples {
+                let tokens = tokenize(text);
+                for token in tokens {
+                    let counts = conn.query_row(
+                        "SELECT spam_count, ham_count FROM word_frequencies WHERE word = ?1",
+                        params![&token],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    );
+                    if let Ok((mut spam_count, mut ham_count)) = counts {
+                        match label.as_str() {
+                            "spam" => spam_count = (spam_count - 1).max(0),
+                            "ham" => ham_count = (ham_count - 1).max(0),
+                            _ => {}
+                        }
+                        if spam_count == 0 && ham_count == 0 {
+                            conn.execute("DELETE FROM word_frequencies WHERE word = ?1", params![&token])?;
+                        } else {
+                            conn.execute(
+                                "UPDATE word_frequencies SET spam_count = ?2, ham_count = ?3 WHERE word = ?1",
+                                params![&token, spam_count, ham_count],
+                            )?;
+                        }
+                    }
+                }
+
+                match label.as_str() {
+                    "spam" => spam_docs = (spam_docs - 1).max(0),
+                    "ham" => ham_docs = (ham_docs - 1).max(0),
+                    _ => {}
+                }
+            }
+
+            conn.execute(
+                "INSERT INTO model_meta (key, value) VALUES ('spam_docs', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![spam_docs.to_string()],
+            )?;
+            conn.execute(
+                "INSERT INTO model_meta (key, value) VALUES ('ham_docs', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![ham_docs.to_string()],
+            )?;
+
             Ok(conn.execute(
                 "DELETE FROM training_samples WHERE text LIKE ?1 OR text LIKE ?2",
                 params![format!("%{payload}%"), payload],
@@ -1081,6 +1145,7 @@ enum ModerationCommand {
     CaseLookup(String),
     MlTrainSpam,
     MlCleanSpam,
+    MlUndoCleanSpam,
     MarkHam,
     MlStats,
     MlThreshold(String),
@@ -1131,6 +1196,7 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/leave" => ModerationCommand::Leave(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
         "/ml_train_spam" => ModerationCommand::MlTrainSpam,
         "/ml_clean_spam" => ModerationCommand::MlCleanSpam,
+        "/ml_undo_clean_spam" | "/ml_undo_ham" => ModerationCommand::MlUndoCleanSpam,
         "/mark_ham" => ModerationCommand::MarkHam,
         "/ml_stats" => ModerationCommand::MlStats,
         "/ml_threshold" => ModerationCommand::MlThreshold(text.split_whitespace().nth(1).unwrap_or("").to_string()),
@@ -1474,7 +1540,7 @@ fn help_text() -> String {
 }
 
 fn help_op_text() -> String {
-    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整自動封禁門檻\n<code>/set 0x&lt;token&gt; &lt;0~1&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat &lt;chat_id&gt;</code>：設定工作群組\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
+    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整自動封禁門檻\n<code>/set 0x&lt;token&gt; &lt;0~1&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat &lt;chat_id&gt;</code>：設定工作群組\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
 }
 
 fn format_score_debug(report: &ScoreDebugReport) -> String {
@@ -2912,7 +2978,7 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
                 "<b>新的 /spam 申請</b>\n\n<b>對象</b>: {} ({})\n<b>發起人</b>: {}\n<b>內容</b>: <blockquote>{}</blockquote>\n<b>案例</b>: <code>{}</code>\n<b>狀態</b>: 已受理並封禁\n<b>處理者</b>: <code>{}</code>",
                 escape_html(&case.target_name),
                 case.target_user_id,
-                escape_html(&short_user(&from)),
+                escape_html(case.actor_name.as_deref().unwrap_or("unknown")),
                 escape_html(&case.evidence_text),
                 case.id,
                 from_id
@@ -2937,7 +3003,7 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
                 "<b>新的 /spam 申請</b>\n\n<b>對象</b>: {} ({})\n<b>發起人</b>: {}\n<b>內容</b>: <blockquote>{}</blockquote>\n<b>案例</b>: <code>{}</code>\n<b>狀態</b>: 已拒絕受理\n<b>處理者</b>: <code>{}</code>",
                 escape_html(&case.target_name),
                 case.target_user_id,
-                escape_html(&short_user(&from)),
+                escape_html(case.actor_name.as_deref().unwrap_or("unknown")),
                 escape_html(&case.evidence_text),
                 case.id,
                 from_id
