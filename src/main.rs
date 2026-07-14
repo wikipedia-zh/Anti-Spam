@@ -2685,19 +2685,25 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                                     bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
                                     return Ok(());
                                 }
-                                let Some(target_msg) = message.reply_to_message() else {
-                                    bot.send_message(message.chat.id, "請回覆一條先前寫入 ham/clean 的樣本訊息。").await?;
-                                    return Ok(());
+                                let raw_text = message.text().or(message.caption()).unwrap_or("");
+                                let text = if let Some(target_msg) = message.reply_to_message() {
+                                    extract_full_text(target_msg)
+                                } else {
+                                    let args = raw_text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+                                    if args.is_empty() {
+                                        bot.send_message(message.chat.id, "請回覆一條先前寫入 ham/clean 的樣本訊息，或在指令後直接貼上要撤銷的文字。") .await?;
+                                        return Ok(());
+                                    }
+                                    args.to_string()
                                 };
-                                let text = extract_full_text(target_msg);
                                 if text.trim().is_empty() {
-                                    bot.send_message(message.chat.id, "請回覆一條先前寫入 ham/clean 的樣本訊息。").await?;
+                                    bot.send_message(message.chat.id, "請回覆一條先前寫入 ham/clean 的樣本訊息，或在指令後直接貼上要撤銷的文字。") .await?;
                                     return Ok(());
                                 }
 
                                 let removed = runtime.undo_clean_training_sample_by_text(&text).await.unwrap_or(0);
                                 if removed == 0 {
-                                    bot.send_message(message.chat.id, "找不到可撤銷的 ham/clean 樣本。") .await?;
+                                    bot.send_message(message.chat.id, "找不到可撤銷的 ham/clean 樣本。請確認文字完全一致，或先用 /ml_export 檢查實際寫入內容。") .await?;
                                     return Ok(());
                                 }
 
