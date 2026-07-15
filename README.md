@@ -69,7 +69,7 @@ Set the following environment variables before running:
 
 ## 功能
 
-- 同時將訊息正文與發言者顯示名稱（Display Name）納入評分特徵。
+- 同時將訊息正文與發言者顯示名稱納入評分特徵。
 - 當 Spam 分數超過設定門檻時，自動刪除訊息並封禁使用者。
 - 所有自動與手動操作皆寫入日誌頻道，並生成唯一的 case ID。
 - 管理員可透過回覆訊息執行 `/sb` (封禁並寫入模型)、`/mute` (禁言) 與 `/kick` (踢出)。
