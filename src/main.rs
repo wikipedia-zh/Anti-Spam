@@ -596,7 +596,14 @@ impl Runtime {
 
     async fn set_token_probability(&self, token: &str, target_spam_prob: f64) -> Result<(u64, u64)> {
         let token = token.trim().to_string();
-        let target = target_spam_prob.clamp(0.000001, 0.999999);
+        // Clamped well away from 0/1: the formula below solves for the raw count
+        // needed to hit `target`, and that count blows up as target approaches
+        // either extreme (at 0.9999 against a modest few-thousand-word corpus it's
+        // already tens of millions). Since spam_count/ham_count feed into the
+        // shared spam_total/ham_total used to score every OTHER token, an
+        // extreme target here silently poisons the whole model's scoring, not
+        // just this one word's.
+        let target = target_spam_prob.clamp(0.05, 0.95);
         let updated = self
             .with_conn(move |conn| {
                 let (spam_total, ham_total, vocab): (u64, u64, u64) = conn.query_row(
@@ -618,6 +625,13 @@ impl Runtime {
                 let spam_count = (((target * (spam_other + vocab)) - 1.0) / (1.0 - target)).ceil().max(0.0) as u64;
                 let ham_target = 1.0 - target;
                 let ham_count = (((ham_target * (ham_other + vocab)) - 1.0) / (1.0 - ham_target)).ceil().max(0.0) as u64;
+
+                // Defense in depth: even with `target` clamped above, never let a
+                // single token's count outweigh the rest of the corpus by more
+                // than 20x, and never past an absolute ceiling. Either bound being
+                // hit means the requested probability wasn't fully reached.
+                let spam_count = spam_count.min((spam_other as u64).saturating_mul(20).max(1_000)).min(1_000_000);
+                let ham_count = ham_count.min((ham_other as u64).saturating_mul(20).max(1_000)).min(1_000_000);
 
                 conn.execute(
                     "INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES (?1, ?2, ?3) ON CONFLICT(word) DO UPDATE SET spam_count = excluded.spam_count, ham_count = excluded.ham_count",
@@ -898,6 +912,32 @@ impl Runtime {
             let ham: u64 = conn.query_row("SELECT COALESCE(SUM(ham_count), 0) FROM word_frequencies", [], |row| row.get(0))?;
             let total: u64 = conn.query_row("SELECT COUNT(*) FROM word_frequencies", [], |row| row.get(0))?;
             Ok((spam, ham, total))
+        })
+        .await
+    }
+
+    /// Returns the single largest spam_count and ham_count in the vocabulary.
+    /// A token whose count dwarfs the rest of the corpus (e.g. from a `/set`
+    /// call with a near-0/near-1 target) silently drags down every other
+    /// token's score, since counts are summed into a shared denominator.
+    /// `/ml_stats` surfaces this so it's catchable without direct DB access.
+    async fn largest_token_counts(&self) -> Result<(Option<(String, u64)>, Option<(String, u64)>)> {
+        self.with_conn(|conn| {
+            let top_spam = conn
+                .query_row(
+                    "SELECT word, spam_count FROM word_frequencies ORDER BY spam_count DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+                )
+                .ok();
+            let top_ham = conn
+                .query_row(
+                    "SELECT word, ham_count FROM word_frequencies ORDER BY ham_count DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+                )
+                .ok();
+            Ok((top_spam, top_ham))
         })
         .await
     }
@@ -1612,7 +1652,7 @@ fn help_text() -> String {
 }
 
 fn help_op_text() -> String {
-    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整自動封禁門檻\n<code>/set 0x&lt;token&gt; &lt;0~1&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat &lt;chat_id&gt;</code>：設定工作群組\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
+    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整自動封禁門檻\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat &lt;chat_id&gt;</code>：設定工作群組\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
 }
 
 fn format_score_debug(report: &ScoreDebugReport) -> String {
@@ -2475,7 +2515,21 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
             let (spam, ham, total) = runtime.word_stats().await.unwrap_or((0, 0, 0));
             let threshold = runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold);
-            let text = format!("<b>模型統計</b>\nspam: {spam}\nham: {ham}\n總樣本: {total}\n有效門檻: {threshold:.2}");
+            let mut text = format!("<b>模型統計</b>\nspam: {spam}\nham: {ham}\n總樣本: {total}\n有效門檻: {threshold:.2}");
+            if let Ok((top_spam, top_ham)) = runtime.largest_token_counts().await {
+                if let Some((word, count)) = top_spam {
+                    text.push_str(&format!("\n\n最大 spam token: <code>{}</code> = {count}", escape_html(&word)));
+                    if spam > 0 && (count as f64) / (spam as f64) > 0.2 {
+                        text.push_str("\n⚠️ 此 token 佔整體 spam 計數超過 20%，可能是 /set 造成的異常值，會拖累其他詞的判斷，建議檢查並用 /set 重新調整或用 /ml_purge_text 清除。");
+                    }
+                }
+                if let Some((word, count)) = top_ham {
+                    text.push_str(&format!("\n最大 ham token: <code>{}</code> = {count}", escape_html(&word)));
+                    if ham > 0 && (count as f64) / (ham as f64) > 0.2 {
+                        text.push_str("\n⚠️ 此 token 佔整體 ham 計數超過 20%，可能是 /set 造成的異常值。");
+                    }
+                }
+            }
             bot.send_message(message.chat.id, text).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::CheckRules => {
@@ -2744,12 +2798,12 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
 
             let token = token_arg.strip_prefix("0x").unwrap_or(&token_arg).trim();
             if token.is_empty() {
-                bot.send_message(message.chat.id, "請提供 token，例如 /set 0x80sun 0.9999。").await?;
+                bot.send_message(message.chat.id, "請提供 token，例如 /set 0x80sun 0.9。").await?;
                 return Ok(());
             }
 
             let Ok(target) = value.parse::<f64>() else {
-                bot.send_message(message.chat.id, "請提供 0.0 到 1.0 的數值。").await?;
+                bot.send_message(message.chat.id, "請提供 0.05 到 0.95 之間的數值（過於極端的值會影響整個模型的計分基準，因此會被限制）。").await?;
                 return Ok(());
             };
 
