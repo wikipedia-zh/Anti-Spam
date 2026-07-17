@@ -5,7 +5,7 @@ use fancy_regex::Regex as FancyRegex;
 use regex::Regex as StdRegex;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, env, path::PathBuf, sync::{Arc, OnceLock}};
+use std::{collections::HashMap, env, path::PathBuf, sync::{Arc, Mutex as StdMutex, OnceLock}};
 use teloxide::{prelude::*, types::{CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, MessageId, ParseMode, UserId}};
 use url::Url;
 use tokio::sync::{Mutex, RwLock};
@@ -128,13 +128,14 @@ struct ModelState {
 
 struct Runtime {
     config: Config,
-    sqlite_path: PathBuf,
+    db: Arc<StdMutex<Connection>>,
     project_chat: Mutex<Option<i64>>,
     model: Mutex<ModelState>,
     spam_rules: RwLock<Vec<SpamRule>>,
     mass_train_buffer: Mutex<HashMap<i64, Vec<String>>>,
     mass_train_mode: Mutex<HashMap<i64, String>>,
     pending_rule_additions: Mutex<HashMap<i64, String>>,
+    group_module_cache: RwLock<HashMap<i64, GroupModuleSettings>>,
 }
 
 #[derive(Clone, Default)]
@@ -199,19 +200,42 @@ impl Runtime {
         let model = Self::load_model(&conn)?;
         let project_chat = Self::load_project_chat(&conn)?;
         let spam_rules = Self::load_spam_rules(&conn)?;
-        Ok(Self { config, sqlite_path, project_chat: Mutex::new(project_chat), model: Mutex::new(model), spam_rules: RwLock::new(spam_rules), mass_train_buffer: Mutex::new(HashMap::new()), mass_train_mode: Mutex::new(HashMap::new()), pending_rule_additions: Mutex::new(HashMap::new()) })
+        Ok(Self {
+            config,
+            db: Arc::new(StdMutex::new(conn)),
+            project_chat: Mutex::new(project_chat),
+            model: Mutex::new(model),
+            spam_rules: RwLock::new(spam_rules),
+            mass_train_buffer: Mutex::new(HashMap::new()),
+            mass_train_mode: Mutex::new(HashMap::new()),
+            pending_rule_additions: Mutex::new(HashMap::new()),
+            group_module_cache: RwLock::new(HashMap::new()),
+        })
     }
 
-    fn open_conn(&self) -> Result<Connection> {
-        let mut conn = Connection::open(&self.sqlite_path)?;
-        Self::init_db(&mut conn)?;
-        Ok(conn)
+    /// Runs `f` against the single shared connection on a blocking-safe thread.
+    /// Centralizing access here means schema setup happens once (in `init_db` at
+    /// startup) instead of on every query, and keeps SQLite's blocking I/O off
+    /// the async executor threads.
+    async fn with_conn<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            f(&mut conn)
+        })
+        .await
+        .context("database task panicked")?
     }
 
     fn init_db(conn: &mut Connection) -> Result<()> {
         conn.execute_batch(
             r#"
             PRAGMA journal_mode=WAL;
+            PRAGMA busy_timeout=5000;
             CREATE TABLE IF NOT EXISTS cases (
                 id TEXT PRIMARY KEY,
                 action TEXT NOT NULL,
@@ -398,58 +422,61 @@ impl Runtime {
     }
 
     async fn persist_case(&self, case: &CaseRecord) -> Result<()> {
-        let conn = self.open_conn()?;
-        conn.execute(
-            r#"
-            INSERT INTO cases (id, action, chat_id, target_user_id, target_name, actor_user_id, actor_name, source_message_id, evidence_text, model_score, matched_rule_id, matched_rule_pattern, status, log_message_id, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-            ON CONFLICT(id) DO UPDATE SET
-              action=excluded.action,
-              chat_id=excluded.chat_id,
-              target_user_id=excluded.target_user_id,
-              target_name=excluded.target_name,
-              actor_user_id=excluded.actor_user_id,
-              actor_name=excluded.actor_name,
-              source_message_id=excluded.source_message_id,
-              evidence_text=excluded.evidence_text,
-              model_score=excluded.model_score,
-              matched_rule_id=excluded.matched_rule_id,
-              matched_rule_pattern=excluded.matched_rule_pattern,
-              status=excluded.status,
-              log_message_id=excluded.log_message_id,
-              created_at=excluded.created_at
-            "#,
-            params![
-                case.id,
-                case.action.as_str(),
-                case.chat_id,
-                case.target_user_id,
-                case.target_name,
-                case.actor_user_id,
-                case.actor_name,
-                case.source_message_id,
-                case.evidence_text,
-                case.model_score,
-                case.matched_rule_id,
-                case.matched_rule_pattern,
-                case.status,
-                case.log_message_id,
-                case.created_at.to_rfc3339(),
-            ],
-        )?;
-        Ok(())
+        let case = case.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                r#"
+                INSERT INTO cases (id, action, chat_id, target_user_id, target_name, actor_user_id, actor_name, source_message_id, evidence_text, model_score, matched_rule_id, matched_rule_pattern, status, log_message_id, created_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                ON CONFLICT(id) DO UPDATE SET
+                  action=excluded.action,
+                  chat_id=excluded.chat_id,
+                  target_user_id=excluded.target_user_id,
+                  target_name=excluded.target_name,
+                  actor_user_id=excluded.actor_user_id,
+                  actor_name=excluded.actor_name,
+                  source_message_id=excluded.source_message_id,
+                  evidence_text=excluded.evidence_text,
+                  model_score=excluded.model_score,
+                  matched_rule_id=excluded.matched_rule_id,
+                  matched_rule_pattern=excluded.matched_rule_pattern,
+                  status=excluded.status,
+                  log_message_id=excluded.log_message_id,
+                  created_at=excluded.created_at
+                "#,
+                params![
+                    case.id,
+                    case.action.as_str(),
+                    case.chat_id,
+                    case.target_user_id,
+                    case.target_name,
+                    case.actor_user_id,
+                    case.actor_name,
+                    case.source_message_id,
+                    case.evidence_text,
+                    case.model_score,
+                    case.matched_rule_id,
+                    case.matched_rule_pattern,
+                    case.status,
+                    case.log_message_id,
+                    case.created_at.to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     async fn load_case(&self, case_id: &str) -> Result<Option<CaseRecord>> {
-        let conn = self.open_conn()?;
-        let result = {
+        let case_id = case_id.to_string();
+        self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 r#"SELECT id, action, chat_id, target_user_id, target_name, actor_user_id, actor_name, source_message_id, evidence_text, model_score, matched_rule_id, matched_rule_pattern, status, log_message_id, created_at FROM cases WHERE id = ?1"#,
             )?;
             let mut rows = stmt.query(params![case_id])?;
             if let Some(row) = rows.next()? {
                 let created_at = DateTime::parse_from_rfc3339(&row.get::<_, String>(14)?)?.with_timezone(&Utc);
-                Some(CaseRecord {
+                Ok(Some(CaseRecord {
                     id: row.get(0)?,
                     action: ActionKind::from_str(&row.get::<_, String>(1)?),
                     chat_id: row.get(2)?,
@@ -465,151 +492,149 @@ impl Runtime {
                     status: row.get(12)?,
                     log_message_id: row.get(13)?,
                     created_at,
-                })
+                }))
             } else {
-                None
+                Ok(None)
             }
-        };
-        Ok(result)
+        })
+        .await
     }
 
     async fn insert_training_sample(&self, label: &str, text: &str, case_id: Option<&str>) -> Result<()> {
-        let conn = self.open_conn()?;
-        conn.execute(
-            "INSERT INTO training_samples (label, text, case_id, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![label, text, case_id, Utc::now().to_rfc3339()],
-        )?;
-        Ok(())
+        let label = label.to_string();
+        let text = text.to_string();
+        let case_id = case_id.map(|s| s.to_string());
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO training_samples (label, text, case_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![label, text, case_id, Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     async fn purge_training_by_case(&self, case_id: &str) -> Result<usize> {
-        let conn = self.open_conn()?;
-        let affected = conn.execute("DELETE FROM training_samples WHERE case_id = ?1", params![case_id])?;
-        Ok(affected)
+        let case_id = case_id.to_string();
+        self.with_conn(move |conn| Ok(conn.execute("DELETE FROM training_samples WHERE case_id = ?1", params![case_id])?))
+            .await
     }
 
+    /// Refreshes the in-memory model from disk. This only reads — the DB is
+    /// always the source of truth and callers that changed the DB (train_spam,
+    /// purge, undo, set_token_probability, ...) have already persisted their
+    /// specific changes, so there is nothing to write back here.
     async fn rebuild_model(&self) -> Result<ModelState> {
-        let conn = self.open_conn()?;
-        let rebuilt = {
-            let mut rebuilt = ModelState::default();
-            let mut stmt = conn.prepare("SELECT key, value FROM model_meta")?;
-            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
-            for row in rows {
-                let (key, value) = row?;
-                match key.as_str() {
-                    "spam_docs" => rebuilt.spam_docs = value.parse().unwrap_or(0),
-                    "ham_docs" => rebuilt.ham_docs = value.parse().unwrap_or(0),
-                    _ => {}
+        let rebuilt = self
+            .with_conn(|conn| {
+                let mut rebuilt = ModelState::default();
+                let mut stmt = conn.prepare("SELECT key, value FROM model_meta")?;
+                let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+                for row in rows {
+                    let (key, value) = row?;
+                    match key.as_str() {
+                        "spam_docs" => rebuilt.spam_docs = value.parse().unwrap_or(0),
+                        "ham_docs" => rebuilt.ham_docs = value.parse().unwrap_or(0),
+                        _ => {}
+                    }
                 }
-            }
-            let mut stmt = conn.prepare("SELECT word, spam_count, ham_count FROM word_frequencies ORDER BY word ASC")?;
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
-                let word: String = row.get(0)?;
-                let spam_count: u64 = row.get(1)?;
-                let ham_count: u64 = row.get(2)?;
-                if spam_count > 0 {
-                    rebuilt.spam_tokens.insert(word.clone(), spam_count);
+                let mut stmt = conn.prepare("SELECT word, spam_count, ham_count FROM word_frequencies ORDER BY word ASC")?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let word: String = row.get(0)?;
+                    let spam_count: u64 = row.get(1)?;
+                    let ham_count: u64 = row.get(2)?;
+                    if spam_count > 0 {
+                        rebuilt.spam_tokens.insert(word.clone(), spam_count);
+                    }
+                    if ham_count > 0 {
+                        rebuilt.ham_tokens.insert(word, ham_count);
+                    }
                 }
-                if ham_count > 0 {
-                    rebuilt.ham_tokens.insert(word, ham_count);
-                }
-            }
-            rebuilt
-        };
+                Ok(rebuilt)
+            })
+            .await?;
 
-        {
-            let mut model = self.model.lock().await;
-            *model = rebuilt.clone();
-        }
-        self.update_model_meta().await?;
+        let mut model = self.model.lock().await;
+        *model = rebuilt.clone();
         Ok(rebuilt)
     }
 
-    async fn update_model_meta(&self) -> Result<()> {
-        let model = self.model.lock().await;
-        let conn = self.open_conn()?;
-        conn.execute(
-            "INSERT INTO model_meta (key, value) VALUES ('spam_docs', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![model.spam_docs.to_string()],
-        )?;
-        conn.execute(
-            "INSERT INTO model_meta (key, value) VALUES ('ham_docs', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![model.ham_docs.to_string()],
-        )?;
-        for (token, count) in &model.spam_tokens {
+    /// Persists only the aggregate doc counters. Per-token counts are written
+    /// directly by whoever changes them (train_spam/train_ham/etc.) — this
+    /// used to also rewrite every token in the vocabulary on every call, which
+    /// got slower as the vocabulary grew for no benefit.
+    async fn persist_doc_counts(&self) -> Result<()> {
+        let (spam_docs, ham_docs) = {
+            let model = self.model.lock().await;
+            (model.spam_docs, model.ham_docs)
+        };
+        self.with_conn(move |conn| {
             conn.execute(
-                "INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES (?1, ?2, 0) ON CONFLICT(word) DO UPDATE SET spam_count=excluded.spam_count",
-                params![token, count.to_string()],
+                "INSERT INTO model_meta (key, value) VALUES ('spam_docs', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![spam_docs.to_string()],
             )?;
-        }
-        for (token, count) in &model.ham_tokens {
             conn.execute(
-                "INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES (?1, 0, ?2) ON CONFLICT(word) DO UPDATE SET ham_count=excluded.ham_count",
-                params![token, count.to_string()],
+                "INSERT INTO model_meta (key, value) VALUES ('ham_docs', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![ham_docs.to_string()],
             )?;
-        }
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     async fn set_threshold(&self, value: f64) -> Result<()> {
-        let conn = self.open_conn()?;
-        conn.execute(
-            "INSERT INTO model_meta (key, value) VALUES ('spam_threshold', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![value.to_string()],
-        )?;
-        Ok(())
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO model_meta (key, value) VALUES ('spam_threshold', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![value.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     async fn set_token_probability(&self, token: &str, target_spam_prob: f64) -> Result<(u64, u64)> {
         let token = token.trim().to_string();
         let target = target_spam_prob.clamp(0.000001, 0.999999);
-        let sqlite_path = self.sqlite_path.clone();
-        let updated = tokio::task::spawn_blocking(move || -> Result<(u64, u64)> {
-            let conn = Connection::open(&sqlite_path)?;
-            let mut conn = conn;
-            Runtime::init_db(&mut conn)?;
+        let updated = self
+            .with_conn(move |conn| {
+                let (spam_total, ham_total, vocab): (u64, u64, u64) = conn.query_row(
+                    "SELECT COALESCE(SUM(spam_count), 0), COALESCE(SUM(ham_count), 0), COUNT(*) FROM word_frequencies",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
 
-            let (spam_total, ham_total, vocab): (u64, u64, u64) = conn.query_row(
-                "SELECT COALESCE(SUM(spam_count), 0), COALESCE(SUM(ham_count), 0), COUNT(*) FROM word_frequencies",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?;
+                let (current_spam, current_ham): (u64, u64) = conn.query_row(
+                    "SELECT COALESCE(spam_count, 0), COALESCE(ham_count, 0) FROM word_frequencies WHERE word = ?1",
+                    params![&token],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                ).unwrap_or((0, 0));
 
-            let (current_spam, current_ham): (u64, u64) = conn.query_row(
-                "SELECT COALESCE(spam_count, 0), COALESCE(ham_count, 0) FROM word_frequencies WHERE word = ?1",
-                params![&token],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            ).unwrap_or((0, 0));
+                let spam_other = spam_total.saturating_sub(current_spam) as f64;
+                let ham_other = ham_total.saturating_sub(current_ham) as f64;
+                let vocab = vocab.max(1) as f64;
 
-            let spam_other = spam_total.saturating_sub(current_spam) as f64;
-            let ham_other = ham_total.saturating_sub(current_ham) as f64;
-            let vocab = vocab.max(1) as f64;
+                let spam_count = (((target * (spam_other + vocab)) - 1.0) / (1.0 - target)).ceil().max(0.0) as u64;
+                let ham_target = 1.0 - target;
+                let ham_count = (((ham_target * (ham_other + vocab)) - 1.0) / (1.0 - ham_target)).ceil().max(0.0) as u64;
 
-            let spam_count = (((target * (spam_other + vocab)) - 1.0) / (1.0 - target)).ceil().max(0.0) as u64;
-            let ham_target = 1.0 - target;
-            let ham_count = (((ham_target * (ham_other + vocab)) - 1.0) / (1.0 - ham_target)).ceil().max(0.0) as u64;
+                conn.execute(
+                    "INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES (?1, ?2, ?3) ON CONFLICT(word) DO UPDATE SET spam_count = excluded.spam_count, ham_count = excluded.ham_count",
+                    params![&token, spam_count, ham_count],
+                )?;
 
-            conn.execute(
-                "INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES (?1, ?2, ?3) ON CONFLICT(word) DO UPDATE SET spam_count = excluded.spam_count, ham_count = excluded.ham_count",
-                params![&token, spam_count, ham_count],
-            )?;
-
-            Ok((spam_count, ham_count))
-        })
-        .await??;
+                Ok((spam_count, ham_count))
+            })
+            .await?;
 
         let _ = self.rebuild_model().await?;
         Ok(updated)
     }
 
     async fn current_threshold(&self) -> Result<f64> {
-        let conn = self.open_conn()?;
-        if let Some(value) = Self::load_threshold(&conn)? {
-            Ok(value)
-        } else {
-            Ok(self.config.spam_threshold)
-        }
+        let value = self.with_conn(|conn| Self::load_threshold(conn)).await?;
+        Ok(value.unwrap_or(self.config.spam_threshold))
     }
 
     async fn start_mass_train(&self, user_id: i64) {
@@ -647,35 +672,42 @@ impl Runtime {
     }
 
     async fn set_project_chat(&self, chat_id: i64) {
-        if let Ok(conn) = self.open_conn() {
-            let _ = conn.execute(
-                "INSERT INTO model_meta (key, value) VALUES ('project_chat_id', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                params![chat_id.to_string()],
-            );
-        }
+        let _ = self
+            .with_conn(move |conn| {
+                conn.execute(
+                    "INSERT INTO model_meta (key, value) VALUES ('project_chat_id', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    params![chat_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .await;
         let mut project_chat = self.project_chat.lock().await;
         *project_chat = Some(chat_id);
     }
 
     async fn blacklist_reason_message_id(&self) -> Result<Option<i32>> {
-        let conn = self.open_conn() ?;
-        let mut stmt = conn.prepare("SELECT value FROM model_meta WHERE key = 'blacklist_reason_message_id'")?;
-        let mut rows = stmt.query([])?;
-        if let Some(row) = rows.next()? {
-            let value: String = row.get(0)?;
-            Ok(value.parse::<i32>().ok())
-        } else {
-            Ok(None)
-        }
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT value FROM model_meta WHERE key = 'blacklist_reason_message_id'")?;
+            let mut rows = stmt.query([])?;
+            if let Some(row) = rows.next()? {
+                let value: String = row.get(0)?;
+                Ok(value.parse::<i32>().ok())
+            } else {
+                Ok(None)
+            }
+        })
+        .await
     }
 
     async fn set_blacklist_reason_message_id(&self, message_id: i32) -> Result<()> {
-        let conn = self.open_conn()?;
-        conn.execute(
-            "INSERT INTO model_meta (key, value) VALUES ('blacklist_reason_message_id', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![message_id.to_string()],
-        )?;
-        Ok(())
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO model_meta (key, value) VALUES ('blacklist_reason_message_id', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![message_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     async fn blacklist_reason_link(&self) -> Option<String> {
@@ -706,8 +738,7 @@ impl Runtime {
     }
 
     async fn export_training_data(&self) -> Result<String> {
-        let conn = self.open_conn()?;
-        let out = {
+        self.with_conn(|conn| {
             let mut stmt = conn.prepare("SELECT label, text, case_id, created_at FROM training_samples ORDER BY id DESC")?;
             let mut rows = stmt.query([])?;
             let mut out = String::new();
@@ -718,9 +749,9 @@ impl Runtime {
                 let created_at: String = row.get(3)?;
                 out.push_str(&format!("[{created_at}] {label} {} {}\n", case_id.unwrap_or_else(|| "-".to_string()), text.replace('\n', " ")));
             }
-            out
-        };
-        Ok(out)
+            Ok(out)
+        })
+        .await
     }
 
     async fn effective_threshold(&self) -> Result<f64> {
@@ -728,16 +759,7 @@ impl Runtime {
     }
 
     async fn refresh_spam_rules(&self) -> Result<()> {
-        let rules = tokio::task::spawn_blocking({
-            let sqlite_path = self.sqlite_path.clone();
-            move || -> Result<Vec<SpamRule>> {
-                let conn = Connection::open(&sqlite_path)?;
-                let mut conn = conn;
-                Runtime::init_db(&mut conn)?;
-                Runtime::load_spam_rules(&conn)
-            }
-        })
-        .await??;
+        let rules = self.with_conn(|conn| Runtime::load_spam_rules(conn)).await?;
         let mut cache = self.spam_rules.write().await;
         *cache = rules;
         Ok(())
@@ -745,28 +767,25 @@ impl Runtime {
 
     async fn purge_training_by_text(&self, payload: &str) -> Result<usize> {
         let payload = payload.to_string();
-        let sqlite_path = self.sqlite_path.clone();
-        tokio::task::spawn_blocking(move || -> Result<usize> {
-            let conn = Connection::open(&sqlite_path)?;
-            let mut conn = conn;
-            Runtime::init_db(&mut conn)?;
+        self.with_conn(move |conn| {
+            let tx = conn.transaction()?;
 
             let mut samples = Vec::new();
             {
-                let mut stmt = conn.prepare("SELECT label, text FROM training_samples WHERE text LIKE ?1 OR text LIKE ?2")?;
+                let mut stmt = tx.prepare("SELECT label, text FROM training_samples WHERE text LIKE ?1 OR text LIKE ?2")?;
                 let rows = stmt.query_map(params![format!("%{payload}%"), payload], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
                 for row in rows {
                     samples.push(row?);
                 }
             }
 
-            let mut spam_docs: i64 = conn.query_row("SELECT COALESCE(value, '0') FROM model_meta WHERE key = 'spam_docs'", [], |row| row.get::<_, String>(0))?.parse().unwrap_or(0);
-            let mut ham_docs: i64 = conn.query_row("SELECT COALESCE(value, '0') FROM model_meta WHERE key = 'ham_docs'", [], |row| row.get::<_, String>(0))?.parse().unwrap_or(0);
+            let mut spam_docs: i64 = tx.query_row("SELECT COALESCE(value, '0') FROM model_meta WHERE key = 'spam_docs'", [], |row| row.get::<_, String>(0))?.parse().unwrap_or(0);
+            let mut ham_docs: i64 = tx.query_row("SELECT COALESCE(value, '0') FROM model_meta WHERE key = 'ham_docs'", [], |row| row.get::<_, String>(0))?.parse().unwrap_or(0);
 
             for (label, text) in &samples {
                 let tokens = tokenize(text);
                 for token in tokens {
-                    let counts = conn.query_row(
+                    let counts = tx.query_row(
                         "SELECT spam_count, ham_count FROM word_frequencies WHERE word = ?1",
                         params![&token],
                         |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
@@ -778,9 +797,9 @@ impl Runtime {
                             _ => {}
                         }
                         if spam_count == 0 && ham_count == 0 {
-                            conn.execute("DELETE FROM word_frequencies WHERE word = ?1", params![&token])?;
+                            tx.execute("DELETE FROM word_frequencies WHERE word = ?1", params![&token])?;
                         } else {
-                            conn.execute(
+                            tx.execute(
                                 "UPDATE word_frequencies SET spam_count = ?2, ham_count = ?3 WHERE word = ?1",
                                 params![&token, spam_count, ham_count],
                             )?;
@@ -795,29 +814,28 @@ impl Runtime {
                 }
             }
 
-            conn.execute(
+            tx.execute(
                 "INSERT INTO model_meta (key, value) VALUES ('spam_docs', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 params![spam_docs.to_string()],
             )?;
-            conn.execute(
+            tx.execute(
                 "INSERT INTO model_meta (key, value) VALUES ('ham_docs', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 params![ham_docs.to_string()],
             )?;
 
-            Ok(conn.execute(
+            let affected = tx.execute(
                 "DELETE FROM training_samples WHERE text LIKE ?1 OR text LIKE ?2",
                 params![format!("%{payload}%"), payload],
-            )?)
+            )?;
+            tx.commit()?;
+            Ok(affected)
         })
-        .await?
+        .await
     }
 
     async fn undo_clean_training_sample_by_text(&self, text: &str) -> Result<usize> {
         let text = text.to_string();
-        let sqlite_path = self.sqlite_path.clone();
-        tokio::task::spawn_blocking(move || -> Result<usize> {
-            let mut conn = Connection::open(&sqlite_path)?;
-            Runtime::init_db(&mut conn)?;
+        self.with_conn(move |conn| {
             let tx = conn.transaction()?;
 
             let maybe_sample = {
@@ -871,39 +889,32 @@ impl Runtime {
             tx.commit()?;
             Ok(1)
         })
-        .await?
+        .await
     }
 
     async fn word_stats(&self) -> Result<(u64, u64, u64)> {
-        let sqlite_path = self.sqlite_path.clone();
-        tokio::task::spawn_blocking(move || -> Result<(u64, u64, u64)> {
-            let conn = Connection::open(&sqlite_path)?;
-            let mut conn = conn;
-            Runtime::init_db(&mut conn)?;
+        self.with_conn(|conn| {
             let spam: u64 = conn.query_row("SELECT COALESCE(SUM(spam_count), 0) FROM word_frequencies", [], |row| row.get(0))?;
             let ham: u64 = conn.query_row("SELECT COALESCE(SUM(ham_count), 0) FROM word_frequencies", [], |row| row.get(0))?;
             let total: u64 = conn.query_row("SELECT COUNT(*) FROM word_frequencies", [], |row| row.get(0))?;
             Ok((spam, ham, total))
         })
-        .await?
+        .await
     }
 
     async fn add_spam_rule(&self, pattern: &str, description: &str) -> Result<i64> {
         FancyRegex::new(pattern).context("invalid regex pattern")?;
         let pattern = pattern.to_string();
         let description = description.to_string();
-        let sqlite_path = self.sqlite_path.clone();
-        let id = tokio::task::spawn_blocking(move || -> Result<i64> {
-            let conn = Connection::open(&sqlite_path)?;
-            let mut conn = conn;
-            Runtime::init_db(&mut conn)?;
-            conn.execute(
-                "INSERT INTO spam_rules (pattern, description) VALUES (?1, ?2)",
-                params![pattern, description],
-            )?;
-            Ok(conn.last_insert_rowid())
-        })
-        .await??;
+        let id = self
+            .with_conn(move |conn| {
+                conn.execute(
+                    "INSERT INTO spam_rules (pattern, description) VALUES (?1, ?2)",
+                    params![pattern, description],
+                )?;
+                Ok(conn.last_insert_rowid())
+            })
+            .await?;
         self.refresh_spam_rules().await?;
         Ok(id)
     }
@@ -911,14 +922,9 @@ impl Runtime {
     async fn update_spam_rule_pattern(&self, rule_id: i64, pattern: &str) -> Result<bool> {
         FancyRegex::new(pattern).context("invalid regex pattern")?;
         let pattern = pattern.to_string();
-        let sqlite_path = self.sqlite_path.clone();
-        let updated = tokio::task::spawn_blocking(move || -> Result<usize> {
-            let conn = Connection::open(&sqlite_path)?;
-            let mut conn = conn;
-            Runtime::init_db(&mut conn)?;
-            Ok(conn.execute("UPDATE spam_rules SET pattern = ?2 WHERE id = ?1", params![rule_id, pattern])?)
-        })
-        .await??;
+        let updated = self
+            .with_conn(move |conn| Ok(conn.execute("UPDATE spam_rules SET pattern = ?2 WHERE id = ?1", params![rule_id, pattern])?))
+            .await?;
         if updated > 0 {
             self.refresh_spam_rules().await?;
             Ok(true)
@@ -928,14 +934,9 @@ impl Runtime {
     }
 
     async fn delete_spam_rule(&self, rule_id: i64) -> Result<bool> {
-        let sqlite_path = self.sqlite_path.clone();
-        let removed = tokio::task::spawn_blocking(move || -> Result<usize> {
-            let conn = Connection::open(&sqlite_path)?;
-            let mut conn = conn;
-            Runtime::init_db(&mut conn)?;
-            Ok(conn.execute("DELETE FROM spam_rules WHERE id = ?1", params![rule_id])?)
-        })
-        .await??;
+        let removed = self
+            .with_conn(move |conn| Ok(conn.execute("DELETE FROM spam_rules WHERE id = ?1", params![rule_id])?))
+            .await?;
         if removed > 0 {
             self.refresh_spam_rules().await?;
             Ok(true)
@@ -945,72 +946,69 @@ impl Runtime {
     }
 
     async fn list_spam_rules(&self) -> Result<Vec<(i64, String, String)>> {
-        tokio::task::spawn_blocking({
-            let sqlite_path = self.sqlite_path.clone();
-            move || -> Result<Vec<(i64, String, String)>> {
-                let conn = Connection::open(&sqlite_path)?;
-                let mut conn = conn;
-                Runtime::init_db(&mut conn)?;
-                let mut stmt = conn.prepare("SELECT id, pattern, description FROM spam_rules ORDER BY id ASC")?;
-                let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?;
-                let mut out = Vec::new();
-                for row in rows {
-                    out.push(row?);
-                }
-                Ok(out)
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT id, pattern, description FROM spam_rules ORDER BY id ASC")?;
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
             }
+            Ok(out)
         })
-        .await?
+        .await
     }
 
     async fn list_invalid_spam_rules(&self) -> Result<Vec<(i64, String, String, String)>> {
-        tokio::task::spawn_blocking({
-            let sqlite_path = self.sqlite_path.clone();
-            move || -> Result<Vec<(i64, String, String, String)>> {
-                let conn = Connection::open(&sqlite_path)?;
-                let mut conn = conn;
-                Runtime::init_db(&mut conn)?;
-                let mut stmt = conn.prepare("SELECT id, pattern, description FROM spam_rules ORDER BY id ASC")?;
-                let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?;
-                let mut out = Vec::new();
-                for row in rows {
-                    let (id, pattern, description) = row?;
-                    if let Err(err) = FancyRegex::new(&pattern) {
-                        out.push((id, pattern, description, err.to_string()));
-                    }
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT id, pattern, description FROM spam_rules ORDER BY id ASC")?;
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, pattern, description) = row?;
+                if let Err(err) = FancyRegex::new(&pattern) {
+                    out.push((id, pattern, description, err.to_string()));
                 }
-                Ok(out)
             }
+            Ok(out)
         })
-        .await?
+        .await
     }
 
     async fn get_group_modules(&self, chat_id: i64) -> Result<GroupModuleSettings> {
-        let conn = self.open_conn()?;
-        conn.execute(
-            "INSERT OR IGNORE INTO group_module_settings (chat_id) VALUES (?1)",
-            params![chat_id],
-        )?;
-        let mut stmt = conn.prepare("SELECT no_long_name, no_halal, no_service_messages FROM group_module_settings WHERE chat_id = ?1")?;
-        let mut rows = stmt.query(params![chat_id])?;
-        if let Some(row) = rows.next()? {
-            Ok(GroupModuleSettings {
-                no_long_name: row.get::<_, i64>(0)? != 0,
-                no_halal: row.get::<_, i64>(1)? != 0,
-                no_service_messages: row.get::<_, i64>(2)? != 0,
-            })
-        } else {
-            Ok(GroupModuleSettings::default())
+        if let Some(cached) = self.group_module_cache.read().await.get(&chat_id) {
+            return Ok(cached.clone());
         }
+        let settings = self
+            .with_conn(move |conn| {
+                conn.execute(
+                    "INSERT OR IGNORE INTO group_module_settings (chat_id) VALUES (?1)",
+                    params![chat_id],
+                )?;
+                let mut stmt = conn.prepare("SELECT no_long_name, no_halal, no_service_messages FROM group_module_settings WHERE chat_id = ?1")?;
+                let mut rows = stmt.query(params![chat_id])?;
+                if let Some(row) = rows.next()? {
+                    Ok(GroupModuleSettings {
+                        no_long_name: row.get::<_, i64>(0)? != 0,
+                        no_halal: row.get::<_, i64>(1)? != 0,
+                        no_service_messages: row.get::<_, i64>(2)? != 0,
+                    })
+                } else {
+                    Ok(GroupModuleSettings::default())
+                }
+            })
+            .await?;
+        self.group_module_cache.write().await.insert(chat_id, settings.clone());
+        Ok(settings)
     }
 
     async fn set_group_module(&self, chat_id: i64, module: &str, enabled: bool) -> Result<()> {
-        let conn = self.open_conn()?;
-        conn.execute(
-            "INSERT OR IGNORE INTO group_module_settings (chat_id) VALUES (?1)",
-            params![chat_id],
-        )?;
-        match module {
+        let module = module.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO group_module_settings (chat_id) VALUES (?1)",
+                params![chat_id],
+            )?;
+            match module.as_str() {
             "nolongname" => {
                 conn.execute(
                     "UPDATE group_module_settings SET no_long_name = ?2 WHERE chat_id = ?1",
@@ -1029,61 +1027,73 @@ impl Runtime {
                     params![chat_id, if enabled { 1 } else { 0 }],
                 )?;
             }
-            _ => {}
-        }
+                _ => {}
+            }
+            Ok(())
+        })
+        .await?;
+        self.group_module_cache.write().await.remove(&chat_id);
         Ok(())
     }
 
     async fn is_group_whitelisted(&self, chat_id: i64, user_id: i64) -> Result<bool> {
-        let conn = self.open_conn()?;
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM group_whitelist WHERE chat_id = ?1 AND user_id = ?2",
-            params![chat_id, user_id],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
+        self.with_conn(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM group_whitelist WHERE chat_id = ?1 AND user_id = ?2",
+                params![chat_id, user_id],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
+        })
+        .await
     }
 
     async fn set_group_whitelist(&self, chat_id: i64, user_id: i64, enabled: bool, added_by: Option<i64>) -> Result<()> {
-        let conn = self.open_conn()?;
-        if enabled {
-            conn.execute(
-                "INSERT OR IGNORE INTO group_whitelist (chat_id, user_id, added_by, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![chat_id, user_id, added_by, Utc::now().to_rfc3339()],
-            )?;
-        } else {
-            conn.execute(
-                "DELETE FROM group_whitelist WHERE chat_id = ?1 AND user_id = ?2",
-                params![chat_id, user_id],
-            )?;
-        }
-        Ok(())
+        self.with_conn(move |conn| {
+            if enabled {
+                conn.execute(
+                    "INSERT OR IGNORE INTO group_whitelist (chat_id, user_id, added_by, created_at) VALUES (?1, ?2, ?3, ?4)",
+                    params![chat_id, user_id, added_by, Utc::now().to_rfc3339()],
+                )?;
+            } else {
+                conn.execute(
+                    "DELETE FROM group_whitelist WHERE chat_id = ?1 AND user_id = ?2",
+                    params![chat_id, user_id],
+                )?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn is_global_whitelisted(&self, user_id: i64) -> Result<bool> {
-        let conn = self.open_conn()?;
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM global_whitelist WHERE user_id = ?1",
-            params![user_id],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
+        self.with_conn(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM global_whitelist WHERE user_id = ?1",
+                params![user_id],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
+        })
+        .await
     }
 
     async fn set_global_whitelist(&self, user_id: i64, enabled: bool, added_by: Option<i64>) -> Result<()> {
-        let conn = self.open_conn()?;
-        if enabled {
-            conn.execute(
-                "INSERT OR IGNORE INTO global_whitelist (user_id, added_by, created_at) VALUES (?1, ?2, ?3)",
-                params![user_id, added_by, Utc::now().to_rfc3339()],
-            )?;
-        } else {
-            conn.execute(
-                "DELETE FROM global_whitelist WHERE user_id = ?1",
-                params![user_id],
-            )?;
-        }
-        Ok(())
+        self.with_conn(move |conn| {
+            if enabled {
+                conn.execute(
+                    "INSERT OR IGNORE INTO global_whitelist (user_id, added_by, created_at) VALUES (?1, ?2, ?3)",
+                    params![user_id, added_by, Utc::now().to_rfc3339()],
+                )?;
+            } else {
+                conn.execute(
+                    "DELETE FROM global_whitelist WHERE user_id = ?1",
+                    params![user_id],
+                )?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn load_user_profile(&self, bot: &Bot, user_id: i64) -> Result<UserProfileInfo> {
@@ -1353,7 +1363,7 @@ fn clean_name_parts(text: &str) -> (String, Vec<String>) {
 }
 
 fn evaluate_name_guard(full_name: &str) -> Vec<String> {
-    if full_name.chars().any(|c| !c.is_ascii()) {
+    if !full_name.is_ascii() {
         return Vec::new();
     }
 
@@ -1656,7 +1666,7 @@ fn chinese_case_action(case: &CaseRecord) -> String {
 }
 
 fn chinese_case_reason(case: &CaseRecord) -> String {
-    case.matched_rule_pattern.as_ref().map(|s| s.clone()).unwrap_or_else(|| "-".to_string())
+    case.matched_rule_pattern.clone().unwrap_or_else(|| "-".to_string())
 }
 
 fn build_reason_link(reason: &str, link: &str) -> String {
@@ -1707,6 +1717,18 @@ async fn is_maintainer(bot: &Bot, config: &Config, user_id: i64) -> bool {
     }
     let _ = bot;
     false
+}
+
+/// Guards a command handler arm behind `is_maintainer`, replying with `$msg` and
+/// returning early otherwise. Collapses the same 4-line permission check that
+/// used to be repeated at the top of ~24 command arms in `handle_command`.
+macro_rules! require_maintainer {
+    ($bot:expr, $runtime:expr, $from_id:expr, $message:expr, $msg:expr) => {
+        if !is_maintainer($bot, &$runtime.config, $from_id).await {
+            $bot.send_message($message.chat.id, $msg).await?;
+            return Ok(());
+        }
+    };
 }
 
 async fn is_group_admin(bot: &Bot, chat_id: ChatId, user_id: i64) -> bool {
@@ -1796,7 +1818,7 @@ async fn notify_bot_added(bot: &Bot, runtime: &Runtime, message: &Message) -> bo
                 actor_user_id: None,
                 actor_name: None,
                 source_message_id: Some(message.id.0),
-                evidence_text: extract_full_text(&message),
+                evidence_text: extract_full_text(message),
                 model_score: None,
                 matched_rule_id: None,
                 matched_rule_pattern: Some(all_reasons.join("；")),
@@ -1926,15 +1948,21 @@ async fn train_spam(runtime: &Runtime, text: &str, case_id: Option<&str>) -> Res
             *model.spam_tokens.entry(token.clone()).or_default() += 1;
         }
     }
-    let conn = runtime.open_conn()?;
-    for token in tokens {
-        conn.execute(
-            "INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES (?1, 1, 0) ON CONFLICT(word) DO UPDATE SET spam_count = spam_count + 1",
-            params![token],
-        )?;
-    }
+    runtime
+        .with_conn(move |conn| {
+            let tx = conn.transaction()?;
+            for token in &tokens {
+                tx.execute(
+                    "INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES (?1, 1, 0) ON CONFLICT(word) DO UPDATE SET spam_count = spam_count + 1",
+                    params![token],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
     runtime.insert_training_sample("spam", text, case_id).await?;
-    runtime.update_model_meta().await
+    runtime.persist_doc_counts().await
 }
 
 async fn train_ham(runtime: &Runtime, text: &str, case_id: Option<&str>) -> Result<()> {
@@ -1946,15 +1974,21 @@ async fn train_ham(runtime: &Runtime, text: &str, case_id: Option<&str>) -> Resu
             *model.ham_tokens.entry(token.clone()).or_default() += 1;
         }
     }
-    let conn = runtime.open_conn()?;
-    for token in tokens {
-        conn.execute(
-            "INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES (?1, 0, 1) ON CONFLICT(word) DO UPDATE SET ham_count = ham_count + 1",
-            params![token],
-        )?;
-    }
+    runtime
+        .with_conn(move |conn| {
+            let tx = conn.transaction()?;
+            for token in &tokens {
+                tx.execute(
+                    "INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES (?1, 0, 1) ON CONFLICT(word) DO UPDATE SET ham_count = ham_count + 1",
+                    params![token],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
     runtime.insert_training_sample("ham", text, case_id).await?;
-    runtime.update_model_meta().await
+    runtime.persist_doc_counts().await
 }
 
 async fn extract_reply_context(message: &Message) -> Option<(i64, String, i32, String)> {
@@ -1981,14 +2015,11 @@ fn extract_full_text(msg: &Message) -> String {
         if !text.is_empty() {
             text.push('\n');
         }
-        match origin {
-            teloxide::types::MessageOrigin::Channel { chat, .. } => {
-                text.push_str(&format!("\n[fwd_id: {}]", chat.id.0));
-                if let Some(username) = chat.username() {
-                    text.push_str(&format!("\n[fwd_user: {}]", username));
-                }
+        if let teloxide::types::MessageOrigin::Channel { chat, .. } = origin {
+            text.push_str(&format!("\n[fwd_id: {}]", chat.id.0));
+            if let Some(username) = chat.username() {
+                text.push_str(&format!("\n[fwd_user: {}]", username));
             }
-            _ => {}
         }
     }
 
@@ -2152,10 +2183,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             bot.send_message(message.chat.id, help_text()).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::HelpOp => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
             bot.send_message(message.chat.id, help_op_text()).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::MyId => {
@@ -2178,10 +2206,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             bot.send_message(message.chat.id, format!("這個群的 Chat ID: <code>{}</code>", message.chat.id.0)).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::ScoreTest(text) => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有維護人員可以使用 /ml_score。") .await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用 /ml_score。");
             let target_msg = message.reply_to_message().unwrap_or(&message);
             let text = if text.trim().is_empty() {
                 extract_full_text(target_msg)
@@ -2211,10 +2236,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             bot.send_message(message.chat.id, response).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::SetChat(chat_id) => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有維護人員可以設定項目交流群。") .await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以設定項目交流群。");
             let Some(value) = chat_id.parse::<i64>().ok() else {
                 bot.send_message(message.chat.id, "請提供有效的 Chat ID。") .await?;
                 return Ok(());
@@ -2223,10 +2245,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             bot.send_message(message.chat.id, format!("已設定項目交流群為 <code>{value}</code>")).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::Leave(reason) => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有維護人員可以使用 /leave。") .await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用 /leave。");
             let (target_chat_id, reason) = parse_leave_args(&reason);
             let reason = if reason.trim().is_empty() { "違反使用規則".to_string() } else { reason };
             let target_chat_id = target_chat_id.unwrap_or(message.chat.id.0);
@@ -2373,10 +2392,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             }
         }
         ModerationCommand::MlTrainSpam | ModerationCommand::MlCleanSpam => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
             let target_msg = message.reply_to_message().unwrap_or(&message);
             let text = extract_full_text(target_msg);
             if text.trim().is_empty() {
@@ -2396,10 +2412,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             }
         }
         ModerationCommand::MarkHam => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有維護人員可以使用 /mark_ham。") .await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用 /mark_ham。");
             let target_msg = message.reply_to_message().unwrap_or(&message);
             let text = extract_full_text(target_msg);
             if text.trim().is_empty() {
@@ -2410,10 +2423,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             bot.send_message(message.chat.id, "已將該樣本寫入 ham 模型。") .await?;
         }
         ModerationCommand::MlUndoCleanSpam => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
             let raw_text = message.text().or(message.caption()).unwrap_or("");
             let text = if let Some(target_msg) = message.reply_to_message() {
                 extract_full_text(target_msg)
@@ -2440,19 +2450,13 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             bot.send_message(message.chat.id, "已撤銷該 ham/clean 樣本並重建模型。").await?;
         }
         ModerationCommand::MlPurge(case_id) => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
             let removed = runtime.purge_training_by_case(&case_id).await.unwrap_or(0);
             let _ = runtime.rebuild_model().await;
             bot.send_message(message.chat.id, format!("已刪除 {removed} 筆訓練樣本，並重建模型。")) .await?;
         }
         ModerationCommand::MlPurgeText(target) => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
             let payload = target.trim();
             if payload.is_empty() {
                 bot.send_message(message.chat.id, "請提供要清除的原文片段。").await?;
@@ -2463,28 +2467,19 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             bot.send_message(message.chat.id, format!("已依文字清除 {removed} 筆訓練樣本，並重建模型。")) .await?;
         }
         ModerationCommand::MlRebuild => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
             let rebuilt = runtime.rebuild_model().await.unwrap_or_default();
             bot.send_message(message.chat.id, format!("已重建模型，spam_docs={} ham_docs={}", rebuilt.spam_docs, rebuilt.ham_docs)).await?;
         }
         ModerationCommand::MlStats => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
             let (spam, ham, total) = runtime.word_stats().await.unwrap_or((0, 0, 0));
             let threshold = runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold);
             let text = format!("<b>模型統計</b>\nspam: {spam}\nham: {ham}\n總樣本: {total}\n有效門檻: {threshold:.2}");
             bot.send_message(message.chat.id, text).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::CheckRules => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
             let invalid = runtime.list_invalid_spam_rules().await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
             let body = if invalid.is_empty() {
                 "<b>規則檢查</b>\n\n全部通過".to_string()
@@ -2502,10 +2497,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             bot.send_message(message.chat.id, body).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::ListRules => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
             let rules = runtime.list_spam_rules().await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
             let body = if rules.is_empty() {
                 "<b>規則清單</b>\n\n╚• 無".to_string()
@@ -2526,10 +2518,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             bot.send_message(message.chat.id, body).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::DelRule(rule_id) => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
             let Some(id) = rule_id.parse::<i64>().ok() else {
                 bot.send_message(message.chat.id, "請提供有效的規則 ID。").await?;
                 return Ok(());
@@ -2538,10 +2527,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             bot.send_message(message.chat.id, if removed { format!("已刪除規則 #{id}") } else { format!("找不到規則 #{id}") }).await?;
         }
         ModerationCommand::AddRule(rule) => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
             let pattern = rule.trim();
             if pattern.is_empty() {
                 bot.send_message(message.chat.id, "請提供正則。").await?;
@@ -2551,10 +2537,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             bot.send_message(message.chat.id, "好的，這組正則要叫什麼？").await?;
         }
         ModerationCommand::EditRule(rule_id, pattern) => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
             let Some(id) = rule_id.parse::<i64>().ok() else {
                 bot.send_message(message.chat.id, "請提供有效的規則 ID。").await?;
                 return Ok(());
@@ -2571,10 +2554,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             }
         }
         ModerationCommand::UpdateBL => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
             let text = build_blacklist_reason_text(&runtime);
             let sent = bot.send_message(ChatId(runtime.config.log_channel_id), text).parse_mode(ParseMode::Html).await?;
             let _ = bot.pin_chat_message(ChatId(runtime.config.log_channel_id), sent.id).await;
@@ -2623,10 +2603,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let _ = bot.delete_message(message.chat.id, message.id).await;
         }
         ModerationCommand::WhiteGlobal(target) => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
             let Some(user_id) = target.parse::<i64>().ok().or_else(|| message.reply_to_message().and_then(|m| m.from.as_ref()).map(|u| u.id.0 as i64)) else {
                 bot.send_message(message.chat.id, "請提供 userid 或回覆一位用戶。") .await?;
                 return Ok(());
@@ -2657,10 +2634,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let _ = bot.delete_message(message.chat.id, message.id).await;
         }
         ModerationCommand::UnwhiteGlobal(target) => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
             let Some(user_id) = target.parse::<i64>().ok().or_else(|| message.reply_to_message().and_then(|m| m.from.as_ref()).map(|u| u.id.0 as i64)) else {
                 bot.send_message(message.chat.id, "請提供 userid 或回覆一位用戶。") .await?;
                 return Ok(());
@@ -2756,10 +2730,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             }
         }
         ModerationCommand::MlThreshold(value) => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
             if let Ok(threshold) = value.parse::<f64>() {
                 let clamped = threshold.clamp(0.50, 0.99);
                 runtime.set_threshold(clamped).await.ok();
@@ -2769,10 +2740,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             }
         }
         ModerationCommand::MlSetToken(token_arg, value) => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
 
             let token = token_arg.strip_prefix("0x").unwrap_or(&token_arg).trim();
             if token.is_empty() {
@@ -2805,10 +2773,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             .await?;
         }
         ModerationCommand::MlExport => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
             let export = runtime.export_training_data().await.unwrap_or_default();
             if export.trim().is_empty() {
                 bot.send_message(message.chat.id, "沒有可匯出的訓練資料。").await?;
@@ -2819,10 +2784,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             }
         }
         ModerationCommand::MlImport => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有維護人員可以使用 /import。") .await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用 /import。");
             let target_msg = message.reply_to_message().unwrap_or(&message);
             let text = extract_full_text(target_msg);
             if text.trim().is_empty() {
@@ -2893,10 +2855,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             bot.send_message(message.chat.id, format!("<b>提</b>:\n<blockquote>{}</blockquote>", body)).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::MlScoreDebug => {
-            if !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只有維護人員可以使用 /ml_score_debug。") .await?;
-                return Ok(());
-            }
+            require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用 /ml_score_debug。");
             let target_msg = message.reply_to_message().unwrap_or(&message);
             let text = extract_full_text(target_msg);
             if text.trim().is_empty() {
