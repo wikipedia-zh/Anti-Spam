@@ -332,6 +332,28 @@ impl Runtime {
         if user_version < 1 {
             Self::migrate_v0_to_v1(conn)?;
         }
+        if user_version < 2 {
+            Self::migrate_v1_to_v2(conn)?;
+        }
+        Ok(())
+    }
+
+    /// A `/set` call with a target very close to 0 or 1 used to compute an
+    /// astronomically large raw count for a single token (see
+    /// `set_token_probability`) — that count then dominated the shared
+    /// spam_total/ham_total used to score every other word, silently
+    /// breaking spam detection for the whole model. This runs once on
+    /// startup (gated by `PRAGMA user_version`, same as `migrate_v0_to_v1`)
+    /// to clamp any such outlier back down, so a deployment self-heals on
+    /// its next restart without needing direct DB access — Toolforge's
+    /// build-service/k8s setup doesn't give us a shell into the running
+    /// pod to run this by hand.
+    fn migrate_v1_to_v2(conn: &mut Connection) -> Result<()> {
+        let tx = conn.transaction()?;
+        tx.execute("UPDATE word_frequencies SET spam_count = 1000 WHERE spam_count > 1000000", [])?;
+        tx.execute("UPDATE word_frequencies SET ham_count = 1000 WHERE ham_count > 1000000", [])?;
+        tx.execute("PRAGMA user_version = 2", [])?;
+        tx.commit()?;
         Ok(())
     }
 
