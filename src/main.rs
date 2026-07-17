@@ -127,6 +127,32 @@ struct CaseRecord {
     created_at: DateTime<Utc>,
 }
 
+/// Builds a `CaseRecord` from a `cases` row - shared by `load_case` and
+/// `load_latest_case_by_actions`, both of which select the same 15 columns
+/// in the same order (id, action, chat_id, target_user_id, target_name,
+/// actor_user_id, actor_name, source_message_id, evidence_text, model_score,
+/// matched_rule_id, matched_rule_pattern, status, log_message_id, created_at).
+fn case_from_row(row: &rusqlite::Row) -> Result<CaseRecord> {
+    let created_at = DateTime::parse_from_rfc3339(&row.get::<_, String>(14)?)?.with_timezone(&Utc);
+    Ok(CaseRecord {
+        id: row.get(0)?,
+        action: ActionKind::from_str(&row.get::<_, String>(1)?),
+        chat_id: row.get(2)?,
+        target_user_id: row.get(3)?,
+        target_name: row.get(4)?,
+        actor_user_id: row.get(5)?,
+        actor_name: row.get(6)?,
+        source_message_id: row.get(7)?,
+        evidence_text: row.get(8)?,
+        model_score: row.get(9)?,
+        matched_rule_id: row.get(10)?,
+        matched_rule_pattern: row.get(11)?,
+        status: row.get(12)?,
+        log_message_id: row.get(13)?,
+        created_at,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ModelState {
     spam_docs: u64,
@@ -562,28 +588,32 @@ impl Runtime {
                 r#"SELECT id, action, chat_id, target_user_id, target_name, actor_user_id, actor_name, source_message_id, evidence_text, model_score, matched_rule_id, matched_rule_pattern, status, log_message_id, created_at FROM cases WHERE id = ?1"#,
             )?;
             let mut rows = stmt.query(params![case_id])?;
-            if let Some(row) = rows.next()? {
-                let created_at = DateTime::parse_from_rfc3339(&row.get::<_, String>(14)?)?.with_timezone(&Utc);
-                Ok(Some(CaseRecord {
-                    id: row.get(0)?,
-                    action: ActionKind::from_str(&row.get::<_, String>(1)?),
-                    chat_id: row.get(2)?,
-                    target_user_id: row.get(3)?,
-                    target_name: row.get(4)?,
-                    actor_user_id: row.get(5)?,
-                    actor_name: row.get(6)?,
-                    source_message_id: row.get(7)?,
-                    evidence_text: row.get(8)?,
-                    model_score: row.get(9)?,
-                    matched_rule_id: row.get(10)?,
-                    matched_rule_pattern: row.get(11)?,
-                    status: row.get(12)?,
-                    log_message_id: row.get(13)?,
-                    created_at,
-                }))
-            } else {
-                Ok(None)
+            rows.next()?.map(case_from_row).transpose()
+        })
+        .await
+    }
+
+    /// Finds the most recent case for (chat_id, target_user_id) whose
+    /// `action` is one of `actions` - e.g. the latest still-active ban, so
+    /// `/unban <user_id>` or a reply (rather than a case_id) can find what to
+    /// reverse without the caller needing to know a case ID. Once a case is
+    /// reversed its `action` is mutated to Unbanned/Unmuted (see the /unban
+    /// and /unmute handlers), so it naturally drops out of this search and
+    /// an older still-active case (if any) surfaces instead.
+    async fn load_latest_case_by_actions(&self, chat_id: i64, target_user_id: i64, actions: &[&str]) -> Result<Option<CaseRecord>> {
+        let actions: Vec<String> = actions.iter().map(|s| s.to_string()).collect();
+        self.with_conn(move |conn| {
+            let placeholders = actions.iter().enumerate().map(|(i, _)| format!("?{}", i + 3)).collect::<Vec<_>>().join(",");
+            let sql = format!(
+                r#"SELECT id, action, chat_id, target_user_id, target_name, actor_user_id, actor_name, source_message_id, evidence_text, model_score, matched_rule_id, matched_rule_pattern, status, log_message_id, created_at FROM cases WHERE chat_id = ?1 AND target_user_id = ?2 AND action IN ({placeholders}) ORDER BY created_at DESC LIMIT 1"#
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&chat_id, &target_user_id];
+            for action in &actions {
+                bound.push(action);
             }
+            let mut rows = stmt.query(bound.as_slice())?;
+            rows.next()?.map(case_from_row).transpose()
         })
         .await
     }
@@ -1872,7 +1902,7 @@ fn help_text() -> String {
 }
 
 fn help_op_text() -> String {
-    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban &lt;case_id&gt;</code>：撤銷該案例的封禁，並移除對應的錯誤訓練樣本後重建模型\n<code>/unmute &lt;case_id&gt;</code>：解除該案例對應用戶的禁言\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat &lt;chat_id&gt;</code>：設定工作群組\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
+    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：回覆要解封的用戶、或提供 user_id / case_id 皆可。會解封該用戶，若找得到對應案例會一併移除錯誤訓練樣本並重建模型\n<code>/unmute</code>：回覆要解除禁言的用戶、或提供 user_id / case_id 皆可\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat &lt;chat_id&gt;</code>：設定工作群組\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
 }
 
 fn format_score_debug(report: &ScoreDebugReport) -> String {
@@ -3391,19 +3421,61 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             bot.send_message(message.chat.id, format!("批量訓練完成。ham: {count}\n\n已提取並訓練的字串：\n{}", if imported.is_empty() { "無可提取樣本".to_string() } else { imported.join("\n---\n") })).await?;
             runtime.clear_mass_train(from_id).await;
         }
-        ModerationCommand::Unban(case_id) => {
+        ModerationCommand::Unban(arg) => {
             require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
-            let case_id = case_id.trim();
-            if case_id.is_empty() {
-                bot.send_message(message.chat.id, "請提供要撤銷的 case ID，例如 /unban abc-123。").await?;
-                return Ok(());
-            }
-            let Some(mut case) = runtime.load_case(case_id).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))? else {
-                bot.send_message(message.chat.id, format!("找不到 case <code>{case_id}</code>。")).parse_mode(ParseMode::Html).await?;
+            // Three ways to target: reply to the user (like /sb), an explicit
+            // user_id, or a case_id (whose own chat_id/target_user_id are used
+            // instead of the current chat - lets you reverse a case from DM).
+            // The reply/user_id forms exist because a user can be banned
+            // without this bot ever knowing - manually by another admin, by a
+            // different bot, or from before this project was even involved -
+            // so unbanning can't depend on a case existing at all.
+            let resolved = if let Some(target_msg) = message.reply_to_message() {
+                target_msg.from.as_ref().map(|u| (message.chat.id.0, u.id.0 as i64, None::<CaseRecord>))
+            } else if let Ok(user_id) = arg.trim().parse::<i64>() {
+                Some((message.chat.id.0, user_id, None))
+            } else if !arg.trim().is_empty() {
+                match runtime.load_case(arg.trim()).await {
+                    Ok(Some(case)) => Some((case.chat_id, case.target_user_id, Some(case))),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            let Some((chat_id, target_user_id, case_from_id)) = resolved else {
+                bot.send_message(message.chat.id, "請回覆要解封的用戶、提供 user_id，或提供 case_id。例如 /unban 123456789。").await?;
                 return Ok(());
             };
-            bot.unban_chat_member(ChatId(case.chat_id), UserId(case.target_user_id as u64)).await?;
-            let removed = runtime.purge_training_by_case(case_id).await.unwrap_or(0);
+
+            if let Err(err) = bot.unban_chat_member(ChatId(chat_id), UserId(target_user_id as u64)).await {
+                bot.send_message(message.chat.id, format!("解封失敗：{err}")).await?;
+                return Ok(());
+            }
+
+            // Best-effort: reverse a tracked case too, if one exists, to also
+            // clean up any training data it contributed. Not finding one is
+            // completely normal for a user this project never banned.
+            let case = match case_from_id {
+                Some(case) => Some(case),
+                None => runtime
+                    .load_latest_case_by_actions(chat_id, target_user_id, &["auto_ban", "spam_ban", "report_approved"])
+                    .await
+                    .ok()
+                    .flatten(),
+            };
+
+            let Some(mut case) = case else {
+                bot.send_message(
+                    message.chat.id,
+                    format!("已在本群解封用戶 <code>{target_user_id}</code>。（找不到本專案的封禁記錄，沒有訓練樣本需要清除）"),
+                )
+                .parse_mode(ParseMode::Html)
+                .await?;
+                return Ok(());
+            };
+
+            let removed = runtime.purge_training_by_case(&case.id).await.unwrap_or(0);
             if removed > 0 {
                 let _ = runtime.rebuild_model().await;
             }
@@ -3416,20 +3488,49 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             case.log_message_id = Some(log_message_id);
             store_case(&runtime, &case).await.ok();
             notify_group(&bot, &runtime, &case, log_message_id, "<b>已撤銷封禁</b>").await.ok();
-            bot.send_message(message.chat.id, format!("已撤銷 case <code>{case_id}</code> 的封禁，並移除 {removed} 筆對應訓練樣本。")).parse_mode(ParseMode::Html).await?;
+            bot.send_message(message.chat.id, format!("已解封用戶，並撤銷 case <code>{}</code>、移除 {removed} 筆對應訓練樣本。", case.id)).parse_mode(ParseMode::Html).await?;
         }
-        ModerationCommand::Unmute(case_id) => {
+        ModerationCommand::Unmute(arg) => {
             require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
-            let case_id = case_id.trim();
-            if case_id.is_empty() {
-                bot.send_message(message.chat.id, "請提供要撤銷的 case ID，例如 /unmute abc-123。").await?;
-                return Ok(());
-            }
-            let Some(mut case) = runtime.load_case(case_id).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))? else {
-                bot.send_message(message.chat.id, format!("找不到 case <code>{case_id}</code>。")).parse_mode(ParseMode::Html).await?;
+            // Same three targeting modes as /unban (reply / user_id / case_id) -
+            // a mute can also come from outside this bot's tracking.
+            let resolved = if let Some(target_msg) = message.reply_to_message() {
+                target_msg.from.as_ref().map(|u| (message.chat.id.0, u.id.0 as i64, None::<CaseRecord>))
+            } else if let Ok(user_id) = arg.trim().parse::<i64>() {
+                Some((message.chat.id.0, user_id, None))
+            } else if !arg.trim().is_empty() {
+                match runtime.load_case(arg.trim()).await {
+                    Ok(Some(case)) => Some((case.chat_id, case.target_user_id, Some(case))),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            let Some((chat_id, target_user_id, case_from_id)) = resolved else {
+                bot.send_message(message.chat.id, "請回覆要解除禁言的用戶、提供 user_id，或提供 case_id。例如 /unmute 123456789。").await?;
                 return Ok(());
             };
-            bot.restrict_chat_member(ChatId(case.chat_id), UserId(case.target_user_id as u64), teloxide::types::ChatPermissions::all()).await?;
+
+            if let Err(err) = bot.restrict_chat_member(ChatId(chat_id), UserId(target_user_id as u64), teloxide::types::ChatPermissions::all()).await {
+                bot.send_message(message.chat.id, format!("解除禁言失敗：{err}")).await?;
+                return Ok(());
+            }
+
+            let case = match case_from_id {
+                Some(case) => Some(case),
+                None => runtime
+                    .load_latest_case_by_actions(chat_id, target_user_id, &["mute", "flood_mute"])
+                    .await
+                    .ok()
+                    .flatten(),
+            };
+
+            let Some(mut case) = case else {
+                bot.send_message(message.chat.id, format!("已在本群解除用戶 <code>{target_user_id}</code> 的禁言。（找不到本專案的禁言記錄）")).parse_mode(ParseMode::Html).await?;
+                return Ok(());
+            };
+
             case.action = ActionKind::Unmuted;
             case.status = "reversed".to_string();
             case.actor_user_id = Some(from_id);
@@ -3439,7 +3540,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             case.log_message_id = Some(log_message_id);
             store_case(&runtime, &case).await.ok();
             notify_group(&bot, &runtime, &case, log_message_id, "<b>已解除禁言</b>").await.ok();
-            bot.send_message(message.chat.id, format!("已解除 case <code>{case_id}</code> 對應用戶的禁言。")).parse_mode(ParseMode::Html).await?;
+            bot.send_message(message.chat.id, format!("已解除禁言，並撤銷 case <code>{}</code>。", case.id)).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::Unknown => {
             if message.chat.is_private() {
@@ -3964,5 +4065,63 @@ mod tests {
         runtime.set_group_threshold(111, Some(0.6)).await.unwrap();
         assert_eq!(runtime.effective_threshold(Some(111)).await.unwrap(), 0.6);
         assert_eq!(runtime.effective_threshold(Some(222)).await.unwrap(), 0.9, "other chats are unaffected");
+    }
+
+    fn dummy_case(action: ActionKind, chat_id: i64, target_user_id: i64, created_at: DateTime<Utc>) -> CaseRecord {
+        CaseRecord {
+            id: Uuid::new_v4().to_string(),
+            action,
+            chat_id,
+            target_user_id,
+            target_name: "test".to_string(),
+            actor_user_id: None,
+            actor_name: None,
+            source_message_id: None,
+            evidence_text: "evidence".to_string(),
+            model_score: None,
+            matched_rule_id: None,
+            matched_rule_pattern: None,
+            status: "auto_banned".to_string(),
+            log_message_id: None,
+            created_at,
+        }
+    }
+
+    // Backs /unban and /unmute's ability to find what to reverse from just a
+    // reply or a user_id, with no case_id given: it should find the most
+    // recent matching case for that (chat, user), not an older one, and not
+    // one with a different action kind.
+    #[tokio::test]
+    async fn load_latest_case_by_actions_picks_most_recent_matching() {
+        let runtime = test_runtime().await;
+        let older = dummy_case(ActionKind::AutoBan, 100, 200, Utc::now() - chrono::TimeDelta::hours(2));
+        let newer = dummy_case(ActionKind::SpamBan, 100, 200, Utc::now() - chrono::TimeDelta::hours(1));
+        let unrelated_action = dummy_case(ActionKind::Mute, 100, 200, Utc::now());
+        let unrelated_user = dummy_case(ActionKind::SpamBan, 100, 999, Utc::now());
+        runtime.persist_case(&older).await.unwrap();
+        runtime.persist_case(&newer).await.unwrap();
+        runtime.persist_case(&unrelated_action).await.unwrap();
+        runtime.persist_case(&unrelated_user).await.unwrap();
+
+        let found = runtime.load_latest_case_by_actions(100, 200, &["auto_ban", "spam_ban", "report_approved"]).await.unwrap();
+        assert_eq!(found.map(|c| c.id), Some(newer.id.clone()));
+    }
+
+    // Once a case is reversed (action mutated to Unbanned, as the /unban
+    // handler does), it must drop out of future lookups so a second /unban
+    // by user_id finds the next still-active case instead of re-finding the
+    // one already undone.
+    #[tokio::test]
+    async fn reversed_case_is_excluded_from_future_lookups() {
+        let runtime = test_runtime().await;
+        let mut case = dummy_case(ActionKind::AutoBan, 100, 200, Utc::now());
+        runtime.persist_case(&case).await.unwrap();
+
+        case.action = ActionKind::Unbanned;
+        case.status = "reversed".to_string();
+        runtime.persist_case(&case).await.unwrap();
+
+        let found = runtime.load_latest_case_by_actions(100, 200, &["auto_ban", "spam_ban", "report_approved"]).await.unwrap();
+        assert!(found.is_none(), "reversed case should no longer match a ban-action search");
     }
 }
