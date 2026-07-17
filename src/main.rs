@@ -5,7 +5,7 @@ use fancy_regex::Regex as FancyRegex;
 use regex::Regex as StdRegex;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, env, path::PathBuf, sync::{Arc, Mutex as StdMutex, OnceLock}};
+use std::{collections::{HashMap, VecDeque}, env, path::PathBuf, sync::{Arc, Mutex as StdMutex, OnceLock}, time::Instant};
 use teloxide::{prelude::*, types::{CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, MessageId, ParseMode, UserId}};
 use url::Url;
 use tokio::sync::{Mutex, RwLock};
@@ -68,6 +68,9 @@ enum ActionKind {
     PendingReport,
     ReportApproved,
     ReportRejected,
+    Unbanned,
+    Unmuted,
+    FloodMute,
 }
 
 impl ActionKind {
@@ -81,6 +84,9 @@ impl ActionKind {
             ActionKind::PendingReport => "pending_report",
             ActionKind::ReportApproved => "report_approved",
             ActionKind::ReportRejected => "report_rejected",
+            ActionKind::Unbanned => "unbanned",
+            ActionKind::Unmuted => "unmuted",
+            ActionKind::FloodMute => "flood_mute",
         }
     }
 
@@ -94,6 +100,9 @@ impl ActionKind {
             "pending_report" => ActionKind::PendingReport,
             "report_approved" => ActionKind::ReportApproved,
             "report_rejected" => ActionKind::ReportRejected,
+            "unbanned" => ActionKind::Unbanned,
+            "unmuted" => ActionKind::Unmuted,
+            "flood_mute" => ActionKind::FloodMute,
             _ => ActionKind::AutoBan,
         }
     }
@@ -136,13 +145,51 @@ struct Runtime {
     mass_train_mode: Mutex<HashMap<i64, String>>,
     pending_rule_additions: Mutex<HashMap<i64, String>>,
     group_module_cache: RwLock<HashMap<i64, GroupModuleSettings>>,
+    /// (chat_id, user_id) -> recent message timestamps within the flood
+    /// window. In-memory only and reset on restart is fine — flood control
+    /// is a rolling behavioral signal, not something that needs to survive
+    /// a restart.
+    flood_tracker: Mutex<HashMap<(i64, i64), VecDeque<Instant>>>,
+    /// (chat_id, user_id) -> outstanding join CAPTCHA. In-memory only: a
+    /// restart mid-challenge just means the member gets re-challenged on
+    /// their next message, or the timeout task (also lost on restart)
+    /// simply never fires — no harm either way, just re-issue on demand.
+    pending_captcha: Mutex<HashMap<(i64, i64), PendingCaptcha>>,
 }
 
-#[derive(Clone, Default)]
+struct PendingCaptcha {
+    expected_answer: String,
+    expires_at: Instant,
+    challenge_message_id: MessageId,
+}
+
+#[derive(Clone)]
 struct GroupModuleSettings {
     no_long_name: bool,
     no_halal: bool,
     no_service_messages: bool,
+    // Unlike the content-policy modules above (which default off, since
+    // they're opinionated choices a group opts into), flood control is
+    // baseline hygiene and defaults on; matches the `DEFAULT 1` on the
+    // `flood_control` column in group_module_settings.
+    flood_control: bool,
+    // Join-time CAPTCHA: opt-in, since (unlike flood control) it adds
+    // visible friction for every legitimate new member.
+    captcha: bool,
+    spam_threshold_override: Option<f64>,
+}
+
+impl Default for GroupModuleSettings {
+    fn default() -> Self {
+        Self {
+            no_long_name: false,
+            no_halal: false,
+            no_service_messages: false,
+            flood_control: true,
+            captcha: false,
+            spam_threshold_override: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -210,6 +257,8 @@ impl Runtime {
             mass_train_mode: Mutex::new(HashMap::new()),
             pending_rule_additions: Mutex::new(HashMap::new()),
             group_module_cache: RwLock::new(HashMap::new()),
+            flood_tracker: Mutex::new(HashMap::new()),
+            pending_captcha: Mutex::new(HashMap::new()),
         })
     }
 
@@ -259,12 +308,6 @@ impl Runtime {
                 text TEXT NOT NULL,
                 case_id TEXT,
                 created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS token_counts (
-                token TEXT NOT NULL,
-                label TEXT NOT NULL,
-                count INTEGER NOT NULL,
-                PRIMARY KEY (token, label)
             );
             CREATE TABLE IF NOT EXISTS word_frequencies (
                 word TEXT PRIMARY KEY,
@@ -335,6 +378,29 @@ impl Runtime {
         if user_version < 2 {
             Self::migrate_v1_to_v2(conn)?;
         }
+        if user_version < 3 {
+            Self::migrate_v2_to_v3(conn)?;
+        }
+        Ok(())
+    }
+
+    /// Drops the dead `token_counts` table (superseded by `word_frequencies`
+    /// long ago, never read or written anywhere) and adds the columns needed
+    /// for flood control, join CAPTCHA, and per-group spam thresholds. Not
+    /// added to the `CREATE TABLE IF NOT EXISTS group_module_settings` above
+    /// on purpose: SQLite's `ALTER TABLE ADD COLUMN` has no `IF NOT EXISTS`
+    /// form, so a fresh DB whose CREATE TABLE already had these columns would
+    /// hit a "duplicate column" error the first time this migration ran.
+    /// Running it unconditionally for every DB (fresh or existing), gated
+    /// only by `user_version`, avoids that.
+    fn migrate_v2_to_v3(conn: &mut Connection) -> Result<()> {
+        let tx = conn.transaction()?;
+        tx.execute("DROP TABLE IF EXISTS token_counts", [])?;
+        tx.execute("ALTER TABLE group_module_settings ADD COLUMN flood_control INTEGER NOT NULL DEFAULT 1", [])?;
+        tx.execute("ALTER TABLE group_module_settings ADD COLUMN captcha INTEGER NOT NULL DEFAULT 0", [])?;
+        tx.execute("ALTER TABLE group_module_settings ADD COLUMN spam_threshold_override REAL", [])?;
+        tx.execute("PRAGMA user_version = 3", [])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -536,10 +602,75 @@ impl Runtime {
         .await
     }
 
+    /// Deletes the training sample(s) tied to `case_id` and rolls back the
+    /// word_frequencies counts and doc totals they contributed - mirrors
+    /// `purge_training_by_text` below. Previously this only deleted the
+    /// `training_samples` audit row and left the learned token weights
+    /// untouched, so a purge (or /unban, which relies on this) didn't
+    /// actually undo the model's memory of the bad sample.
     async fn purge_training_by_case(&self, case_id: &str) -> Result<usize> {
         let case_id = case_id.to_string();
-        self.with_conn(move |conn| Ok(conn.execute("DELETE FROM training_samples WHERE case_id = ?1", params![case_id])?))
-            .await
+        self.with_conn(move |conn| {
+            let tx = conn.transaction()?;
+
+            let mut samples = Vec::new();
+            {
+                let mut stmt = tx.prepare("SELECT label, text FROM training_samples WHERE case_id = ?1")?;
+                let rows = stmt.query_map(params![&case_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+                for row in rows {
+                    samples.push(row?);
+                }
+            }
+
+            let mut spam_docs: i64 = tx.query_row("SELECT COALESCE(value, '0') FROM model_meta WHERE key = 'spam_docs'", [], |row| row.get::<_, String>(0))?.parse().unwrap_or(0);
+            let mut ham_docs: i64 = tx.query_row("SELECT COALESCE(value, '0') FROM model_meta WHERE key = 'ham_docs'", [], |row| row.get::<_, String>(0))?.parse().unwrap_or(0);
+
+            for (label, text) in &samples {
+                let tokens = tokenize(text);
+                for token in tokens {
+                    let counts = tx.query_row(
+                        "SELECT spam_count, ham_count FROM word_frequencies WHERE word = ?1",
+                        params![&token],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    );
+                    if let Ok((mut spam_count, mut ham_count)) = counts {
+                        match label.as_str() {
+                            "spam" => spam_count = (spam_count - 1).max(0),
+                            "ham" => ham_count = (ham_count - 1).max(0),
+                            _ => {}
+                        }
+                        if spam_count == 0 && ham_count == 0 {
+                            tx.execute("DELETE FROM word_frequencies WHERE word = ?1", params![&token])?;
+                        } else {
+                            tx.execute(
+                                "UPDATE word_frequencies SET spam_count = ?2, ham_count = ?3 WHERE word = ?1",
+                                params![&token, spam_count, ham_count],
+                            )?;
+                        }
+                    }
+                }
+
+                match label.as_str() {
+                    "spam" => spam_docs = (spam_docs - 1).max(0),
+                    "ham" => ham_docs = (ham_docs - 1).max(0),
+                    _ => {}
+                }
+            }
+
+            tx.execute(
+                "INSERT INTO model_meta (key, value) VALUES ('spam_docs', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![spam_docs.to_string()],
+            )?;
+            tx.execute(
+                "INSERT INTO model_meta (key, value) VALUES ('ham_docs', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![ham_docs.to_string()],
+            )?;
+
+            let affected = tx.execute("DELETE FROM training_samples WHERE case_id = ?1", params![&case_id])?;
+            tx.commit()?;
+            Ok(affected)
+        })
+        .await
     }
 
     /// Refreshes the in-memory model from disk. This only reads — the DB is
@@ -790,7 +921,18 @@ impl Runtime {
         .await
     }
 
-    async fn effective_threshold(&self) -> Result<f64> {
+    /// Resolves the threshold that actually applies for `chat_id`: a
+    /// per-group override if one is set, otherwise the global default.
+    /// `chat_id` is `None` for contexts with no specific chat (there are
+    /// none left currently, but keeps this usable from anywhere).
+    async fn effective_threshold(&self, chat_id: Option<i64>) -> Result<f64> {
+        if let Some(chat_id) = chat_id {
+            if let Ok(settings) = self.get_group_modules(chat_id).await {
+                if let Some(value) = settings.spam_threshold_override {
+                    return Ok(value);
+                }
+            }
+        }
         self.current_threshold().await
     }
 
@@ -1046,13 +1188,16 @@ impl Runtime {
                     "INSERT OR IGNORE INTO group_module_settings (chat_id) VALUES (?1)",
                     params![chat_id],
                 )?;
-                let mut stmt = conn.prepare("SELECT no_long_name, no_halal, no_service_messages FROM group_module_settings WHERE chat_id = ?1")?;
+                let mut stmt = conn.prepare("SELECT no_long_name, no_halal, no_service_messages, flood_control, captcha, spam_threshold_override FROM group_module_settings WHERE chat_id = ?1")?;
                 let mut rows = stmt.query(params![chat_id])?;
                 if let Some(row) = rows.next()? {
                     Ok(GroupModuleSettings {
                         no_long_name: row.get::<_, i64>(0)? != 0,
                         no_halal: row.get::<_, i64>(1)? != 0,
                         no_service_messages: row.get::<_, i64>(2)? != 0,
+                        flood_control: row.get::<_, i64>(3)? != 0,
+                        captcha: row.get::<_, i64>(4)? != 0,
+                        spam_threshold_override: row.get::<_, Option<f64>>(5)?,
                     })
                 } else {
                     Ok(GroupModuleSettings::default())
@@ -1089,6 +1234,18 @@ impl Runtime {
                     params![chat_id, if enabled { 1 } else { 0 }],
                 )?;
             }
+            "flood" => {
+                conn.execute(
+                    "UPDATE group_module_settings SET flood_control = ?2 WHERE chat_id = ?1",
+                    params![chat_id, if enabled { 1 } else { 0 }],
+                )?;
+            }
+            "captcha" => {
+                conn.execute(
+                    "UPDATE group_module_settings SET captcha = ?2 WHERE chat_id = ?1",
+                    params![chat_id, if enabled { 1 } else { 0 }],
+                )?;
+            }
                 _ => {}
             }
             Ok(())
@@ -1096,6 +1253,44 @@ impl Runtime {
         .await?;
         self.group_module_cache.write().await.remove(&chat_id);
         Ok(())
+    }
+
+    async fn set_group_threshold(&self, chat_id: i64, value: Option<f64>) -> Result<()> {
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO group_module_settings (chat_id) VALUES (?1)",
+                params![chat_id],
+            )?;
+            conn.execute(
+                "UPDATE group_module_settings SET spam_threshold_override = ?2 WHERE chat_id = ?1",
+                params![chat_id, value],
+            )?;
+            Ok(())
+        })
+        .await?;
+        self.group_module_cache.write().await.remove(&chat_id);
+        Ok(())
+    }
+
+    /// Records this message towards the (chat, user) flood window and
+    /// returns true if it just tripped the threshold. Pure in-memory bookkeeping
+    /// (see `flood_tracker` on `Runtime`) - no DB access, so this is cheap
+    /// enough to call on every single incoming group message.
+    async fn check_flood(&self, chat_id: i64, user_id: i64) -> bool {
+        const WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+        const LIMIT: usize = 5;
+        let now = Instant::now();
+        let mut tracker = self.flood_tracker.lock().await;
+        let timestamps = tracker.entry((chat_id, user_id)).or_default();
+        timestamps.push_back(now);
+        while let Some(&front) = timestamps.front() {
+            if now.duration_since(front) > WINDOW {
+                timestamps.pop_front();
+            } else {
+                break;
+            }
+        }
+        timestamps.len() >= LIMIT
     }
 
     async fn is_group_whitelisted(&self, chat_id: i64, user_id: i64) -> Result<bool> {
@@ -1288,7 +1483,6 @@ enum ModerationCommand {
     MlPurge(String),
     MlPurgeText(String),
     MlRebuild,
-    MlStartMassTrain,
     MlFinishMassTrain,
     MlStartMassHam,
     MlFinishMassHam,
@@ -1309,6 +1503,8 @@ enum ModerationCommand {
     UnwhiteGlobal(String),
     HelpOp,
     Check(String),
+    Unban(String),
+    Unmute(String),
     Unknown,
 }
 
@@ -1342,7 +1538,7 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/ml_purge" => ModerationCommand::MlPurge(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/ml_purge_text" => ModerationCommand::MlPurgeText(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
         "/ml_rebuild" => ModerationCommand::MlRebuild,
-        "/ml_start_mass_train" => ModerationCommand::MlStartMassTrain,
+        "/ml_start_mass_train" => ModerationCommand::MlStartMassTrainWithMode("smart".to_string()),
         "/ml_finish_mass_train" => ModerationCommand::MlFinishMassTrain,
         "/ml_start_mass_ham" => ModerationCommand::MlStartMassHam,
         "/ml_finish_mass_ham" => ModerationCommand::MlFinishMassHam,
@@ -1392,6 +1588,8 @@ fn parse_command(text: &str) -> ModerationCommand {
             }
         }
         "/check" => ModerationCommand::Check(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
+        "/unban" => ModerationCommand::Unban(text.split_whitespace().nth(1).unwrap_or("").to_string()),
+        "/unmute" => ModerationCommand::Unmute(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         _ => ModerationCommand::Unknown,
     }
 }
@@ -1670,11 +1868,11 @@ fn import_train_payloads(input: &str) -> Vec<String> {
 }
 
 fn help_text() -> String {
-    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n<code>/white</code>：加入本群白名單\n<code>/white -global</code>：加入全域白名單\n<code>/unwhite</code>：移出本群白名單\n<code>/unwhite -global</code>：移出全域白名單\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n".to_string()
+    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n<code>/white</code>：加入本群白名單\n<code>/white -global</code>：加入全域白名單\n<code>/unwhite</code>：移出本群白名單\n<code>/unwhite -global</code>：移出全域白名單\n\n<b>群組管理員可用</b>\n<code>/module &lt;名稱&gt; &lt;on/off&gt;</code>：切換群組模組，名稱支援 NoLongName（英名檢查）/ NoHalal（清真檢查）/ NoSM（服務訊息刪除）/ Flood（洗版偵測，預設開啟）/ Captcha（新成員驗證，預設關閉）\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n".to_string()
 }
 
 fn help_op_text() -> String {
-    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整自動封禁門檻\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat &lt;chat_id&gt;</code>：設定工作群組\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
+    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban &lt;case_id&gt;</code>：撤銷該案例的封禁，並移除對應的錯誤訓練樣本後重建模型\n<code>/unmute &lt;case_id&gt;</code>：解除該案例對應用戶的禁言\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat &lt;chat_id&gt;</code>：設定工作群組\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
 }
 
 fn format_score_debug(report: &ScoreDebugReport) -> String {
@@ -1723,6 +1921,9 @@ fn chinese_case_action(case: &CaseRecord) -> String {
             ActionKind::PendingReport => "待審核".to_string(),
             ActionKind::ReportApproved => "受理封禁".to_string(),
             ActionKind::ReportRejected => "拒絕受理".to_string(),
+            ActionKind::Unbanned => "已撤銷封禁".to_string(),
+            ActionKind::Unmuted => "已解除禁言".to_string(),
+            ActionKind::FloodMute => "洗版禁言".to_string(),
         }
     }
 }
@@ -1824,7 +2025,110 @@ fn is_special_user(config: &Config, user_id: i64) -> bool {
     config.maintainer_ids.contains(&user_id)
 }
 
-async fn notify_bot_added(bot: &Bot, runtime: &Runtime, message: &Message) -> bool {
+const CAPTCHA_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Not cryptographically random and not meant to be - this only needs to be
+/// unpredictable enough to stop a dumb join-spam bot from guessing the
+/// answer, not to resist a targeted attack.
+fn generate_captcha_challenge(seed_extra: i64) -> (i64, i64, String) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as i64)
+        .unwrap_or(0);
+    let seed = nanos.wrapping_add(seed_extra).unsigned_abs();
+    let a = (seed % 8 + 1) as i64;
+    let b = ((seed / 8) % 8 + 1) as i64;
+    (a, b, (a + b).to_string())
+}
+
+/// Restricts a new member to text-only, posts a simple arithmetic challenge,
+/// and schedules a kick if it goes unanswered. Reuses the same
+/// spawn-a-delayed-cleanup-task pattern `notify_group` already uses for its
+/// 180s auto-delete, just kicking instead of deleting when it fires.
+async fn start_captcha_challenge(bot: &Bot, runtime: &Arc<Runtime>, chat_id: ChatId, user: &teloxide::types::User) {
+    let user_id = user.id.0 as i64;
+    let (a, b, expected_answer) = generate_captcha_challenge(user_id);
+
+    if bot
+        .restrict_chat_member(chat_id, user.id, teloxide::types::ChatPermissions::SEND_MESSAGES)
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let text = format!(
+        "{} 你好，為了防止機器人/廣告帳號，請在 {} 秒內直接回覆下面問題的答案（純數字），逾時將被移出群組：\n\n<b>{a} + {b} = ?</b>",
+        escape_html(&short_user(user)),
+        CAPTCHA_TIMEOUT.as_secs(),
+    );
+    let Ok(sent) = bot.send_message(chat_id, text).parse_mode(ParseMode::Html).await else { return; };
+
+    {
+        let mut pending = runtime.pending_captcha.lock().await;
+        pending.insert(
+            (chat_id.0, user_id),
+            PendingCaptcha { expected_answer, expires_at: Instant::now() + CAPTCHA_TIMEOUT, challenge_message_id: sent.id },
+        );
+    }
+
+    let bot = bot.clone();
+    let runtime = runtime.clone();
+    let challenge_message_id = sent.id;
+    tokio::spawn(async move {
+        sleep(CAPTCHA_TIMEOUT).await;
+        let still_pending = {
+            let mut pending = runtime.pending_captcha.lock().await;
+            match pending.get(&(chat_id.0, user_id)) {
+                Some(p) if p.challenge_message_id == challenge_message_id => {
+                    pending.remove(&(chat_id.0, user_id));
+                    true
+                }
+                _ => false,
+            }
+        };
+        if still_pending {
+            let _ = bot.delete_message(chat_id, challenge_message_id).await;
+            // Kick, not ban: failing to answer in time isn't proof of spam,
+            // just an unverified join.
+            let _ = kick_user(&bot, chat_id, user_id).await;
+        }
+    });
+}
+
+/// Checks an incoming message against a pending join CAPTCHA for its sender
+/// in this chat. Returns true if it consumed the message (whether right or
+/// wrong), so the caller can skip further processing for it.
+async fn check_captcha_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) -> bool {
+    let Some(user) = message.from.as_ref() else { return false; };
+    let key = (message.chat.id.0, user.id.0 as i64);
+
+    let expected = {
+        let pending = runtime.pending_captcha.lock().await;
+        let Some(entry) = pending.get(&key) else { return false; };
+        if Instant::now() > entry.expires_at {
+            // Already expired - let the timeout task's own kick handle it
+            // rather than racing it.
+            return false;
+        }
+        entry.expected_answer.clone()
+    };
+
+    let answer = message.text().unwrap_or("").trim();
+    if answer == expected {
+        runtime.pending_captcha.lock().await.remove(&key);
+        let _ = bot
+            .restrict_chat_member(message.chat.id, user.id, teloxide::types::ChatPermissions::all())
+            .await;
+        let _ = bot.delete_message(message.chat.id, message.id).await;
+    } else {
+        // Wrong guess: delete it and let them try again until the timeout.
+        let _ = bot.delete_message(message.chat.id, message.id).await;
+    }
+    true
+}
+
+async fn notify_bot_added(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) -> bool {
     let Some(users) = message.new_chat_members() else { return false; };
     if users.is_empty() {
         return false;
@@ -1853,46 +2157,51 @@ async fn notify_bot_added(bot: &Bot, runtime: &Runtime, message: &Message) -> bo
         }
 
         let enabled = runtime.get_group_modules(message.chat.id.0).await.unwrap_or_default();
-        if !enabled.no_long_name && !enabled.no_halal {
-            continue;
+        let mut banned = false;
+
+        if enabled.no_long_name || enabled.no_halal {
+            let reasons = if enabled.no_long_name { evaluate_name_guard(&display_name_only(user)) } else { Vec::new() };
+            let mut arabic_reasons = if enabled.no_halal {
+                let profile = runtime.load_user_profile(bot, user.id.0 as i64).await.ok();
+                let bio = profile.as_ref().and_then(|p| p.bio.as_deref());
+                evaluate_module_checks(user, user.username.as_deref(), bio, None)
+            } else {
+                Vec::new()
+            };
+            let mut all_reasons = reasons;
+            all_reasons.append(&mut arabic_reasons);
+
+            if !all_reasons.is_empty() {
+                banned = true;
+                let _ = bot.delete_message(message.chat.id, message.id).await;
+                let _ = ban_user(bot, message.chat.id, user.id.0 as i64).await;
+                let case = CaseRecord {
+                    id: Uuid::new_v4().to_string(),
+                    action: ActionKind::AutoBan,
+                    chat_id: message.chat.id.0,
+                    target_user_id: user.id.0 as i64,
+                    target_name: short_user(user),
+                    actor_user_id: None,
+                    actor_name: None,
+                    source_message_id: Some(message.id.0),
+                    evidence_text: extract_full_text(message),
+                    model_score: None,
+                    matched_rule_id: None,
+                    matched_rule_pattern: Some(all_reasons.join("；")),
+                    status: "auto_banned".to_string(),
+                    log_message_id: None,
+                    created_at: Utc::now(),
+                };
+                let log_message_id = log_action(bot, runtime, &case).await.unwrap_or_default();
+                let mut updated = case.clone();
+                updated.log_message_id = Some(log_message_id);
+                let _ = store_case(runtime, &updated).await;
+                let _ = notify_group(bot, runtime, &updated, log_message_id, "<b>自動模組封禁</b>").await;
+            }
         }
 
-        let reasons = if enabled.no_long_name { evaluate_name_guard(&display_name_only(user)) } else { Vec::new() };
-        let mut arabic_reasons = if enabled.no_halal {
-            let profile = runtime.load_user_profile(bot, user.id.0 as i64).await.ok();
-            let bio = profile.as_ref().and_then(|p| p.bio.as_deref());
-            evaluate_module_checks(user, user.username.as_deref(), bio, None)
-        } else {
-            Vec::new()
-        };
-        let mut all_reasons = reasons;
-        all_reasons.append(&mut arabic_reasons);
-
-        if !all_reasons.is_empty() {
-            let _ = bot.delete_message(message.chat.id, message.id).await;
-            let _ = ban_user(bot, message.chat.id, user.id.0 as i64).await;
-            let case = CaseRecord {
-                id: Uuid::new_v4().to_string(),
-                action: ActionKind::AutoBan,
-                chat_id: message.chat.id.0,
-                target_user_id: user.id.0 as i64,
-                target_name: short_user(user),
-                actor_user_id: None,
-                actor_name: None,
-                source_message_id: Some(message.id.0),
-                evidence_text: extract_full_text(message),
-                model_score: None,
-                matched_rule_id: None,
-                matched_rule_pattern: Some(all_reasons.join("；")),
-                status: "auto_banned".to_string(),
-                log_message_id: None,
-                created_at: Utc::now(),
-            };
-            let log_message_id = log_action(bot, runtime, &case).await.unwrap_or_default();
-            let mut updated = case.clone();
-            updated.log_message_id = Some(log_message_id);
-            let _ = store_case(runtime, &updated).await;
-            let _ = notify_group(bot, runtime, &updated, log_message_id, "<b>自動模組封禁</b>").await;
+        if !banned && enabled.captcha {
+            start_captcha_challenge(bot, runtime, message.chat.id, user).await;
         }
     }
 
@@ -2221,6 +2530,72 @@ async fn delete_service_message_if_enabled(bot: &Bot, runtime: &Arc<Runtime>, me
     Ok(false)
 }
 
+/// Behavioral (content-independent) spam signal: N messages from the same
+/// user in the same chat within a short window. Complements the Naive Bayes
+/// / regex / name-guard checks, which are all content-based and blind to a
+/// brand-new spam account posting brand-new wording. Runs for every message
+/// type (not just text), so it's called from the raw dispatcher in `main()`
+/// rather than from inside `auto_moderate` (which only fires for non-command
+/// messages once other checks have run).
+async fn check_flood_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) -> ResponseResult<bool> {
+    if !message.chat.is_group() && !message.chat.is_supergroup() {
+        return Ok(false);
+    }
+    let Some(user) = message.from.as_ref() else { return Ok(false); };
+    if user.is_bot {
+        return Ok(false);
+    }
+    let chat_id = message.chat.id.0;
+    let user_id = user.id.0 as i64;
+
+    if is_special_user(&runtime.config, user_id) {
+        return Ok(false);
+    }
+    if runtime.is_global_whitelisted(user_id).await.unwrap_or(false) {
+        return Ok(false);
+    }
+    if runtime.is_group_whitelisted(chat_id, user_id).await.unwrap_or(false) {
+        return Ok(false);
+    }
+    if is_group_admin(bot, message.chat.id, user_id).await {
+        return Ok(false);
+    }
+
+    let settings = runtime.get_group_modules(chat_id).await.unwrap_or_default();
+    if !settings.flood_control {
+        return Ok(false);
+    }
+
+    if !runtime.check_flood(chat_id, user_id).await {
+        return Ok(false);
+    }
+
+    let _ = mute_user(bot, message.chat.id, user_id).await;
+    let case = CaseRecord {
+        id: Uuid::new_v4().to_string(),
+        action: ActionKind::FloodMute,
+        chat_id,
+        target_user_id: user_id,
+        target_name: short_user(user),
+        actor_user_id: None,
+        actor_name: None,
+        source_message_id: Some(message.id.0),
+        evidence_text: extract_full_text(message),
+        model_score: None,
+        matched_rule_id: None,
+        matched_rule_pattern: Some("FLOOD".to_string()),
+        status: "auto_muted".to_string(),
+        log_message_id: None,
+        created_at: Utc::now(),
+    };
+    let log_message_id = log_action(bot, runtime, &case).await.unwrap_or_default();
+    let mut updated = case.clone();
+    updated.log_message_id = Some(log_message_id);
+    let _ = store_case(runtime, &updated).await;
+    let _ = notify_group(bot, runtime, &updated, log_message_id, "<b>自動洗版偵測禁言</b>").await;
+    Ok(true)
+}
+
 async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> ResponseResult<()> {
     let Some(text) = message.text() else { return Ok(()); };
     let cmd = parse_command(text);
@@ -2536,8 +2911,13 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         ModerationCommand::MlStats => {
             require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
             let (spam, ham, total) = runtime.word_stats().await.unwrap_or((0, 0, 0));
-            let threshold = runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold);
-            let mut text = format!("<b>模型統計</b>\nspam: {spam}\nham: {ham}\n總樣本: {total}\n有效門檻: {threshold:.2}");
+            let threshold = runtime.effective_threshold(Some(message.chat.id.0)).await.unwrap_or(runtime.config.spam_threshold);
+            let threshold_source = if runtime.get_group_modules(message.chat.id.0).await.ok().and_then(|s| s.spam_threshold_override).is_some() {
+                "本群自訂"
+            } else {
+                "全域"
+            };
+            let mut text = format!("<b>模型統計</b>\nspam: {spam}\nham: {ham}\n總樣本: {total}\n有效門檻: {threshold:.2}（{threshold_source}）");
             if let Ok((top_spam, top_ham)) = runtime.largest_token_counts().await {
                 if let Some((word, count)) = top_spam {
                     text.push_str(&format!("\n\n最大 spam token: <code>{}</code> = {count}", escape_html(&word)));
@@ -2652,8 +3032,10 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 "nolongname" => { runtime.set_group_module(message.chat.id.0, "nolongname", enabled).await.ok(); }
                 "nohalal" => { runtime.set_group_module(message.chat.id.0, "nohalal", enabled).await.ok(); }
                 "nosm" => { runtime.set_group_module(message.chat.id.0, "nosm", enabled).await.ok(); }
+                "flood" => { runtime.set_group_module(message.chat.id.0, "flood", enabled).await.ok(); }
+                "captcha" => { runtime.set_group_module(message.chat.id.0, "captcha", enabled).await.ok(); }
                 _ => {
-                    bot.send_message(message.chat.id, "模組名稱僅支援 NoLongName / NoHalal / NoSM。") .await?;
+                    bot.send_message(message.chat.id, "模組名稱僅支援 NoLongName / NoHalal / NoSM / Flood / Captcha。") .await?;
                     return Ok(());
                 }
             }
@@ -2807,12 +3189,23 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         }
         ModerationCommand::MlThreshold(value) => {
             require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
-            if let Ok(threshold) = value.parse::<f64>() {
-                let clamped = threshold.clamp(0.50, 0.99);
-                runtime.set_threshold(clamped).await.ok();
-                bot.send_message(message.chat.id, format!("已保存門檻: {clamped:.2}")).await?;
-            } else {
+            let Ok(threshold) = value.parse::<f64>() else {
                 bot.send_message(message.chat.id, "請提供 0.50 到 0.99 的數值。").await?;
+                return Ok(());
+            };
+            let clamped = threshold.clamp(0.50, 0.99);
+            // DM, the test group, and the project/work chat aren't moderated
+            // customer groups with their own policy - a threshold set there is
+            // the global default. Any other group gets its own override.
+            let is_global_scope = message.chat.is_private()
+                || runtime.config.test_group_id == Some(message.chat.id.0)
+                || runtime.project_chat().await == Some(message.chat.id.0);
+            if is_global_scope {
+                runtime.set_threshold(clamped).await.ok();
+                bot.send_message(message.chat.id, format!("已保存全域門檻: {clamped:.2}")).await?;
+            } else {
+                runtime.set_group_threshold(message.chat.id.0, Some(clamped)).await.ok();
+                bot.send_message(message.chat.id, format!("已為本群設定門檻: {clamped:.2}（僅適用於本群，其他群組不受影響）")).await?;
             }
         }
         ModerationCommand::MlSetToken(token_arg, value) => {
@@ -2881,16 +3274,6 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             }
             bot.send_message(message.chat.id, format!("已匯入並訓練 {count} 筆。\n\n匯入字串：\n{}", debug.join("\n---\n"))).await?;
         }
-        ModerationCommand::MlStartMassTrain => {
-            if !message.chat.is_private() || !is_maintainer(&bot, &runtime.config, from_id).await {
-                bot.send_message(message.chat.id, "只允許維護者在私訊中啟動批量訓練。") .await?;
-                return Ok(());
-            }
-            runtime.start_mass_train(from_id).await;
-            runtime.set_mass_train_mode(from_id, "smart").await;
-            bot.send_message(message.chat.id, "已啟動批量訓練。接下來你在這個私訊中傳送的純文本訊息會被收集；完成後使用 /ml_finish_mass_train。")
-                .await?;
-        }
         ModerationCommand::MlStartMassTrainWithMode(mode) => {
             if !message.chat.is_private() || !is_maintainer(&bot, &runtime.config, from_id).await {
                 bot.send_message(message.chat.id, "只允許維護者在私訊中啟動批量訓練。") .await?;
@@ -2948,7 +3331,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 }
                 InspectionResult::Spam { score, .. } | InspectionResult::Ham { score } => {
                     let report = runtime.score_debug(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
-                    out.push_str(&format!("<b>判定</b>: {}\n<b>分數</b>: {score:.6}\n{}", if score >= runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold) { "垃圾" } else { "正常" }, format_score_debug(&report)));
+                    out.push_str(&format!("<b>判定</b>: {}\n<b>分數</b>: {score:.6}\n{}", if score >= runtime.effective_threshold(Some(message.chat.id.0)).await.unwrap_or(runtime.config.spam_threshold) { "垃圾" } else { "正常" }, format_score_debug(&report)));
                 }
             }
             bot.send_message(message.chat.id, out).parse_mode(ParseMode::Html).await?;
@@ -3007,6 +3390,56 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             }
             bot.send_message(message.chat.id, format!("批量訓練完成。ham: {count}\n\n已提取並訓練的字串：\n{}", if imported.is_empty() { "無可提取樣本".to_string() } else { imported.join("\n---\n") })).await?;
             runtime.clear_mass_train(from_id).await;
+        }
+        ModerationCommand::Unban(case_id) => {
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
+            let case_id = case_id.trim();
+            if case_id.is_empty() {
+                bot.send_message(message.chat.id, "請提供要撤銷的 case ID，例如 /unban abc-123。").await?;
+                return Ok(());
+            }
+            let Some(mut case) = runtime.load_case(case_id).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))? else {
+                bot.send_message(message.chat.id, format!("找不到 case <code>{case_id}</code>。")).parse_mode(ParseMode::Html).await?;
+                return Ok(());
+            };
+            bot.unban_chat_member(ChatId(case.chat_id), UserId(case.target_user_id as u64)).await?;
+            let removed = runtime.purge_training_by_case(case_id).await.unwrap_or(0);
+            if removed > 0 {
+                let _ = runtime.rebuild_model().await;
+            }
+            case.action = ActionKind::Unbanned;
+            case.status = "reversed".to_string();
+            case.actor_user_id = Some(from_id);
+            case.actor_name = Some(short_user(from));
+            store_case(&runtime, &case).await.ok();
+            let log_message_id = log_action(&bot, &runtime, &case).await.unwrap_or_default();
+            case.log_message_id = Some(log_message_id);
+            store_case(&runtime, &case).await.ok();
+            notify_group(&bot, &runtime, &case, log_message_id, "<b>已撤銷封禁</b>").await.ok();
+            bot.send_message(message.chat.id, format!("已撤銷 case <code>{case_id}</code> 的封禁，並移除 {removed} 筆對應訓練樣本。")).parse_mode(ParseMode::Html).await?;
+        }
+        ModerationCommand::Unmute(case_id) => {
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
+            let case_id = case_id.trim();
+            if case_id.is_empty() {
+                bot.send_message(message.chat.id, "請提供要撤銷的 case ID，例如 /unmute abc-123。").await?;
+                return Ok(());
+            }
+            let Some(mut case) = runtime.load_case(case_id).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))? else {
+                bot.send_message(message.chat.id, format!("找不到 case <code>{case_id}</code>。")).parse_mode(ParseMode::Html).await?;
+                return Ok(());
+            };
+            bot.restrict_chat_member(ChatId(case.chat_id), UserId(case.target_user_id as u64), teloxide::types::ChatPermissions::all()).await?;
+            case.action = ActionKind::Unmuted;
+            case.status = "reversed".to_string();
+            case.actor_user_id = Some(from_id);
+            case.actor_name = Some(short_user(from));
+            store_case(&runtime, &case).await.ok();
+            let log_message_id = log_action(&bot, &runtime, &case).await.unwrap_or_default();
+            case.log_message_id = Some(log_message_id);
+            store_case(&runtime, &case).await.ok();
+            notify_group(&bot, &runtime, &case, log_message_id, "<b>已解除禁言</b>").await.ok();
+            bot.send_message(message.chat.id, format!("已解除 case <code>{case_id}</code> 對應用戶的禁言。")).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::Unknown => {
             if message.chat.is_private() {
@@ -3196,7 +3629,7 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
         InspectionResult::Spam { score, .. } | InspectionResult::Ham { score } => score,
     };
 
-    let threshold = runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold);
+    let threshold = runtime.effective_threshold(Some(message.chat.id.0)).await.unwrap_or(runtime.config.spam_threshold);
     if score < threshold {
         return Ok(());
     }
@@ -3240,7 +3673,7 @@ async fn score_only(bot: &Bot, runtime: &Runtime, message: &Message) -> Response
     let score = match result {
         InspectionResult::Spam { score, .. } | InspectionResult::Ham { score } => score,
     };
-    let threshold = runtime.effective_threshold().await.unwrap_or(runtime.config.spam_threshold);
+    let threshold = runtime.effective_threshold(Some(message.chat.id.0)).await.unwrap_or(runtime.config.spam_threshold);
     let verdict = if score >= threshold { "spam" } else { "ham" };
     let reply = format!(
         "<b>判定</b>: {}\n<b>分數</b>: {:.4}\n<b>門檻</b>: {:.4}",
@@ -3283,6 +3716,22 @@ async fn main() -> Result<()> {
             async move {
                 // First, check and delete service messages if enabled
                 if delete_service_message_if_enabled(&bot, &runtime, &message).await? {
+                    return Ok(());
+                }
+
+                // A pending join CAPTCHA takes priority over everything else -
+                // this message is either the answer or noise from a still-muted
+                // member, never a real command/content to process further.
+                if check_captcha_and_act(&bot, &runtime, &message).await {
+                    return Ok(());
+                }
+
+                // Behavioral flood check runs before anything content-based, and
+                // for every message type - skip it in the test group, which is
+                // score-only by design (see score_only below) and never enforces.
+                if runtime.config.test_group_id != Some(message.chat.id.0)
+                    && check_flood_and_act(&bot, &runtime, &message).await?
+                {
                     return Ok(());
                 }
 
@@ -3401,5 +3850,119 @@ mod tests {
         let export = runtime.export_training_data().await.unwrap();
         assert!(export.contains("spam"));
         assert!(export.contains("case-1"));
+    }
+
+    // Regression check for the /set corruption incident: seeds a v1-shaped DB
+    // (pre-migrate_v2_to_v3) with a dead token_counts table and a poisoned
+    // word_frequencies row, then loads a Runtime against it and confirms
+    // migrate_v1_to_v2/migrate_v2_to_v3 both actually ran on startup.
+    #[tokio::test]
+    async fn migration_clamps_outlier_and_drops_dead_table() {
+        let dir = std::env::temp_dir().join(format!("spb_test_{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let db_path = dir.join("bot.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE token_counts (token TEXT NOT NULL, label TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY (token, label));
+                CREATE TABLE word_frequencies (word TEXT PRIMARY KEY, spam_count INTEGER NOT NULL DEFAULT 0, ham_count INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE group_module_settings (chat_id INTEGER PRIMARY KEY, no_long_name INTEGER NOT NULL DEFAULT 0, no_halal INTEGER NOT NULL DEFAULT 0, no_service_messages INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE model_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES ('poisoned', 250000000000000, 0);
+                INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES ('normal', 49, 0);
+                PRAGMA user_version = 1;
+                "#,
+            )
+            .unwrap();
+        }
+
+        let config = Config {
+            bot_token: "test".to_string(),
+            log_channel_id: -1,
+            report_channel_id: -1,
+            test_group_id: None,
+            maintainer_ids: vec![],
+            data_dir: dir.clone(),
+            sqlite_path: db_path.clone(),
+            spam_threshold: 0.85,
+        };
+        let runtime = Runtime::load(config).await.unwrap();
+
+        let (poisoned_count, normal_count): (i64, i64) = runtime
+            .with_conn(|conn| {
+                let poisoned: i64 = conn.query_row("SELECT spam_count FROM word_frequencies WHERE word = 'poisoned'", [], |r| r.get(0))?;
+                let normal: i64 = conn.query_row("SELECT spam_count FROM word_frequencies WHERE word = 'normal'", [], |r| r.get(0))?;
+                Ok((poisoned, normal))
+            })
+            .await
+            .unwrap();
+        assert_eq!(poisoned_count, 1000, "outlier should be clamped");
+        assert_eq!(normal_count, 49, "untouched row should be unaffected");
+
+        let token_counts_exists: bool = runtime
+            .with_conn(|conn| {
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='token_counts'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok(count > 0)
+            })
+            .await
+            .unwrap();
+        assert!(!token_counts_exists, "dead token_counts table should be dropped");
+    }
+
+    // The /unban and /unmute commands lean on purge_training_by_case +
+    // rebuild_model to undo a bad training sample tied to a case. This
+    // confirms that combination actually removes the sample and its tokens.
+    #[tokio::test]
+    async fn purge_by_case_removes_training_sample_and_tokens() {
+        let runtime = test_runtime().await;
+        let text = "測試用垃圾樣本文字內容";
+        train_spam(&runtime, text, Some("case-unban-1")).await.unwrap();
+
+        let removed = runtime.purge_training_by_case("case-unban-1").await.unwrap();
+        assert!(removed > 0);
+
+        let rebuilt = runtime.rebuild_model().await.unwrap();
+        let export = runtime.export_training_data().await.unwrap();
+        assert!(!export.contains("case-unban-1"));
+        for token in tokenize(text) {
+            assert_eq!(rebuilt.spam_tokens.get(&token).copied().unwrap_or(0), 0, "token should be gone: {token}");
+        }
+    }
+
+    #[tokio::test]
+    async fn flood_check_trips_after_five_within_window() {
+        let runtime = test_runtime().await;
+        for _ in 0..4 {
+            assert!(!runtime.check_flood(1, 1).await);
+        }
+        assert!(runtime.check_flood(1, 1).await, "5th message within the window should trip it");
+    }
+
+    #[tokio::test]
+    async fn flood_check_is_scoped_per_chat_and_user() {
+        let runtime = test_runtime().await;
+        for _ in 0..4 {
+            assert!(!runtime.check_flood(1, 1).await);
+        }
+        // A different user in the same chat has their own counter.
+        assert!(!runtime.check_flood(1, 2).await);
+    }
+
+    #[tokio::test]
+    async fn group_threshold_override_falls_back_to_global() {
+        let runtime = test_runtime().await;
+        runtime.set_threshold(0.9).await.unwrap();
+        assert_eq!(runtime.effective_threshold(None).await.unwrap(), 0.9);
+        assert_eq!(runtime.effective_threshold(Some(111)).await.unwrap(), 0.9, "no override yet, should inherit global");
+
+        runtime.set_group_threshold(111, Some(0.6)).await.unwrap();
+        assert_eq!(runtime.effective_threshold(Some(111)).await.unwrap(), 0.6);
+        assert_eq!(runtime.effective_threshold(Some(222)).await.unwrap(), 0.9, "other chats are unaffected");
     }
 }
