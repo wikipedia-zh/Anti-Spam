@@ -36,6 +36,37 @@ impl Config {
         let test_group_id = env::var("TEST_GROUP_ID").ok().and_then(|v| v.parse::<i64>().ok());
         let maintainer_ids = env::var("MAINTAINER_IDS")
             .unwrap_or_default()
+            .split(',')
+            .filter_map(|v| v.trim().parse::<i64>().ok())
+            .collect::<Vec<_>>();
+        let data_dir = env::var("DATA_DIR").unwrap_or_else(|_| "data".to_string());
+        let sqlite_path = env::var("SQLITE_PATH").unwrap_or_else(|_| format!("{data_dir}/bot.db"));
+        let spam_threshold = env::var("SPAM_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.85);
+        Ok(Self {
+            bot_token,
+            log_channel_id,
+            report_channel_id,
+            test_group_id,
+            maintainer_ids,
+            data_dir: PathBuf::from(data_dir),
+            sqlite_path: PathBuf::from(sqlite_path),
+            spam_threshold,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum ActionKind {
+    AutoDelete,
+    AutoBan,
+    SpamBan,
+    Mute,
+    Kick,
+    PendingReport,
+    ReportApproved,
     ReportRejected,
 }
 
@@ -2378,6 +2409,36 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             train_ham(&runtime, &text, None).await.ok();
             bot.send_message(message.chat.id, "已將該樣本寫入 ham 模型。") .await?;
         }
+        ModerationCommand::MlUndoCleanSpam => {
+            if !is_maintainer(&bot, &runtime.config, from_id).await {
+                bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
+                return Ok(());
+            }
+            let raw_text = message.text().or(message.caption()).unwrap_or("");
+            let text = if let Some(target_msg) = message.reply_to_message() {
+                extract_full_text(target_msg)
+            } else {
+                let args = raw_text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+                if args.is_empty() {
+                    bot.send_message(message.chat.id, "請回覆一條先前寫入 ham/clean 的樣本訊息，或在指令後直接貼上要撤銷的文字。").await?;
+                    return Ok(());
+                }
+                args
+            };
+            if text.trim().is_empty() {
+                bot.send_message(message.chat.id, "請回覆一條先前寫入 ham/clean 的樣本訊息，或在指令後直接貼上要撤銷的文字。").await?;
+                return Ok(());
+            }
+
+            let removed = runtime.undo_clean_training_sample_by_text(&text).await.unwrap_or(0);
+            if removed == 0 {
+                bot.send_message(message.chat.id, "找不到可撤銷的 ham/clean 樣本。請確認文字完全一致，或先用 /ml_export 檢查實際寫入內容。").await?;
+                return Ok(());
+            }
+
+            let _ = runtime.rebuild_model().await;
+            bot.send_message(message.chat.id, "已撤銷該 ham/clean 樣本並重建模型。").await?;
+        }
         ModerationCommand::MlPurge(case_id) => {
             if !is_maintainer(&bot, &runtime.config, from_id).await {
                 bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
@@ -2649,96 +2710,6 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                                     );
                                     bot.send_message(message.chat.id, body).parse_mode(ParseMode::Html).await?;
                                 }
-                            ModerationCommand::MlUndoCleanSpam => {
-                                if !is_maintainer(&bot, &runtime.config, from_id).await {
-                                    bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
-                                    return Ok(());
-                                }
-                                let raw_text = message.text().or(message.caption()).unwrap_or("");
-                                let text = if let Some(target_msg) = message.reply_to_message() {
-                                    extract_full_text(target_msg)
-                                } else {
-                                    let args = raw_text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
-                                    if args.is_empty() {
-                                        bot.send_message(message.chat.id, "請回覆一條先前寫入 ham/clean 的樣本訊息，或在指令後直接貼上要撤銷的文字。").await?;
-                                        return Ok(());
-                                    }
-                                    args
-                                };
-                                if text.trim().is_empty() {
-                                    bot.send_message(message.chat.id, "請回覆一條先前寫入 ham/clean 的樣本訊息，或在指令後直接貼上要撤銷的文字。").await?;
-                                    return Ok(());
-                                }
-
-                                let removed = runtime.undo_clean_training_sample_by_text(&text).await.unwrap_or(0);
-                                if removed == 0 {
-                                    bot.send_message(message.chat.id, "找不到可撤銷的 ham/clean 樣本。請確認文字完全一致，或先用 /ml_export 檢查實際寫入內容。").await?;
-                                    return Ok(());
-                                }
-
-                                let _ = runtime.rebuild_model().await;
-                                bot.send_message(message.chat.id, "已撤銷該 ham/clean 樣本並重建模型。").await?;
-                            }
-                            ModerationCommand::MlUndoCleanSpam => {
-                                if !is_maintainer(&bot, &runtime.config, from_id).await {
-                                    bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
-                                    return Ok(());
-                                }
-                                let raw_text = message.text().or(message.caption()).unwrap_or("");
-                                let text = if let Some(target_msg) = message.reply_to_message() {
-                                    extract_full_text(target_msg)
-                                } else {
-                                    let args = raw_text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
-                                    if args.is_empty() {
-                                        bot.send_message(message.chat.id, "請回覆一條先前寫入 ham/clean 的樣本訊息，或在指令後直接貼上要撤銷的文字。").await?;
-                                        return Ok(());
-                                    }
-                                    args
-                                };
-                                if text.trim().is_empty() {
-                                    bot.send_message(message.chat.id, "請回覆一條先前寫入 ham/clean 的樣本訊息，或在指令後直接貼上要撤銷的文字。").await?;
-                                    return Ok(());
-                                }
-
-                                let removed = runtime.undo_clean_training_sample_by_text(&text).await.unwrap_or(0);
-                                if removed == 0 {
-                                    bot.send_message(message.chat.id, "找不到可撤銷的 ham/clean 樣本。請確認文字完全一致，或先用 /ml_export 檢查實際寫入內容。").await?;
-                                    return Ok(());
-                                }
-
-                                let _ = runtime.rebuild_model().await;
-                                bot.send_message(message.chat.id, "已撤銷該 ham/clean 樣本並重建模型。").await?;
-                            }
-                            ModerationCommand::MlUndoCleanSpam => {
-                                if !is_maintainer(&bot, &runtime.config, from_id).await {
-                                    bot.send_message(message.chat.id, "只有項目維護組可以使用此指令。").await?;
-                                    return Ok(());
-                                }
-                                let raw_text = message.text().or(message.caption()).unwrap_or("");
-                                let text = if let Some(target_msg) = message.reply_to_message() {
-                                    extract_full_text(target_msg)
-                                } else {
-                                    let args = raw_text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
-                                    if args.is_empty() {
-                                        bot.send_message(message.chat.id, "請回覆一條先前寫入 ham/clean 的樣本訊息，或在指令後直接貼上要撤銷的文字。") .await?;
-                                        return Ok(());
-                                    }
-                                    args.to_string()
-                                };
-                                if text.trim().is_empty() {
-                                    bot.send_message(message.chat.id, "請回覆一條先前寫入 ham/clean 的樣本訊息，或在指令後直接貼上要撤銷的文字。") .await?;
-                                    return Ok(());
-                                }
-
-                                let removed = runtime.undo_clean_training_sample_by_text(&text).await.unwrap_or(0);
-                                if removed == 0 {
-                                    bot.send_message(message.chat.id, "找不到可撤銷的 ham/clean 樣本。請確認文字完全一致，或先用 /ml_export 檢查實際寫入內容。") .await?;
-                                    return Ok(());
-                                }
-
-                                let _ = runtime.rebuild_model().await;
-                                bot.send_message(message.chat.id, "已撤銷該 ham/clean 樣本並重建模型。").await?;
-                            }
                                 Err(err) => {
                                     bot.send_message(message.chat.id, format!("檢查失敗：{err}")).await?;
                                 }
