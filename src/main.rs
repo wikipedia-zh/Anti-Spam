@@ -1898,11 +1898,11 @@ fn import_train_payloads(input: &str) -> Vec<String> {
 }
 
 fn help_text() -> String {
-    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n<code>/white</code>：加入本群白名單\n<code>/white -global</code>：加入全域白名單\n<code>/unwhite</code>：移出本群白名單\n<code>/unwhite -global</code>：移出全域白名單\n\n<b>群組管理員可用</b>\n<code>/module &lt;名稱&gt; &lt;on/off&gt;</code>：切換群組模組，名稱支援 NoLongName（英名檢查）/ NoHalal（清真檢查）/ NoSM（服務訊息刪除）/ Flood（洗版偵測，預設開啟）/ Captcha（新成員驗證，預設關閉）\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n".to_string()
+    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n<code>/white</code>：加入本群白名單\n<code>/white -global</code>：加入全域白名單\n<code>/unwhite</code>：移出本群白名單\n<code>/unwhite -global</code>：移出全域白名單\n\n<b>群組管理員可用</b>\n<code>/module &lt;名稱&gt; &lt;on/off&gt;</code>：切換群組模組，名稱支援 NoLongName（英名檢查）/ NoHalal（清真檢查）/ NoSM（服務訊息刪除）/ Flood（洗版偵測，預設開啟）/ Captcha（新成員驗證，預設關閉）\n<code>/unban</code>：回覆要解封的用戶、或提供 user_id，解封本群該用戶（僅本群，不影響訓練資料，如需連同撤銷誤判樣本請找維護組）\n<code>/unmute</code>：回覆要解除禁言的用戶、或提供 user_id\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n".to_string()
 }
 
 fn help_op_text() -> String {
-    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：回覆要解封的用戶、或提供 user_id / case_id 皆可。會解封該用戶，若找得到對應案例會一併移除錯誤訓練樣本並重建模型\n<code>/unmute</code>：回覆要解除禁言的用戶、或提供 user_id / case_id 皆可\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat &lt;chat_id&gt;</code>：設定工作群組\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
+    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可。會解封並在找得到對應案例時一併移除錯誤訓練樣本並重建模型（群組管理員也能用 /unban，但僅解封本群、不影響訓練資料）\n<code>/unmute</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可，並會撤銷對應案例（群組管理員也能用 /unmute，但僅解除本群禁言）\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat &lt;chat_id&gt;</code>：設定工作群組\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
 }
 
 fn format_score_debug(report: &ScoreDebugReport) -> String {
@@ -3422,14 +3422,57 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             runtime.clear_mass_train(from_id).await;
         }
         ModerationCommand::Unban(arg) => {
-            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
-            // Three ways to target: reply to the user (like /sb), an explicit
-            // user_id, or a case_id (whose own chat_id/target_user_id are used
-            // instead of the current chat - lets you reverse a case from DM).
-            // The reply/user_id forms exist because a user can be banned
-            // without this bot ever knowing - manually by another admin, by a
-            // different bot, or from before this project was even involved -
-            // so unbanning can't depend on a case existing at all.
+            let is_maintainer_user = is_maintainer(&bot, &runtime.config, from_id).await;
+            let is_admin_user = (message.chat.is_group() || message.chat.is_supergroup())
+                && is_group_admin(&bot, message.chat.id, from_id).await;
+            if !is_maintainer_user && !is_admin_user {
+                bot.send_message(message.chat.id, "只有群組管理員或項目維護組可以使用此指令。").await?;
+                return Ok(());
+            }
+
+            if !is_maintainer_user {
+                // Group admins (not maintainers) can let someone back into
+                // their own group, but reversing the case and purging
+                // training data is left to a maintainer reviewing the logs -
+                // that judgment call (was this actually a false positive?)
+                // needs someone with visibility across the whole project,
+                // not just this one group.
+                let target_user_id = if let Some(target_msg) = message.reply_to_message() {
+                    target_msg.from.as_ref().map(|u| u.id.0 as i64)
+                } else {
+                    arg.trim().parse::<i64>().ok()
+                };
+                let Some(target_user_id) = target_user_id else {
+                    bot.send_message(message.chat.id, "請回覆要解封的用戶，或提供 user_id。").await?;
+                    return Ok(());
+                };
+                if let Err(err) = bot.unban_chat_member(message.chat.id, UserId(target_user_id as u64)).await {
+                    bot.send_message(message.chat.id, format!("解封失敗：{err}")).await?;
+                    return Ok(());
+                }
+                let _ = bot
+                    .send_message(
+                        ChatId(runtime.config.log_channel_id),
+                        format!(
+                            "<b>群組管理員手動解封</b>\n<b>群組</b>: <code>{}</code>\n<b>對象</b>: <code>{target_user_id}</code>\n<b>操作者</b>: {}",
+                            message.chat.id.0,
+                            escape_html(&short_user(from)),
+                        ),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await;
+                bot.send_message(message.chat.id, format!("已在本群解封用戶 <code>{target_user_id}</code>。")).parse_mode(ParseMode::Html).await?;
+                return Ok(());
+            }
+
+            // Maintainer path: three ways to target - reply to the user (like
+            // /sb), an explicit user_id, or a case_id (whose own
+            // chat_id/target_user_id are used instead of the current chat -
+            // lets you reverse a case from DM). The reply/user_id forms exist
+            // because a user can be banned without this bot ever knowing -
+            // manually by another admin, by a different bot, or from before
+            // this project was even involved - so unbanning can't depend on a
+            // case existing at all.
             let resolved = if let Some(target_msg) = message.reply_to_message() {
                 target_msg.from.as_ref().map(|u| (message.chat.id.0, u.id.0 as i64, None::<CaseRecord>))
             } else if let Ok(user_id) = arg.trim().parse::<i64>() {
@@ -3491,9 +3534,49 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             bot.send_message(message.chat.id, format!("已解封用戶，並撤銷 case <code>{}</code>、移除 {removed} 筆對應訓練樣本。", case.id)).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::Unmute(arg) => {
-            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
-            // Same three targeting modes as /unban (reply / user_id / case_id) -
-            // a mute can also come from outside this bot's tracking.
+            let is_maintainer_user = is_maintainer(&bot, &runtime.config, from_id).await;
+            let is_admin_user = (message.chat.is_group() || message.chat.is_supergroup())
+                && is_group_admin(&bot, message.chat.id, from_id).await;
+            if !is_maintainer_user && !is_admin_user {
+                bot.send_message(message.chat.id, "只有群組管理員或項目維護組可以使用此指令。").await?;
+                return Ok(());
+            }
+
+            if !is_maintainer_user {
+                // Same reasoning as /unban: a group admin can free their own
+                // group's member right away, but reversing the case is left
+                // to a maintainer's judgment call.
+                let target_user_id = if let Some(target_msg) = message.reply_to_message() {
+                    target_msg.from.as_ref().map(|u| u.id.0 as i64)
+                } else {
+                    arg.trim().parse::<i64>().ok()
+                };
+                let Some(target_user_id) = target_user_id else {
+                    bot.send_message(message.chat.id, "請回覆要解除禁言的用戶，或提供 user_id。").await?;
+                    return Ok(());
+                };
+                if let Err(err) = bot.restrict_chat_member(message.chat.id, UserId(target_user_id as u64), teloxide::types::ChatPermissions::all()).await {
+                    bot.send_message(message.chat.id, format!("解除禁言失敗：{err}")).await?;
+                    return Ok(());
+                }
+                let _ = bot
+                    .send_message(
+                        ChatId(runtime.config.log_channel_id),
+                        format!(
+                            "<b>群組管理員手動解除禁言</b>\n<b>群組</b>: <code>{}</code>\n<b>對象</b>: <code>{target_user_id}</code>\n<b>操作者</b>: {}",
+                            message.chat.id.0,
+                            escape_html(&short_user(from)),
+                        ),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await;
+                bot.send_message(message.chat.id, format!("已在本群解除用戶 <code>{target_user_id}</code> 的禁言。")).parse_mode(ParseMode::Html).await?;
+                return Ok(());
+            }
+
+            // Maintainer path: same three targeting modes as /unban (reply /
+            // user_id / case_id) - a mute can also come from outside this
+            // bot's tracking.
             let resolved = if let Some(target_msg) = message.reply_to_message() {
                 target_msg.from.as_ref().map(|u| (message.chat.id.0, u.id.0 as i64, None::<CaseRecord>))
             } else if let Ok(user_id) = arg.trim().parse::<i64>() {
