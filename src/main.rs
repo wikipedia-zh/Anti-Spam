@@ -3351,3 +3351,55 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_runtime() -> Runtime {
+        let dir = std::env::temp_dir().join(format!("spb_test_{}", Uuid::new_v4()));
+        let config = Config {
+            bot_token: "test".to_string(),
+            log_channel_id: -1,
+            report_channel_id: -1,
+            test_group_id: None,
+            maintainer_ids: vec![],
+            data_dir: dir.clone(),
+            sqlite_path: dir.join("bot.db"),
+            spam_threshold: 0.85,
+        };
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        Runtime::load(config).await.unwrap()
+    }
+
+    // Regression check for the /sb (SpamBan) path: it calls train_spam with the
+    // replied-to message's text, and this confirms that call actually reaches
+    // and persists in the DB rather than just updating the in-memory cache -
+    // exactly the path the with_conn/transaction refactor touched.
+    #[tokio::test]
+    async fn spam_ban_training_persists_to_disk() {
+        let runtime = test_runtime().await;
+        let text = "腾龙集团 联系客服 usdt 官方注册通道";
+        train_spam(&runtime, text, Some("case-1")).await.unwrap();
+
+        {
+            let model = runtime.model.lock().await;
+            assert_eq!(model.spam_docs, 1);
+            assert!(!model.spam_tokens.is_empty());
+        }
+
+        // Drop the in-memory cache and reload straight from disk, simulating a
+        // restart, to prove the write actually landed in SQLite rather than
+        // only updating the process-local cache.
+        let rebuilt = runtime.rebuild_model().await.unwrap();
+        assert_eq!(rebuilt.spam_docs, 1);
+        assert!(!rebuilt.spam_tokens.is_empty());
+        for token in tokenize(text) {
+            assert!(rebuilt.spam_tokens.get(&token).copied().unwrap_or(0) >= 1, "missing token: {token}");
+        }
+
+        let export = runtime.export_training_data().await.unwrap();
+        assert!(export.contains("spam"));
+        assert!(export.contains("case-1"));
+    }
+}
