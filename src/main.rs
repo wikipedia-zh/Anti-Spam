@@ -2133,7 +2133,7 @@ async fn check_captcha_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Mess
     let Some(user) = message.from.as_ref() else { return false; };
     let key = (message.chat.id.0, user.id.0 as i64);
 
-    let expected = {
+    let (expected, challenge_message_id) = {
         let pending = runtime.pending_captcha.lock().await;
         let Some(entry) = pending.get(&key) else { return false; };
         if Instant::now() > entry.expires_at {
@@ -2141,7 +2141,7 @@ async fn check_captcha_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Mess
             // rather than racing it.
             return false;
         }
-        entry.expected_answer.clone()
+        (entry.expected_answer.clone(), entry.challenge_message_id)
     };
 
     let answer = message.text().unwrap_or("").trim();
@@ -2151,6 +2151,13 @@ async fn check_captcha_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Mess
             .restrict_chat_member(message.chat.id, user.id, teloxide::types::ChatPermissions::all())
             .await;
         let _ = bot.delete_message(message.chat.id, message.id).await;
+        // Clean up the question itself, not just the answer - it was still
+        // sitting in the chat with nothing telling anyone it got resolved.
+        let _ = bot.delete_message(message.chat.id, challenge_message_id).await;
+        let _ = bot
+            .send_message(message.chat.id, format!("✅ {} 驗證通過，歡迎！", escape_html(&short_user(user))))
+            .parse_mode(ParseMode::Html)
+            .await;
     } else {
         // Wrong guess: delete it and let them try again until the timeout.
         let _ = bot.delete_message(message.chat.id, message.id).await;
