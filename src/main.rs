@@ -2697,6 +2697,7 @@ async fn notify_bot_added(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) 
                 let _ = store_case(runtime, &updated).await;
                 let _ = notify_group(bot, runtime, &updated, log_message_id, "<b>自動模組封禁</b>").await;
                 propagate_network_ban(bot, runtime, &updated).await;
+                broadcast_ban_status(bot, runtime, updated.target_user_id, true).await;
             }
         }
 
@@ -2879,6 +2880,7 @@ async fn reverse_ban_case(bot: &Bot, runtime: &Runtime, mut case: CaseRecord, ac
     case.log_message_id = Some(log_message_id);
     store_case(runtime, &case).await.ok();
     notify_group(bot, runtime, &case, log_message_id, "<b>已撤銷封禁</b>").await.ok();
+    broadcast_ban_status(bot, runtime, case.target_user_id, false).await;
 
     let network_note = if network_targets.is_empty() {
         String::new()
@@ -2907,6 +2909,19 @@ async fn reverse_mute_case(bot: &Bot, runtime: &Runtime, mut case: CaseRecord, a
     notify_group(bot, runtime, &case, log_message_id, "<b>已解除禁言</b>").await.ok();
 
     Ok(format!("已解除禁言，並撤銷 case <code>{}</code>。", case.id))
+}
+
+/// Keeps PM's local ban-status cache (`bad_ids["users"]`) in sync so a
+/// banned user's very first cold DM is routed straight to the self-appeal
+/// flow instead of normal ticket handling - without this, PM only learns
+/// about a ban via a live `/status` check, which defeats the point of
+/// "just message the bot to appeal." No-ops if no exchange channel is
+/// configured. Unconditional, unlike `propagate_network_ban` below - PM's
+/// appeal flow has nothing to do with which groups opted into netban.
+async fn broadcast_ban_status(bot: &Bot, runtime: &Runtime, user_id: i64, banned: bool) {
+    let Some(chat) = runtime.exchange_channel().await else { return };
+    let action = if banned { "add" } else { "remove" };
+    send_exchange_message(bot, chat, action, "bad", serde_json::json!({ "id": user_id })).await;
 }
 
 /// Propagates a ban case to every other group that has opted into `netban`.
@@ -3638,6 +3653,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             notify_group(&bot, &runtime, &case, log_message_id, "<b>已執行管理操作</b>").await.ok();
             if action == ActionKind::SpamBan {
                 propagate_network_ban(&bot, &runtime, &case).await;
+                broadcast_ban_status(&bot, &runtime, case.target_user_id, true).await;
             }
 
             // Reuses the case's own case_id as the revert handle - no new ID
@@ -4739,6 +4755,7 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
                 }
             }
             propagate_network_ban(&bot, &runtime, &updated).await;
+            broadcast_ban_status(&bot, &runtime, updated.target_user_id, true).await;
             let body = format!(
                 "<b>新的 /spam 申請</b>\n\n<b>對象</b>: {} ({})\n<b>發起人</b>: {}\n<b>內容</b>: <blockquote>{}</blockquote>\n<b>案例</b>: <code>{}</code>\n<b>狀態</b>: 已受理並封禁\n<b>處理者</b>: <code>{}</code>",
                 escape_html(&case.target_name),
@@ -4825,6 +4842,7 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
             let _ = store_case(&runtime, &updated).await;
             let _ = notify_group(&bot, &runtime, &updated, log_message_id, "<b>自動模組封禁</b>").await;
             propagate_network_ban(&bot, &runtime, &updated).await;
+            broadcast_ban_status(&bot, &runtime, updated.target_user_id, true).await;
             return Ok(());
         }
     }
@@ -4866,6 +4884,7 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
     store_case(&runtime, &case).await.ok();
     notify_group(&bot, &runtime, &case, log_message_id, "<b>自動機器學習封禁</b>").await.ok();
     propagate_network_ban(&bot, &runtime, &case).await;
+    broadcast_ban_status(&bot, &runtime, case.target_user_id, true).await;
     Ok(())
 }
 
