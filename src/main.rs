@@ -162,6 +162,48 @@ fn case_from_row(row: &rusqlite::Row) -> Result<CaseRecord> {
     })
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum CaseKind {
+    Ban,
+    Mute,
+}
+
+/// Enough to reverse a maintainer command via `/revert <action_id>`.
+/// Reverting is deliberately "call the same setter again with the old
+/// value" rather than bespoke inverse logic - e.g. `GroupModule`'s revert is
+/// just another `set_group_module` call, and `Case`'s revert reuses the
+/// exact same `reverse_ban_case`/`reverse_mute_case` functions `/unban` and
+/// `/unmute` call directly. Serialized to JSON in the `maintainer_actions.
+/// undo_data` column.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum UndoData {
+    Threshold { old: f64 },
+    GroupThreshold { chat_id: i64, old: Option<f64> },
+    TokenProbability { token: String, old_spam: u64, old_ham: u64 },
+    GroupModule { chat_id: i64, module: String, old_enabled: bool },
+    GroupWhitelist { chat_id: i64, user_id: i64, old_enabled: bool },
+    GlobalWhitelist { user_id: i64, old_enabled: bool },
+    RuleAdded { rule_id: i64 },
+    RuleEdited { rule_id: i64, old_pattern: String },
+    RuleDeleted { pattern: String, description: String },
+    ProjectChat { old: Option<i64> },
+    /// A synthetic case_id-like handle passed as `case_id` into
+    /// `train_spam`/`train_ham` purely so `purge_training_by_case` can find
+    /// and remove exactly this training sample later - not a real case.
+    TrainingSample { training_ref: String },
+    Case { case_id: String, kind: CaseKind },
+    NotRevertible,
+}
+
+struct MaintainerAction {
+    actor_name: String,
+    chat_id: Option<i64>,
+    command: String,
+    summary: String,
+    undo: UndoData,
+    reverted: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ModelState {
     spam_docs: u64,
@@ -174,6 +216,9 @@ struct Runtime {
     config: Config,
     db: Arc<StdMutex<Connection>>,
     project_chat: Mutex<Option<i64>>,
+    /// Private channel for the maintainer action audit log, set via
+    /// `/set_audit_log`. Same persistence pattern as `project_chat`.
+    audit_log_chat: Mutex<Option<i64>>,
     model: Mutex<ModelState>,
     spam_rules: RwLock<Vec<SpamRule>>,
     mass_train_buffer: Mutex<HashMap<i64, Vec<String>>>,
@@ -291,11 +336,13 @@ impl Runtime {
         Self::init_db(&mut conn)?;
         let model = Self::load_model(&conn)?;
         let project_chat = Self::load_project_chat(&conn)?;
+        let audit_log_chat = Self::load_audit_log_chat(&conn)?;
         let spam_rules = Self::load_spam_rules(&conn)?;
         Ok(Self {
             config,
             db: Arc::new(StdMutex::new(conn)),
             project_chat: Mutex::new(project_chat),
+            audit_log_chat: Mutex::new(audit_log_chat),
             model: Mutex::new(model),
             spam_rules: RwLock::new(spam_rules),
             mass_train_buffer: Mutex::new(HashMap::new()),
@@ -432,6 +479,9 @@ impl Runtime {
         if user_version < 5 {
             Self::migrate_v4_to_v5(conn)?;
         }
+        if user_version < 6 {
+            Self::migrate_v5_to_v6(conn)?;
+        }
         Ok(())
     }
 
@@ -498,6 +548,33 @@ impl Runtime {
             [],
         )?;
         tx.execute("PRAGMA user_version = 5", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// One row per state-changing maintainer command, with enough in
+    /// `undo_data` (a serialized `UndoData`) to reverse it via `/revert
+    /// <action_id>`. `action_id` is a plain autoincrementing integer rather
+    /// than a UUID, specifically so it's short enough to type.
+    fn migrate_v5_to_v6(conn: &mut Connection) -> Result<()> {
+        let tx = conn.transaction()?;
+        tx.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS maintainer_actions (
+                action_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor_id INTEGER NOT NULL,
+                actor_name TEXT NOT NULL,
+                chat_id INTEGER,
+                command TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                undo_data TEXT NOT NULL,
+                reverted INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+            "#,
+            [],
+        )?;
+        tx.execute("PRAGMA user_version = 6", [])?;
         tx.commit()?;
         Ok(())
     }
@@ -598,6 +675,17 @@ impl Runtime {
 
     fn load_project_chat(conn: &Connection) -> Result<Option<i64>> {
         let mut stmt = conn.prepare("SELECT value FROM model_meta WHERE key = 'project_chat_id'")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let value: String = row.get(0)?;
+            Ok(value.parse::<i64>().ok())
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn load_audit_log_chat(conn: &Connection) -> Result<Option<i64>> {
+        let mut stmt = conn.prepare("SELECT value FROM model_meta WHERE key = 'audit_log_chat_id'")?;
         let mut rows = stmt.query([])?;
         if let Some(row) = rows.next()? {
             let value: String = row.get(0)?;
@@ -793,6 +881,56 @@ impl Runtime {
         .await
     }
 
+    /// Logs one state-changing maintainer command. Returns the new
+    /// `action_id` (a plain autoincrementing integer - short enough to type
+    /// back into `/revert`, unlike a UUID).
+    async fn record_maintainer_action(&self, actor_id: i64, actor_name: &str, chat_id: Option<i64>, command: &str, summary: &str, undo: &UndoData) -> Result<i64> {
+        let actor_name = actor_name.to_string();
+        let command = command.to_string();
+        let summary = summary.to_string();
+        let undo_json = serde_json::to_string(undo)?;
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO maintainer_actions (actor_id, actor_name, chat_id, command, summary, undo_data, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![actor_id, actor_name, chat_id, command, summary, undo_json, Utc::now().to_rfc3339()],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+        .await
+    }
+
+    async fn load_maintainer_action(&self, action_id: i64) -> Result<Option<MaintainerAction>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT actor_name, chat_id, command, summary, undo_data, reverted FROM maintainer_actions WHERE action_id = ?1",
+            )?;
+            let mut rows = stmt.query(params![action_id])?;
+            if let Some(row) = rows.next()? {
+                let undo_json: String = row.get(4)?;
+                let undo: UndoData = serde_json::from_str(&undo_json)?;
+                Ok(Some(MaintainerAction {
+                    actor_name: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    command: row.get(2)?,
+                    summary: row.get(3)?,
+                    undo,
+                    reverted: row.get::<_, i64>(5)? != 0,
+                }))
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+    }
+
+    async fn mark_maintainer_action_reverted(&self, action_id: i64) -> Result<()> {
+        self.with_conn(move |conn| {
+            conn.execute("UPDATE maintainer_actions SET reverted = 1 WHERE action_id = ?1", params![action_id])?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn insert_training_sample(&self, label: &str, text: &str, case_id: Option<&str>) -> Result<()> {
         let label = label.to_string();
         let text = text.to_string();
@@ -952,7 +1090,10 @@ impl Runtime {
         .await
     }
 
-    async fn set_token_probability(&self, token: &str, target_spam_prob: f64) -> Result<(u64, u64)> {
+    /// Returns `(new_spam_count, new_ham_count, old_spam_count, old_ham_count)`.
+    /// The old counts are returned too, rather than requiring a separate
+    /// query, so `/revert` can restore them via `UndoData::TokenProbability`.
+    async fn set_token_probability(&self, token: &str, target_spam_prob: f64) -> Result<(u64, u64, u64, u64)> {
         let token = token.trim().to_string();
         // Clamped well away from 0/1: the formula below solves for the raw count
         // needed to hit `target`, and that count blows up as target approaches
@@ -996,7 +1137,7 @@ impl Runtime {
                     params![&token, spam_count, ham_count],
                 )?;
 
-                Ok((spam_count, ham_count))
+                Ok((spam_count, ham_count, current_spam, current_ham))
             })
             .await?;
 
@@ -1007,6 +1148,25 @@ impl Runtime {
     async fn current_threshold(&self) -> Result<f64> {
         let value = self.with_conn(|conn| Self::load_threshold(conn)).await?;
         Ok(value.unwrap_or(self.config.spam_threshold))
+    }
+
+    /// Sets a token's spam/ham counts directly, unlike `set_token_probability`
+    /// which solves for counts from a target probability. Used by `/revert`
+    /// to restore exact prior counts, where the clamping/defense-in-depth
+    /// `set_token_probability` applies would be wrong (those old counts were
+    /// already valid before, so they don't need re-validating).
+    async fn set_token_counts_raw(&self, token: &str, spam_count: u64, ham_count: u64) -> Result<()> {
+        let token = token.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES (?1, ?2, ?3) ON CONFLICT(word) DO UPDATE SET spam_count = excluded.spam_count, ham_count = excluded.ham_count",
+                params![&token, spam_count, ham_count],
+            )?;
+            Ok(())
+        })
+        .await?;
+        let _ = self.rebuild_model().await?;
+        Ok(())
     }
 
     async fn start_mass_train(&self, user_id: i64) {
@@ -1055,6 +1215,25 @@ impl Runtime {
             .await;
         let mut project_chat = self.project_chat.lock().await;
         *project_chat = Some(chat_id);
+    }
+
+    async fn set_audit_log_chat(&self, chat_id: i64) {
+        let _ = self
+            .with_conn(move |conn| {
+                conn.execute(
+                    "INSERT INTO model_meta (key, value) VALUES ('audit_log_chat_id', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    params![chat_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .await;
+        let mut audit_log_chat = self.audit_log_chat.lock().await;
+        *audit_log_chat = Some(chat_id);
+    }
+
+    async fn audit_log_chat(&self) -> Option<i64> {
+        let audit_log_chat = self.audit_log_chat.lock().await;
+        *audit_log_chat
     }
 
     async fn blacklist_reason_message_id(&self) -> Result<Option<i32>> {
@@ -1725,6 +1904,8 @@ enum ModerationCommand {
     Unban(String),
     Unmute(String),
     Ping,
+    SetAuditLog(String),
+    Revert(String),
     Unknown,
 }
 
@@ -1811,6 +1992,8 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/unban" => ModerationCommand::Unban(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/unmute" => ModerationCommand::Unmute(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/ping" => ModerationCommand::Ping,
+        "/set_audit_log" => ModerationCommand::SetAuditLog(text.split_whitespace().nth(1).unwrap_or("").to_string()),
+        "/revert" => ModerationCommand::Revert(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         _ => ModerationCommand::Unknown,
     }
 }
@@ -2105,7 +2288,7 @@ fn help_text() -> String {
 }
 
 fn help_op_text() -> String {
-    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>（別名 <code>/mark_spam</code>）：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可。會解封並在找得到對應案例時一併移除錯誤訓練樣本並重建模型，若該案例曾透過 Netban 同步封禁到其他群組，也會一併在那些群組解封（群組管理員也能用 /unban，但僅解封本群、不影響訓練資料與其他群組）\n<code>/unmute</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可，並會撤銷對應案例（群組管理員也能用 /unmute，但僅解除本群禁言）\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat [chat_id]</code>：設定工作群組。不帶參數時直接綁定目前所在的群組；也可提供 chat_id 從其他地方設定。綁定後，若該群組串連的頻道發文時被 Telegram 自動釘選，機器人會自動取消釘選，避免洗掉手動釘選的訊息\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n<code>/ping</code>：確認機器人在線，並回報目前運行的版本號與 commit hash\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
+    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>（別名 <code>/mark_spam</code>）：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可。會解封並在找得到對應案例時一併移除錯誤訓練樣本並重建模型，若該案例曾透過 Netban 同步封禁到其他群組，也會一併在那些群組解封（群組管理員也能用 /unban，但僅解封本群、不影響訓練資料與其他群組）\n<code>/unmute</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可，並會撤銷對應案例（群組管理員也能用 /unmute，但僅解除本群禁言）\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat [chat_id]</code>：設定工作群組。不帶參數時直接綁定目前所在的群組；也可提供 chat_id 從其他地方設定。綁定後，若該群組串連的頻道發文時被 Telegram 自動釘選，機器人會自動取消釘選，避免洗掉手動釘選的訊息\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n<code>/ping</code>：確認機器人在線，並回報目前運行的版本號與 commit hash\n<code>/set_audit_log [chat_id]</code>：設定維護操作日誌頻道。不帶參數時綁定目前所在的群組/頻道。設定後，每個會改變狀態的維護指令（門檻、白名單、模組開關、規則異動、封禁/禁言等）都會記錄在這裡，並附上 action id\n<code>/revert &lt;action_id&gt;</code>：復原指定的維護操作，回到變更前的狀態；封禁/禁言類會重用 /unban、/unmute 的邏輯。少數沒有明確「復原前狀態」的操作無法自動復原，會直接告知\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
 }
 
 fn format_score_debug(report: &ScoreDebugReport) -> String {
@@ -2557,6 +2740,98 @@ async fn notify_group(bot: &Bot, runtime: &Runtime, case: &CaseRecord, log_messa
         let _ = bot.delete_message(chat_id, message_id).await;
     });
     Ok(())
+}
+
+/// Records a state-changing maintainer command and, if `/set_audit_log` has
+/// been configured, posts it to the private audit channel with its new
+/// `action_id` and a `/revert` hint (unless `undo` is `NotRevertible`).
+/// Best-effort: a failure to record shouldn't block the command that
+/// triggered it, so callers just ignore the `None` case.
+#[allow(clippy::too_many_arguments)]
+async fn log_maintainer_action(bot: &Bot, runtime: &Runtime, actor_id: i64, actor_name: &str, chat_id: Option<i64>, command: &str, summary: &str, undo: UndoData) -> Option<i64> {
+    let revertible = !matches!(undo, UndoData::NotRevertible);
+    let action_id = runtime.record_maintainer_action(actor_id, actor_name, chat_id, command, summary, &undo).await.ok()?;
+    if let Some(log_chat) = runtime.audit_log_chat().await {
+        let revert_hint = if revertible {
+            format!("復原：<code>/revert {action_id}</code>")
+        } else {
+            "（無法復原）".to_string()
+        };
+        let text = format!(
+            "<b>維護操作 #{action_id}</b>\n<b>指令</b>: <code>{}</code>\n<b>操作者</b>: {} (<code>{actor_id}</code>)\n<b>內容</b>: {}\n{revert_hint}",
+            escape_html(command),
+            escape_html(actor_name),
+            escape_html(summary),
+        );
+        let _ = bot.send_message(ChatId(log_chat), text).parse_mode(ParseMode::Html).await;
+    }
+    Some(action_id)
+}
+
+/// Reverses a ban case: unbans in the case's origin chat (and any chat
+/// netban had propagated it to), purges the training sample it
+/// contributed, and marks the case `Unbanned`. Shared by `/unban`'s
+/// maintainer path and the `/revert` dispatcher, so ban reversal only
+/// exists in one place. Returns a ready-to-send HTML summary on success, or
+/// a ready-to-send error message on failure.
+async fn reverse_ban_case(bot: &Bot, runtime: &Runtime, mut case: CaseRecord, actor_id: i64, actor_name: &str) -> Result<String, String> {
+    if let Err(err) = bot.unban_chat_member(ChatId(case.chat_id), UserId(case.target_user_id as u64)).await {
+        return Err(format!("解封失敗：{err}"));
+    }
+
+    let removed = runtime.purge_training_by_case(&case.id).await.unwrap_or(0);
+    if removed > 0 {
+        let _ = runtime.rebuild_model().await;
+    }
+
+    // If netban had propagated this ban elsewhere, undo it everywhere it
+    // actually landed - not just wherever's currently opted in, since that
+    // can have changed since the ban happened.
+    let network_targets = runtime.list_network_ban_targets(&case.id).await.unwrap_or_default();
+    for target_chat_id in &network_targets {
+        let _ = bot.unban_chat_member(ChatId(*target_chat_id), UserId(case.target_user_id as u64)).await;
+    }
+    if !network_targets.is_empty() {
+        let _ = runtime.clear_network_ban_targets(&case.id).await;
+    }
+
+    case.action = ActionKind::Unbanned;
+    case.status = "reversed".to_string();
+    case.actor_user_id = Some(actor_id);
+    case.actor_name = Some(actor_name.to_string());
+    store_case(runtime, &case).await.ok();
+    let log_message_id = log_action(bot, runtime, &case).await.unwrap_or_default();
+    case.log_message_id = Some(log_message_id);
+    store_case(runtime, &case).await.ok();
+    notify_group(bot, runtime, &case, log_message_id, "<b>已撤銷封禁</b>").await.ok();
+
+    let network_note = if network_targets.is_empty() {
+        String::new()
+    } else {
+        format!("，並在 {} 個跨群組黑名單同步的群組中解封", network_targets.len())
+    };
+    Ok(format!("已解封用戶，並撤銷 case <code>{}</code>、移除 {removed} 筆對應訓練樣本{network_note}。", case.id))
+}
+
+/// Reverses a mute case: restores full permissions in the case's chat and
+/// marks the case `Unmuted`. Shared by `/unmute`'s maintainer path and the
+/// `/revert` dispatcher.
+async fn reverse_mute_case(bot: &Bot, runtime: &Runtime, mut case: CaseRecord, actor_id: i64, actor_name: &str) -> Result<String, String> {
+    if let Err(err) = bot.restrict_chat_member(ChatId(case.chat_id), UserId(case.target_user_id as u64), teloxide::types::ChatPermissions::all()).await {
+        return Err(format!("解除禁言失敗：{err}"));
+    }
+
+    case.action = ActionKind::Unmuted;
+    case.status = "reversed".to_string();
+    case.actor_user_id = Some(actor_id);
+    case.actor_name = Some(actor_name.to_string());
+    store_case(runtime, &case).await.ok();
+    let log_message_id = log_action(bot, runtime, &case).await.unwrap_or_default();
+    case.log_message_id = Some(log_message_id);
+    store_case(runtime, &case).await.ok();
+    notify_group(bot, runtime, &case, log_message_id, "<b>已解除禁言</b>").await.ok();
+
+    Ok(format!("已解除禁言，並撤銷 case <code>{}</code>。", case.id))
 }
 
 /// Propagates a ban case to every other group that has opted into `netban`.
@@ -3173,8 +3448,29 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 };
                 value
             };
+            let old = runtime.project_chat().await;
             runtime.set_project_chat(value).await;
+            log_maintainer_action(&bot, &runtime, from_id, &short_user(from), None, "/setchat", &format!("項目交流群 {old:?} → {value}"), UndoData::ProjectChat { old }).await;
             bot.send_message(message.chat.id, format!("已設定項目交流群為 <code>{value}</code>。此群組串連的頻道發文自動釘選時，機器人會自動取消釘選。")).parse_mode(ParseMode::Html).await?;
+        }
+        ModerationCommand::SetAuditLog(chat_id) => {
+            require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以設定日誌頻道。");
+            // Same no-argument-binds-current-chat convenience as /setchat.
+            let value = if chat_id.trim().is_empty() {
+                if !message.chat.is_group() && !message.chat.is_supergroup() {
+                    bot.send_message(message.chat.id, "請在群組/頻道中使用 /set_audit_log 綁定，或提供 Chat ID。").await?;
+                    return Ok(());
+                }
+                message.chat.id.0
+            } else {
+                let Some(value) = chat_id.parse::<i64>().ok() else {
+                    bot.send_message(message.chat.id, "請提供有效的 Chat ID。").await?;
+                    return Ok(());
+                };
+                value
+            };
+            runtime.set_audit_log_chat(value).await;
+            bot.send_message(message.chat.id, format!("已設定維護操作日誌頻道為 <code>{value}</code>。之後每個會改變狀態的維護指令都會記錄在這裡，並附上可用於 /revert 的 action id。")).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::Leave(reason) => {
             require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用 /leave。");
@@ -3257,6 +3553,18 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 propagate_network_ban(&bot, &runtime, &case).await;
             }
 
+            // Reuses the case's own case_id as the revert handle - no new ID
+            // needed, /revert for a Case just calls the same
+            // reverse_ban_case/reverse_mute_case the case_id form of
+            // /unban and /unmute already use. A kick has nothing persistent
+            // to undo (it's just a ban immediately followed by an unban).
+            let (command_name, undo) = match action {
+                ActionKind::SpamBan => ("/sb", UndoData::Case { case_id: case_id.clone(), kind: CaseKind::Ban }),
+                ActionKind::Mute => ("/mute", UndoData::Case { case_id: case_id.clone(), kind: CaseKind::Mute }),
+                _ => ("/kick", UndoData::NotRevertible),
+            };
+            log_maintainer_action(&bot, &runtime, from_id, &short_user(from), Some(message.chat.id.0), command_name, &format!("{} 對象={target_id}", chinese_case_action(&case)), undo).await;
+
             // Delete the command message to minimize group disruption
             let _ = bot.delete_message(message.chat.id, message.id).await;
         }
@@ -3334,13 +3642,19 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "請回覆一條訊息來訓練或清洗模型。").await?;
                 return Ok(());
             }
+            // A fresh UUID passed as case_id purely as a revert handle (see
+            // UndoData::TrainingSample) - there's no real case behind a
+            // manual single-sample training action.
+            let training_ref = Uuid::new_v4().to_string();
             match cmd {
                 ModerationCommand::MlTrainSpam => {
-                    train_spam(&runtime, &text, None).await.ok();
+                    train_spam(&runtime, &text, Some(&training_ref)).await.ok();
+                    log_maintainer_action(&bot, &runtime, from_id, &short_user(from), Some(message.chat.id.0), "/ml_train_spam", "手動訓練 spam 樣本", UndoData::TrainingSample { training_ref }).await;
                     bot.send_message(message.chat.id, "已將該樣本寫入 spam 模型。") .await?;
                 }
                 ModerationCommand::MlCleanSpam => {
-                    train_ham(&runtime, &text, None).await.ok();
+                    train_ham(&runtime, &text, Some(&training_ref)).await.ok();
+                    log_maintainer_action(&bot, &runtime, from_id, &short_user(from), Some(message.chat.id.0), "/ml_clean_spam", "手動訓練 ham/clean 樣本", UndoData::TrainingSample { training_ref }).await;
                     bot.send_message(message.chat.id, "已將該樣本寫入 ham/clean 模型。") .await?;
                 }
                 _ => {}
@@ -3354,7 +3668,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "請回覆一條訊息作為 ham 樣本。") .await?;
                 return Ok(());
             }
-            train_ham(&runtime, &text, None).await.ok();
+            let training_ref = Uuid::new_v4().to_string();
+            train_ham(&runtime, &text, Some(&training_ref)).await.ok();
+            log_maintainer_action(&bot, &runtime, from_id, &short_user(from), Some(message.chat.id.0), "/mark_ham", "手動標記 ham 樣本", UndoData::TrainingSample { training_ref }).await;
             bot.send_message(message.chat.id, "已將該樣本寫入 ham 模型。") .await?;
         }
         ModerationCommand::MlUndoCleanSpam => {
@@ -3477,7 +3793,13 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "請提供有效的規則 ID。").await?;
                 return Ok(());
             };
+            let old_rule = runtime.list_spam_rules().await.unwrap_or_default().into_iter().find(|(rid, _, _)| *rid == id);
             let removed = runtime.delete_spam_rule(id).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
+            if removed {
+                if let Some((_, pattern, description)) = old_rule {
+                    log_maintainer_action(&bot, &runtime, from_id, &short_user(from), None, "/del_rule", &format!("刪除規則 @{id}"), UndoData::RuleDeleted { pattern, description }).await;
+                }
+            }
             bot.send_message(message.chat.id, if removed { format!("已刪除規則 #{id}") } else { format!("找不到規則 #{id}") }).await?;
         }
         ModerationCommand::AddRule(rule) => {
@@ -3500,8 +3822,12 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "請提供正則。").await?;
                 return Ok(());
             }
+            let old_pattern = runtime.list_spam_rules().await.unwrap_or_default().into_iter().find(|(rid, _, _)| *rid == id).map(|(_, p, _)| p);
             let updated = runtime.update_spam_rule_pattern(id, pattern.trim()).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
             if updated {
+                if let Some(old_pattern) = old_pattern {
+                    log_maintainer_action(&bot, &runtime, from_id, &short_user(from), None, "/edit_rule", &format!("規則 @{id} 正則變更"), UndoData::RuleEdited { rule_id: id, old_pattern }).await;
+                }
                 bot.send_message(message.chat.id, format!("已更新規則 @{id}。名稱不變。\n")).await?;
             } else {
                 bot.send_message(message.chat.id, format!("找不到規則 @{id}。")).await?;
@@ -3526,6 +3852,17 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             }
             let enabled = matches!(state.to_lowercase().as_str(), "on" | "enable" | "enabled");
             let key = module.trim().to_lowercase();
+            let old_settings = runtime.get_group_modules(message.chat.id.0).await.unwrap_or_default();
+            let old_enabled = match key.as_str() {
+                "nolongname" => Some(old_settings.no_long_name),
+                "nohalal" => Some(old_settings.no_halal),
+                "nosm" => Some(old_settings.no_service_messages),
+                "flood" => Some(old_settings.flood_control),
+                "captcha" => Some(old_settings.captcha),
+                "netban" => Some(old_settings.netban),
+                "cmdclean" => Some(old_settings.cmd_clean),
+                _ => None,
+            };
             match key.as_str() {
                 "nolongname" => { runtime.set_group_module(message.chat.id.0, "nolongname", enabled).await.ok(); }
                 "nohalal" => { runtime.set_group_module(message.chat.id.0, "nohalal", enabled).await.ok(); }
@@ -3538,6 +3875,19 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     reply_ephemeral(&bot, &message, "模組名稱僅支援 NoLongName / NoHalal / NoSM / Flood / Captcha / Netban / CmdClean。").await?;
                     return Ok(());
                 }
+            }
+            if let Some(old_enabled) = old_enabled {
+                log_maintainer_action(
+                    &bot,
+                    &runtime,
+                    from_id,
+                    &short_user(from),
+                    Some(message.chat.id.0),
+                    "/module",
+                    &format!("{key} {old_enabled}→{enabled}"),
+                    UndoData::GroupModule { chat_id: message.chat.id.0, module: key.clone(), old_enabled },
+                )
+                .await;
             }
             bot.send_message(message.chat.id, format!("已將 {module} 設為 {}", if enabled { "on" } else { "off" })).await?;
         }
@@ -3554,9 +3904,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 reply_ephemeral(&bot, &message, "請提供 userid 或回覆一位用戶。").await?;
                 return Ok(());
             };
+            let old_enabled = runtime.is_group_whitelisted(message.chat.id.0, user_id).await.unwrap_or(false);
             runtime.set_group_whitelist(message.chat.id.0, user_id, true, Some(from_id)).await.ok();
+            log_maintainer_action(&bot, &runtime, from_id, &short_user(from), Some(message.chat.id.0), "/white", &format!("本群白名單 user_id={user_id} {old_enabled}→true"), UndoData::GroupWhitelist { chat_id: message.chat.id.0, user_id, old_enabled }).await;
             bot.send_message(message.chat.id, format!("已將 <code>{user_id}</code> 加入本群白名單。",)).parse_mode(ParseMode::Html).await?;
-            
+
             // Delete the command message to minimize group disruption
             let _ = bot.delete_message(message.chat.id, message.id).await;
         }
@@ -3566,9 +3918,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "請提供 userid 或回覆一位用戶。") .await?;
                 return Ok(());
             };
+            let old_enabled = runtime.is_global_whitelisted(user_id).await.unwrap_or(false);
             runtime.set_global_whitelist(user_id, true, Some(from_id)).await.ok();
+            log_maintainer_action(&bot, &runtime, from_id, &short_user(from), None, "/white -global", &format!("全域白名單 user_id={user_id} {old_enabled}→true"), UndoData::GlobalWhitelist { user_id, old_enabled }).await;
             bot.send_message(message.chat.id, format!("已將 <code>{user_id}</code> 加入全域白名單。",)).parse_mode(ParseMode::Html).await?;
-            
+
             // Delete the command message to minimize group disruption
             let _ = bot.delete_message(message.chat.id, message.id).await;
         }
@@ -3585,9 +3939,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 reply_ephemeral(&bot, &message, "請提供 userid 或回覆一位用戶。").await?;
                 return Ok(());
             };
+            let old_enabled = runtime.is_group_whitelisted(message.chat.id.0, user_id).await.unwrap_or(false);
             runtime.set_group_whitelist(message.chat.id.0, user_id, false, Some(from_id)).await.ok();
+            log_maintainer_action(&bot, &runtime, from_id, &short_user(from), Some(message.chat.id.0), "/unwhite", &format!("本群白名單 user_id={user_id} {old_enabled}→false"), UndoData::GroupWhitelist { chat_id: message.chat.id.0, user_id, old_enabled }).await;
             bot.send_message(message.chat.id, format!("已將 <code>{user_id}</code> 移出本群白名單。",)).parse_mode(ParseMode::Html).await?;
-            
+
             // Delete the command message to minimize group disruption
             let _ = bot.delete_message(message.chat.id, message.id).await;
         }
@@ -3597,9 +3953,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "請提供 userid 或回覆一位用戶。") .await?;
                 return Ok(());
             };
+            let old_enabled = runtime.is_global_whitelisted(user_id).await.unwrap_or(false);
             runtime.set_global_whitelist(user_id, false, Some(from_id)).await.ok();
+            log_maintainer_action(&bot, &runtime, from_id, &short_user(from), None, "/unwhite -global", &format!("全域白名單 user_id={user_id} {old_enabled}→false"), UndoData::GlobalWhitelist { user_id, old_enabled }).await;
             bot.send_message(message.chat.id, format!("已將 <code>{user_id}</code> 移出全域白名單。",)).parse_mode(ParseMode::Html).await?;
-            
+
             // Delete the command message to minimize group disruption
             let _ = bot.delete_message(message.chat.id, message.id).await;
         }
@@ -3701,10 +4059,14 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 || runtime.config.test_group_id == Some(message.chat.id.0)
                 || runtime.project_chat().await == Some(message.chat.id.0);
             if is_global_scope {
+                let old = runtime.current_threshold().await.unwrap_or(runtime.config.spam_threshold);
                 runtime.set_threshold(clamped).await.ok();
+                log_maintainer_action(&bot, &runtime, from_id, &short_user(from), None, "/ml_threshold", &format!("全域門檻 {old:.2} → {clamped:.2}"), UndoData::Threshold { old }).await;
                 bot.send_message(message.chat.id, format!("已保存全域門檻: {clamped:.2}")).await?;
             } else {
+                let old = runtime.get_group_modules(message.chat.id.0).await.unwrap_or_default().spam_threshold_override;
                 runtime.set_group_threshold(message.chat.id.0, Some(clamped)).await.ok();
+                log_maintainer_action(&bot, &runtime, from_id, &short_user(from), Some(message.chat.id.0), "/ml_threshold", &format!("本群門檻 {old:?} → {clamped:.2}"), UndoData::GroupThreshold { chat_id: message.chat.id.0, old }).await;
                 bot.send_message(message.chat.id, format!("已為本群設定門檻: {clamped:.2}（僅適用於本群，其他群組不受影響）")).await?;
             }
         }
@@ -3723,10 +4085,22 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             };
 
             let target = target.clamp(0.000001, 0.999999);
-            let (spam_count, ham_count) = runtime
+            let token_owned = token.to_string();
+            let (spam_count, ham_count, old_spam, old_ham) = runtime
                 .set_token_probability(token, target)
                 .await
                 .map_err(|err| teloxide::RequestError::Io(std::io::Error::other(err.to_string()).into()))?;
+            log_maintainer_action(
+                &bot,
+                &runtime,
+                from_id,
+                &short_user(from),
+                None,
+                "/set",
+                &format!("token `{token_owned}` spam_count {old_spam}→{spam_count}, ham_count {old_ham}→{ham_count}"),
+                UndoData::TokenProbability { token: token_owned, old_spam, old_ham },
+            )
+            .await;
 
             bot.send_message(
                 message.chat.id,
@@ -3961,11 +4335,6 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 return Ok(());
             };
 
-            if let Err(err) = bot.unban_chat_member(ChatId(chat_id), UserId(target_user_id as u64)).await {
-                bot.send_message(message.chat.id, format!("解封失敗：{err}")).await?;
-                return Ok(());
-            }
-
             // Best-effort: reverse a tracked case too, if one exists, to also
             // clean up any training data it contributed. Not finding one is
             // completely normal for a user this project never banned.
@@ -3978,7 +4347,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     .flatten(),
             };
 
-            let Some(mut case) = case else {
+            let Some(case) = case else {
+                if let Err(err) = bot.unban_chat_member(ChatId(chat_id), UserId(target_user_id as u64)).await {
+                    bot.send_message(message.chat.id, format!("解封失敗：{err}")).await?;
+                    return Ok(());
+                }
                 bot.send_message(
                     message.chat.id,
                     format!("已在本群解封用戶 <code>{target_user_id}</code>。（找不到本專案的封禁記錄，沒有訓練樣本需要清除）"),
@@ -3988,37 +4361,10 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 return Ok(());
             };
 
-            let removed = runtime.purge_training_by_case(&case.id).await.unwrap_or(0);
-            if removed > 0 {
-                let _ = runtime.rebuild_model().await;
+            match reverse_ban_case(&bot, &runtime, case, from_id, &short_user(from)).await {
+                Ok(summary) => { bot.send_message(message.chat.id, summary).parse_mode(ParseMode::Html).await?; }
+                Err(err) => { bot.send_message(message.chat.id, err).await?; }
             }
-
-            // If netban had propagated this ban elsewhere, undo it everywhere
-            // it actually landed - not just wherever's currently opted in,
-            // since that can have changed since the ban happened.
-            let network_targets = runtime.list_network_ban_targets(&case.id).await.unwrap_or_default();
-            for target_chat_id in &network_targets {
-                let _ = bot.unban_chat_member(ChatId(*target_chat_id), UserId(target_user_id as u64)).await;
-            }
-            if !network_targets.is_empty() {
-                let _ = runtime.clear_network_ban_targets(&case.id).await;
-            }
-
-            case.action = ActionKind::Unbanned;
-            case.status = "reversed".to_string();
-            case.actor_user_id = Some(from_id);
-            case.actor_name = Some(short_user(from));
-            store_case(&runtime, &case).await.ok();
-            let log_message_id = log_action(&bot, &runtime, &case).await.unwrap_or_default();
-            case.log_message_id = Some(log_message_id);
-            store_case(&runtime, &case).await.ok();
-            notify_group(&bot, &runtime, &case, log_message_id, "<b>已撤銷封禁</b>").await.ok();
-            let network_note = if network_targets.is_empty() {
-                String::new()
-            } else {
-                format!("，並在 {} 個跨群組黑名單同步的群組中解封", network_targets.len())
-            };
-            bot.send_message(message.chat.id, format!("已解封用戶，並撤銷 case <code>{}</code>、移除 {removed} 筆對應訓練樣本{network_note}。", case.id)).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::Unmute(arg) => {
             let is_maintainer_user = is_maintainer(&bot, &runtime.config, from_id).await;
@@ -4082,11 +4428,6 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 return Ok(());
             };
 
-            if let Err(err) = bot.restrict_chat_member(ChatId(chat_id), UserId(target_user_id as u64), teloxide::types::ChatPermissions::all()).await {
-                bot.send_message(message.chat.id, format!("解除禁言失敗：{err}")).await?;
-                return Ok(());
-            }
-
             let case = match case_from_id {
                 Some(case) => Some(case),
                 None => runtime
@@ -4096,25 +4437,125 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     .flatten(),
             };
 
-            let Some(mut case) = case else {
+            let Some(case) = case else {
+                if let Err(err) = bot.restrict_chat_member(ChatId(chat_id), UserId(target_user_id as u64), teloxide::types::ChatPermissions::all()).await {
+                    bot.send_message(message.chat.id, format!("解除禁言失敗：{err}")).await?;
+                    return Ok(());
+                }
                 bot.send_message(message.chat.id, format!("已在本群解除用戶 <code>{target_user_id}</code> 的禁言。（找不到本專案的禁言記錄）")).parse_mode(ParseMode::Html).await?;
                 return Ok(());
             };
 
-            case.action = ActionKind::Unmuted;
-            case.status = "reversed".to_string();
-            case.actor_user_id = Some(from_id);
-            case.actor_name = Some(short_user(from));
-            store_case(&runtime, &case).await.ok();
-            let log_message_id = log_action(&bot, &runtime, &case).await.unwrap_or_default();
-            case.log_message_id = Some(log_message_id);
-            store_case(&runtime, &case).await.ok();
-            notify_group(&bot, &runtime, &case, log_message_id, "<b>已解除禁言</b>").await.ok();
-            bot.send_message(message.chat.id, format!("已解除禁言，並撤銷 case <code>{}</code>。", case.id)).parse_mode(ParseMode::Html).await?;
+            match reverse_mute_case(&bot, &runtime, case, from_id, &short_user(from)).await {
+                Ok(summary) => { bot.send_message(message.chat.id, summary).parse_mode(ParseMode::Html).await?; }
+                Err(err) => { bot.send_message(message.chat.id, err).await?; }
+            }
         }
         ModerationCommand::Ping => {
             require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
             bot.send_message(message.chat.id, version_info_text()).parse_mode(ParseMode::Html).await?;
+        }
+        ModerationCommand::Revert(action_id_arg) => {
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
+            let Some(action_id) = action_id_arg.trim().parse::<i64>().ok() else {
+                bot.send_message(message.chat.id, "請提供有效的 action id，例如 /revert 42。").await?;
+                return Ok(());
+            };
+            let action = runtime
+                .load_maintainer_action(action_id)
+                .await
+                .map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
+            let Some(action) = action else {
+                bot.send_message(message.chat.id, format!("找不到 action #{action_id}。")).await?;
+                return Ok(());
+            };
+            if action.reverted {
+                bot.send_message(message.chat.id, format!("action #{action_id} 已經被復原過了。")).await?;
+                return Ok(());
+            }
+
+            let actor_name = short_user(from);
+            let result: Result<String, String> = match action.undo {
+                UndoData::NotRevertible => Err(format!("action #{action_id}（{}）無法自動復原。", action.command)),
+                UndoData::Threshold { old } => match runtime.set_threshold(old).await {
+                    Ok(()) => Ok(format!("已將全域門檻復原為 {old:.2}。")),
+                    Err(e) => Err(e.to_string()),
+                },
+                UndoData::GroupThreshold { chat_id, old } => match runtime.set_group_threshold(chat_id, old).await {
+                    Ok(()) => Ok(format!("已將群組 {chat_id} 的門檻復原為 {old:?}。")),
+                    Err(e) => Err(e.to_string()),
+                },
+                UndoData::TokenProbability { token, old_spam, old_ham } => match runtime.set_token_counts_raw(&token, old_spam, old_ham).await {
+                    Ok(()) => Ok(format!("已將 token <code>{}</code> 的計數復原為 spam={old_spam}, ham={old_ham}。", escape_html(&token))),
+                    Err(e) => Err(e.to_string()),
+                },
+                UndoData::GroupModule { chat_id, module, old_enabled } => match runtime.set_group_module(chat_id, &module, old_enabled).await {
+                    Ok(()) => Ok(format!("已將群組 {chat_id} 的模組 {module} 復原為 {old_enabled}。")),
+                    Err(e) => Err(e.to_string()),
+                },
+                UndoData::GroupWhitelist { chat_id, user_id, old_enabled } => match runtime.set_group_whitelist(chat_id, user_id, old_enabled, None).await {
+                    Ok(()) => Ok(format!("已將群組 {chat_id} 對 user_id={user_id} 的白名單狀態復原為 {old_enabled}。")),
+                    Err(e) => Err(e.to_string()),
+                },
+                UndoData::GlobalWhitelist { user_id, old_enabled } => match runtime.set_global_whitelist(user_id, old_enabled, None).await {
+                    Ok(()) => Ok(format!("已將 user_id={user_id} 的全域白名單狀態復原為 {old_enabled}。")),
+                    Err(e) => Err(e.to_string()),
+                },
+                UndoData::RuleAdded { rule_id } => match runtime.delete_spam_rule(rule_id).await {
+                    Ok(_) => Ok(format!("已刪除規則 @{rule_id}。")),
+                    Err(e) => Err(e.to_string()),
+                },
+                UndoData::RuleEdited { rule_id, old_pattern } => match runtime.update_spam_rule_pattern(rule_id, &old_pattern).await {
+                    Ok(_) => Ok(format!("已將規則 @{rule_id} 的正則復原。")),
+                    Err(e) => Err(e.to_string()),
+                },
+                UndoData::RuleDeleted { pattern, description } => match runtime.add_spam_rule(&pattern, &description).await {
+                    Ok(new_id) => Ok(format!("已重新建立規則（新 ID：@{new_id}，原規則 ID 無法保留）。")),
+                    Err(e) => Err(e.to_string()),
+                },
+                UndoData::ProjectChat { old } => match old {
+                    Some(old) => {
+                        runtime.set_project_chat(old).await;
+                        Ok(format!("已將項目交流群復原為 {old}。"))
+                    }
+                    None => Err("此操作之前沒有設定項目交流群，無法自動復原成「未設定」狀態，請視需要手動處理。".to_string()),
+                },
+                UndoData::TrainingSample { training_ref } => match runtime.purge_training_by_case(&training_ref).await {
+                    Ok(removed) => {
+                        if removed > 0 {
+                            let _ = runtime.rebuild_model().await;
+                        }
+                        Ok(format!("已移除該筆訓練樣本並重建模型（共 {removed} 筆）。"))
+                    }
+                    Err(e) => Err(e.to_string()),
+                },
+                UndoData::Case { case_id, kind } => match runtime.load_case(&case_id).await {
+                    Ok(Some(case)) => match kind {
+                        CaseKind::Ban => reverse_ban_case(&bot, &runtime, case, from_id, &actor_name).await,
+                        CaseKind::Mute => reverse_mute_case(&bot, &runtime, case, from_id, &actor_name).await,
+                    },
+                    Ok(None) => Err(format!("找不到案例 {case_id}。")),
+                    Err(e) => Err(e.to_string()),
+                },
+            };
+
+            let original_context = format!(
+                "原操作: <code>{}</code>（{}{}操作者: {}{}）",
+                escape_html(&action.command),
+                escape_html(&action.summary),
+                if action.summary.is_empty() { "" } else { "，" },
+                escape_html(&action.actor_name),
+                action.chat_id.map(|c| format!("，群組: {c}")).unwrap_or_default(),
+            );
+            match result {
+                Ok(summary) => {
+                    runtime.mark_maintainer_action_reverted(action_id).await.ok();
+                    bot.send_message(message.chat.id, format!("已復原 action #{action_id}：{summary}\n{original_context}")).parse_mode(ParseMode::Html).await?;
+                }
+                Err(err) => {
+                    bot.send_message(message.chat.id, format!("{err}\n{original_context}")).await?;
+                }
+            }
         }
         ModerationCommand::Unknown => {
             if message.chat.is_private() {
@@ -4123,6 +4564,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     if !name.is_empty() {
                         let id = runtime.add_spam_rule(&pattern, name).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
                         runtime.take_pending_rule_addition(from_id).await;
+                        log_maintainer_action(&bot, &runtime, from_id, &short_user(from), None, "/add_rule", &format!("新增規則 @{id}"), UndoData::RuleAdded { rule_id: id }).await;
                         bot.send_message(message.chat.id, format!("已建立規則 @{}。", id)).await?;
                         return Ok(());
                     }
@@ -4829,5 +5271,84 @@ mod tests {
         let second = runtime.last_permission_offense(100, 200).await.unwrap().unwrap();
 
         assert!(second >= first);
+    }
+
+    // Backs /revert: record an action, load it back (undo_data round-trips
+    // through JSON correctly), mark it reverted, and confirm an already
+    // reverted action is flagged as such.
+    #[tokio::test]
+    async fn maintainer_action_round_trip_and_reverted_flag() {
+        let runtime = test_runtime().await;
+        let undo = UndoData::GroupModule { chat_id: 100, module: "flood".to_string(), old_enabled: true };
+        let action_id = runtime
+            .record_maintainer_action(555, "Test Maintainer", Some(100), "/module", "flood true→false", &undo)
+            .await
+            .unwrap();
+
+        let loaded = runtime.load_maintainer_action(action_id).await.unwrap().unwrap();
+        assert_eq!(loaded.actor_name, "Test Maintainer");
+        assert_eq!(loaded.chat_id, Some(100));
+        assert_eq!(loaded.command, "/module");
+        assert!(!loaded.reverted);
+        match loaded.undo {
+            UndoData::GroupModule { chat_id, module, old_enabled } => {
+                assert_eq!(chat_id, 100);
+                assert_eq!(module, "flood");
+                assert!(old_enabled);
+            }
+            other => panic!("expected GroupModule, got {other:?}"),
+        }
+
+        runtime.mark_maintainer_action_reverted(action_id).await.unwrap();
+        let reloaded = runtime.load_maintainer_action(action_id).await.unwrap().unwrap();
+        assert!(reloaded.reverted);
+    }
+
+    #[tokio::test]
+    async fn load_maintainer_action_missing_returns_none() {
+        let runtime = test_runtime().await;
+        assert!(runtime.load_maintainer_action(999999).await.unwrap().is_none());
+    }
+
+    // /revert's dispatcher is "call the same setter again with the old
+    // value" for most UndoData variants - this exercises that exact pattern
+    // for GroupModule and Threshold, the two simplest representative cases,
+    // confirming the setters actually restore prior state correctly.
+    #[tokio::test]
+    async fn reverting_group_module_restores_prior_state() {
+        let runtime = test_runtime().await;
+        runtime.set_group_module(100, "flood", false).await.unwrap();
+        assert!(!runtime.get_group_modules(100).await.unwrap().flood_control);
+
+        // Simulates what /revert does for UndoData::GroupModule { old_enabled: true, .. }
+        runtime.set_group_module(100, "flood", true).await.unwrap();
+        assert!(runtime.get_group_modules(100).await.unwrap().flood_control);
+    }
+
+    #[tokio::test]
+    async fn reverting_threshold_restores_prior_value() {
+        let runtime = test_runtime().await;
+        runtime.set_threshold(0.9).await.unwrap();
+        assert_eq!(runtime.current_threshold().await.unwrap(), 0.9);
+
+        // Simulates what /revert does for UndoData::Threshold { old: 0.7 }
+        runtime.set_threshold(0.7).await.unwrap();
+        assert_eq!(runtime.current_threshold().await.unwrap(), 0.7);
+    }
+
+    #[tokio::test]
+    async fn set_token_counts_raw_restores_exact_counts() {
+        let runtime = test_runtime().await;
+        // Push the counts to some large, formula-derived values first...
+        runtime.set_token_probability("spamword", 0.9).await.unwrap();
+
+        // ...then simulate /revert for UndoData::TokenProbability { old_spam: 3, old_ham: 7 },
+        // which must land on exactly those values, not another formula-derived pair.
+        runtime.set_token_counts_raw("spamword", 3, 7).await.unwrap();
+        let (spam_after, ham_after): (i64, i64) = runtime
+            .with_conn(|conn| Ok(conn.query_row("SELECT spam_count, ham_count FROM word_frequencies WHERE word = 'spamword'", [], |row| Ok((row.get(0)?, row.get(1)?)))?))
+            .await
+            .unwrap();
+        assert_eq!((spam_after, ham_after), (3, 7));
     }
 }
