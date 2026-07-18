@@ -219,6 +219,10 @@ struct Runtime {
     /// Private channel for the maintainer action audit log, set via
     /// `/set_audit_log`. Same persistence pattern as `project_chat`.
     audit_log_chat: Mutex<Option<i64>>,
+    /// Private broadcast channel used as the SCP-079 exchange bus for the PM
+    /// ticket bot's self-appeal bridge, set via `/set_exchange_channel`. Same
+    /// persistence pattern as `project_chat`/`audit_log_chat`.
+    exchange_channel: Mutex<Option<i64>>,
     model: Mutex<ModelState>,
     spam_rules: RwLock<Vec<SpamRule>>,
     mass_train_buffer: Mutex<HashMap<i64, Vec<String>>>,
@@ -337,12 +341,14 @@ impl Runtime {
         let model = Self::load_model(&conn)?;
         let project_chat = Self::load_project_chat(&conn)?;
         let audit_log_chat = Self::load_audit_log_chat(&conn)?;
+        let exchange_channel = Self::load_exchange_channel(&conn)?;
         let spam_rules = Self::load_spam_rules(&conn)?;
         Ok(Self {
             config,
             db: Arc::new(StdMutex::new(conn)),
             project_chat: Mutex::new(project_chat),
             audit_log_chat: Mutex::new(audit_log_chat),
+            exchange_channel: Mutex::new(exchange_channel),
             model: Mutex::new(model),
             spam_rules: RwLock::new(spam_rules),
             mass_train_buffer: Mutex::new(HashMap::new()),
@@ -695,6 +701,17 @@ impl Runtime {
         }
     }
 
+    fn load_exchange_channel(conn: &Connection) -> Result<Option<i64>> {
+        let mut stmt = conn.prepare("SELECT value FROM model_meta WHERE key = 'exchange_channel_id'")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let value: String = row.get(0)?;
+            Ok(value.parse::<i64>().ok())
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn persist_case(&self, case: &CaseRecord) -> Result<()> {
         let case = case.clone();
         self.with_conn(move |conn| {
@@ -808,6 +825,43 @@ impl Runtime {
             )?;
             let mut rows = stmt.query(params![user_id])?;
             rows.next()?.map(case_from_row).transpose()
+        })
+        .await
+    }
+
+    /// Same "reversal mutates action in place" property as
+    /// `find_active_network_ban`, but without its netban-membership join -
+    /// this is for the PM appeal bridge, which needs to see a ban in *any*
+    /// group, not just ones that opted into netban propagation. A user can
+    /// have independent active bans in several unrelated groups at once, so
+    /// this returns all of them rather than just the most recent.
+    async fn find_active_bans_for_user(&self, user_id: i64) -> Result<Vec<CaseRecord>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, action, chat_id, target_user_id, target_name, actor_user_id, actor_name, source_message_id, evidence_text, model_score, matched_rule_id, matched_rule_pattern, status, log_message_id, created_at
+                 FROM cases WHERE target_user_id = ?1 AND action IN ('auto_ban', 'spam_ban', 'report_approved')
+                 ORDER BY created_at DESC",
+            )?;
+            let mut rows = stmt.query(params![user_id])?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next()? {
+                out.push(case_from_row(row)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// "How many times has this person been banned" for the PM bridge's
+    /// `strike_count` field - counts bans that were later lifted too
+    /// (`unbanned`), since a strike is about history, not current status.
+    async fn count_ban_strikes_for_user(&self, user_id: i64) -> Result<i64> {
+        self.with_conn(move |conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM cases WHERE target_user_id = ?1 AND action IN ('auto_ban', 'spam_ban', 'report_approved', 'unbanned')",
+                params![user_id],
+                |row| row.get(0),
+            )?)
         })
         .await
     }
@@ -1234,6 +1288,25 @@ impl Runtime {
     async fn audit_log_chat(&self) -> Option<i64> {
         let audit_log_chat = self.audit_log_chat.lock().await;
         *audit_log_chat
+    }
+
+    async fn set_exchange_channel(&self, chat_id: i64) {
+        let _ = self
+            .with_conn(move |conn| {
+                conn.execute(
+                    "INSERT INTO model_meta (key, value) VALUES ('exchange_channel_id', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    params![chat_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .await;
+        let mut exchange_channel = self.exchange_channel.lock().await;
+        *exchange_channel = Some(chat_id);
+    }
+
+    async fn exchange_channel(&self) -> Option<i64> {
+        let exchange_channel = self.exchange_channel.lock().await;
+        *exchange_channel
     }
 
     async fn blacklist_reason_message_id(&self) -> Result<Option<i32>> {
@@ -1906,6 +1979,7 @@ enum ModerationCommand {
     Ping,
     SetAuditLog(String),
     Revert(String),
+    SetExchangeChannel(String),
     Unknown,
 }
 
@@ -1994,6 +2068,7 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/ping" => ModerationCommand::Ping,
         "/set_audit_log" => ModerationCommand::SetAuditLog(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/revert" => ModerationCommand::Revert(text.split_whitespace().nth(1).unwrap_or("").to_string()),
+        "/set_exchange_channel" => ModerationCommand::SetExchangeChannel(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         _ => ModerationCommand::Unknown,
     }
 }
@@ -2288,7 +2363,7 @@ fn help_text() -> String {
 }
 
 fn help_op_text() -> String {
-    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>（別名 <code>/mark_spam</code>）：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可。會解封並在找得到對應案例時一併移除錯誤訓練樣本並重建模型，若該案例曾透過 Netban 同步封禁到其他群組，也會一併在那些群組解封（群組管理員也能用 /unban，但僅解封本群、不影響訓練資料與其他群組）\n<code>/unmute</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可，並會撤銷對應案例（群組管理員也能用 /unmute，但僅解除本群禁言）\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat [chat_id]</code>：設定工作群組。不帶參數時直接綁定目前所在的群組；也可提供 chat_id 從其他地方設定。綁定後，若該群組串連的頻道發文時被 Telegram 自動釘選，機器人會自動取消釘選，避免洗掉手動釘選的訊息\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n<code>/ping</code>：確認機器人在線，並回報目前運行的版本號與 commit hash\n<code>/set_audit_log [chat_id]</code>：設定維護操作日誌頻道。不帶參數時綁定目前所在的群組/頻道。設定後，每個會改變狀態的維護指令（門檻、白名單、模組開關、規則異動、封禁/禁言等）都會記錄在這裡，並附上 action id\n<code>/revert &lt;action_id&gt;</code>：復原指定的維護操作，回到變更前的狀態；封禁/禁言類會重用 /unban、/unmute 的邏輯。少數沒有明確「復原前狀態」的操作無法自動復原，會直接告知\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
+    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>（別名 <code>/mark_spam</code>）：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可。會解封並在找得到對應案例時一併移除錯誤訓練樣本並重建模型，若該案例曾透過 Netban 同步封禁到其他群組，也會一併在那些群組解封（群組管理員也能用 /unban，但僅解封本群、不影響訓練資料與其他群組）\n<code>/unmute</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可，並會撤銷對應案例（群組管理員也能用 /unmute，但僅解除本群禁言）\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat [chat_id]</code>：設定工作群組。不帶參數時直接綁定目前所在的群組；也可提供 chat_id 從其他地方設定。綁定後，若該群組串連的頻道發文時被 Telegram 自動釘選，機器人會自動取消釘選，避免洗掉手動釘選的訊息\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n<code>/ping</code>：確認機器人在線，並回報目前運行的版本號與 commit hash\n<code>/set_audit_log [chat_id]</code>：設定維護操作日誌頻道。不帶參數時綁定目前所在的群組/頻道。設定後，每個會改變狀態的維護指令（門檻、白名單、模組開關、規則異動、封禁/禁言等）都會記錄在這裡，並附上 action id\n<code>/revert &lt;action_id&gt;</code>：復原指定的維護操作，回到變更前的狀態；封禁/禁言類會重用 /unban、/unmute 的邏輯。少數沒有明確「復原前狀態」的操作無法自動復原，會直接告知\n<code>/set_exchange_channel &lt;chat_id&gt;</code>：設定 PM 申訴機器人橋接用的交換頻道。設定後，機器人會回應 PM 透過該頻道發出的封禁查詢與解封請求，讓被封禁用戶能透過 PM 自助查詢並申訴\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
 }
 
 fn format_score_debug(report: &ScoreDebugReport) -> String {
@@ -3471,6 +3546,18 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             };
             runtime.set_audit_log_chat(value).await;
             bot.send_message(message.chat.id, format!("已設定維護操作日誌頻道為 <code>{value}</code>。之後每個會改變狀態的維護指令都會記錄在這裡，並附上可用於 /revert 的 action id。")).parse_mode(ParseMode::Html).await?;
+        }
+        ModerationCommand::SetExchangeChannel(chat_id) => {
+            require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以設定交換頻道。");
+            // No current-chat convenience here, unlike /setchat/-set_audit_log
+            // - this is a broadcast channel the bot posts into as an admin,
+            // not somewhere you'd naturally run a command from inside.
+            let Some(value) = chat_id.trim().parse::<i64>().ok() else {
+                bot.send_message(message.chat.id, "請提供有效的 Chat ID，例如 /set_exchange_channel -1001234567890。").await?;
+                return Ok(());
+            };
+            runtime.set_exchange_channel(value).await;
+            bot.send_message(message.chat.id, format!("已設定 PM 申訴橋接交換頻道為 <code>{value}</code>。")).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::Leave(reason) => {
             require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用 /leave。");
@@ -4824,6 +4911,202 @@ async fn ensure_bot_can_moderate(bot: &Bot, _runtime: &Runtime, chat_id: ChatId)
     Ok(allowed)
 }
 
+const EXCHANGE_SENDER_GBB: &str = "GBB";
+const EXCHANGE_SENDER_PM: &str = "PM";
+
+/// One "envelope" message on the shared SCP-079 exchange channel bus (see
+/// https://scp-079.org/exchange/ for the generic convention). PM, a separate
+/// ticket/appeal bot, posts these to ask "is this user banned, where, why"
+/// and to request an unban after a maintainer accepts an appeal in its own
+/// UI - GBB never talks to the appealing user directly, only answers PM.
+#[derive(Debug, Deserialize)]
+struct ExchangeEnvelope {
+    from: String,
+    #[serde(default)]
+    to: Vec<String>,
+    action: String,
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    data: serde_json::Value,
+}
+
+/// PM's sender wraps its JSON in a Markdown code block; GBB's own sends
+/// don't, but incoming text must tolerate either.
+fn parse_exchange_envelope(text: &str) -> Option<ExchangeEnvelope> {
+    let t = text.trim();
+    let t = t.strip_prefix("```json").or_else(|| t.strip_prefix("```")).map(str::trim_start).unwrap_or(t);
+    let t = t.strip_suffix("```").map(str::trim_end).unwrap_or(t);
+    serde_json::from_str(t).ok()
+}
+
+/// No `parse_mode` - plain text, so JSON's braces/quotes are never
+/// misinterpreted as Markdown/HTML.
+async fn send_exchange_message(bot: &Bot, chat: i64, action: &str, kind: &str, data: serde_json::Value) {
+    let text = serde_json::to_string_pretty(&serde_json::json!({
+        "from": EXCHANGE_SENDER_GBB,
+        "to": [EXCHANGE_SENDER_PM],
+        "action": action,
+        "type": kind,
+        "data": data,
+    }))
+    .unwrap_or_default();
+    let _ = bot.send_message(ChatId(chat), text).await;
+}
+
+async fn handle_exchange_query_bad(bot: &Bot, runtime: &Runtime, chat: i64, data: serde_json::Value) {
+    let Some(user_id) = data.get("id").and_then(|v| v.as_i64()) else { return };
+    let request_id = data.get("request_id").and_then(|v| v.as_str()).unwrap_or_default();
+    let banned = runtime.find_active_bans_for_user(user_id).await.map(|cases| !cases.is_empty()).unwrap_or(false);
+    let action = if banned { "add" } else { "remove" };
+    send_exchange_message(bot, chat, action, "bad", serde_json::json!({ "id": user_id, "request_id": request_id })).await;
+}
+
+async fn handle_exchange_query_bad_detail(bot: &Bot, runtime: &Runtime, chat: i64, data: serde_json::Value) {
+    let Some(user_id) = data.get("id").and_then(|v| v.as_i64()) else { return };
+    let request_id = data.get("request_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let cases = runtime.find_active_bans_for_user(user_id).await.unwrap_or_default();
+
+    let Some(case) = cases.first() else {
+        send_exchange_message(bot, chat, "report", "bad_detail", serde_json::json!({
+            "id": user_id,
+            "request_id": request_id,
+            "is_banned": false,
+        }))
+        .await;
+        return;
+    };
+
+    // GBB owns this taxonomy - PM never validates reason_code/ban_source/
+    // risk_level against any enum, it just stores and displays them (only
+    // reason_code is actually rendered).
+    let reason_code = case.action.as_str().to_uppercase();
+    let ban_source = match case.action.as_str() {
+        "auto_ban" => "auto",
+        "report_approved" => "report",
+        _ => "manual",
+    };
+    let risk_level = match case.model_score {
+        Some(score) if score >= 0.95 => "high",
+        Some(score) if score >= 0.85 => "medium",
+        Some(_) => "low",
+        None => "high",
+    };
+    let banned_by = match case.actor_user_id {
+        Some(id) => format!("admin:{id}"),
+        None => "system".to_string(),
+    };
+    let excerpt: String = case.evidence_text.chars().take(300).collect();
+    let chat_title = bot.get_chat(ChatId(case.chat_id)).await.ok().and_then(|c| c.title().map(str::to_string));
+    // "How many times has this person been banned" (including bans later
+    // lifted) - an unenforced field on PM's side, but the most natural
+    // reading of "strike count" for a moderation history.
+    let strike_count = runtime.count_ban_strikes_for_user(user_id).await.unwrap_or(0);
+
+    send_exchange_message(bot, chat, "report", "bad_detail", serde_json::json!({
+        "id": user_id,
+        "request_id": request_id,
+        "is_banned": true,
+        "ban_source": ban_source,
+        "reason_code": reason_code,
+        "reason_text": case.evidence_text,
+        "trigger_rule": case.matched_rule_pattern.clone().unwrap_or_default(),
+        "trigger_content_excerpt": excerpt,
+        "trigger_chat_id": case.chat_id,
+        "trigger_chat_title": chat_title,
+        "detected_at": case.created_at.to_rfc3339(),
+        "banned_at": case.created_at.to_rfc3339(),
+        "banned_by": banned_by,
+        "risk_level": risk_level,
+        "strike_count": strike_count,
+        "evidence_refs": [format!("case_id:{}", case.id), format!("chat_id:{}", case.chat_id)],
+        // PM's UI has zero enforcement on this field today - a no-op either way.
+        "can_auto_unban": true,
+    }))
+    .await;
+}
+
+async fn handle_exchange_request_unban(bot: &Bot, runtime: &Runtime, chat: i64, data: serde_json::Value) {
+    let Some(user_id) = data.get("id").and_then(|v| v.as_i64()) else { return };
+    let request_id = data.get("request_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    // Defensive defaults rather than rejecting outright - a legitimate
+    // request shouldn't be dropped just because an optional-looking field
+    // was missing.
+    let operator_id = data.get("operator_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let operator_name = data.get("operator_name").and_then(|v| v.as_str()).unwrap_or(EXCHANGE_SENDER_PM).to_string();
+
+    let cases = runtime.find_active_bans_for_user(user_id).await.unwrap_or_default();
+    if cases.is_empty() {
+        // Idempotent: the desired end state ("not banned") already holds, and
+        // PM has no retry path for a failed case, so erroring here would be
+        // more likely to strand an appeal than to help.
+        send_exchange_message(bot, chat, "result", "unban", serde_json::json!({
+            "id": user_id,
+            "request_id": request_id,
+            "success": true,
+            "message": "沒有找到有效的封禁記錄，視為已解封。",
+        }))
+        .await;
+        return;
+    }
+
+    // A user can have independent active bans in several unrelated groups -
+    // reverse all of them, attributing the reversal to the actual staff
+    // member who accepted the appeal in PM, not to "PM" or "GBB".
+    let mut reversed = Vec::new();
+    let mut errors = Vec::new();
+    for case in cases {
+        let case_id = case.id.clone();
+        match reverse_ban_case(bot, runtime, case, operator_id, &operator_name).await {
+            Ok(_) => reversed.push(case_id),
+            Err(err) => errors.push(format!("{case_id}: {err}")),
+        }
+    }
+
+    let success = errors.is_empty();
+    let summary = if success {
+        format!("PM 申訴解封成功，共解除 {} 個 case：{}", reversed.len(), reversed.join(", "))
+    } else {
+        format!("PM 申訴解封部分失敗。成功：{}；失敗：{}", reversed.join(", "), errors.join("; "))
+    };
+    // A new, less-visible trust boundary (an external bot triggering state
+    // change with no maintainer typing a command) - worth the audit-channel
+    // visibility even though a human-typed /unban doesn't bother. Not
+    // revertible: there's no "re-ban" mechanism.
+    log_maintainer_action(bot, runtime, operator_id, &operator_name, None, "PM 申訴解封", &summary, UndoData::NotRevertible).await;
+
+    send_exchange_message(bot, chat, "result", "unban", serde_json::json!({
+        "id": user_id,
+        "request_id": request_id,
+        "success": success,
+        "message": summary,
+    }))
+    .await;
+}
+
+async fn handle_exchange_post(bot: Bot, runtime: Arc<Runtime>, post: Message) -> ResponseResult<()> {
+    let Some(exchange_chat) = runtime.exchange_channel().await else { return Ok(()) };
+    if post.chat.id.0 != exchange_chat {
+        return Ok(());
+    }
+    let Some(text) = post.text() else { return Ok(()) };
+    let Some(envelope) = parse_exchange_envelope(text) else { return Ok(()) };
+    // The same channel may carry traffic for/from PM's other siblings
+    // (CLEAN, LONG, NOSPAM, ...) - anything not addressed to GBB from PM is
+    // silently ignored, not an error.
+    if envelope.from != EXCHANGE_SENDER_PM || !envelope.to.iter().any(|t| t == EXCHANGE_SENDER_GBB) {
+        return Ok(());
+    }
+
+    match (envelope.action.as_str(), envelope.kind.as_str()) {
+        ("query", "bad") => handle_exchange_query_bad(&bot, &runtime, exchange_chat, envelope.data).await,
+        ("query", "bad_detail") => handle_exchange_query_bad_detail(&bot, &runtime, exchange_chat, envelope.data).await,
+        ("request", "unban") => handle_exchange_request_unban(&bot, &runtime, exchange_chat, envelope.data).await,
+        _ => {}
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_env()?;
@@ -4926,12 +5209,21 @@ async fn main() -> Result<()> {
         }
     });
 
+    let exchange_handler = Update::filter_channel_post().endpoint({
+        let runtime = runtime.clone();
+        move |bot: Bot, post: Message| {
+            let runtime = runtime.clone();
+            async move { handle_exchange_post(bot, runtime, post).await }
+        }
+    });
+
     let handler = dptree::entry()
         .inspect(|u: teloxide::types::Update| {
             println!("=> [DISPATCHER RECEIVED UPDATE]: ID {:?}", u.id);
         })
         .branch(message_handler)
-        .branch(callback_handler);
+        .branch(callback_handler)
+        .branch(exchange_handler);
 
     let mut dispatcher = Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![runtime.clone(), runtime.config.clone()])
@@ -5200,6 +5492,70 @@ mod tests {
         case.action = ActionKind::Unbanned;
         runtime.persist_case(&case).await.unwrap();
         assert!(runtime.find_active_network_ban(200).await.unwrap().is_none());
+    }
+
+    // Backs the PM appeal bridge's "is this user banned anywhere, and
+    // where/why" query: unlike find_active_network_ban, this must see bans
+    // in every group, not just netban-participating ones, and return every
+    // independent active ban across distinct chats, not just the latest.
+    #[tokio::test]
+    async fn find_active_bans_for_user_spans_all_chats_without_netban() {
+        let runtime = test_runtime().await;
+        let case_a = dummy_case(ActionKind::AutoBan, 100, 200, Utc::now() - chrono::TimeDelta::hours(1));
+        let case_b = dummy_case(ActionKind::SpamBan, 300, 200, Utc::now());
+        let unrelated_user = dummy_case(ActionKind::AutoBan, 100, 999, Utc::now());
+        runtime.persist_case(&case_a).await.unwrap();
+        runtime.persist_case(&case_b).await.unwrap();
+        runtime.persist_case(&unrelated_user).await.unwrap();
+
+        let mut found: Vec<String> = runtime.find_active_bans_for_user(200).await.unwrap().into_iter().map(|c| c.id).collect();
+        found.sort();
+        let mut expected = vec![case_a.id.clone(), case_b.id.clone()];
+        expected.sort();
+        assert_eq!(found, expected);
+    }
+
+    #[tokio::test]
+    async fn find_active_bans_for_user_excludes_reversed_case() {
+        let runtime = test_runtime().await;
+        let mut case = dummy_case(ActionKind::AutoBan, 100, 200, Utc::now());
+        runtime.persist_case(&case).await.unwrap();
+        assert_eq!(runtime.find_active_bans_for_user(200).await.unwrap().len(), 1);
+
+        case.action = ActionKind::Unbanned;
+        runtime.persist_case(&case).await.unwrap();
+        assert!(runtime.find_active_bans_for_user(200).await.unwrap().is_empty());
+    }
+
+    // strike_count means "was ever banned," not "is currently banned" - it
+    // must count a since-reversed ban too, not just active ones.
+    #[tokio::test]
+    async fn count_ban_strikes_counts_active_and_reversed_bans() {
+        let runtime = test_runtime().await;
+        let active = dummy_case(ActionKind::AutoBan, 100, 200, Utc::now());
+        runtime.persist_case(&active).await.unwrap();
+        let mut reversed = dummy_case(ActionKind::SpamBan, 300, 200, Utc::now());
+        runtime.persist_case(&reversed).await.unwrap();
+        reversed.action = ActionKind::Unbanned;
+        runtime.persist_case(&reversed).await.unwrap();
+
+        assert_eq!(runtime.count_ban_strikes_for_user(200).await.unwrap(), 2);
+        assert_eq!(runtime.count_ban_strikes_for_user(999).await.unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_exchange_envelope_accepts_plain_and_code_fenced_json() {
+        let plain = r#"{"from":"PM","to":["GBB"],"action":"query","type":"bad","data":{"id":1}}"#;
+        let envelope = parse_exchange_envelope(plain).expect("plain JSON should parse");
+        assert_eq!(envelope.from, "PM");
+        assert_eq!(envelope.action, "query");
+        assert_eq!(envelope.kind, "bad");
+
+        let fenced = format!("```json\n{plain}\n```");
+        let envelope = parse_exchange_envelope(&fenced).expect("code-fenced JSON should parse");
+        assert_eq!(envelope.from, "PM");
+
+        assert!(parse_exchange_envelope("not json at all").is_none());
     }
 
     // Backs /unban's ability to reverse a propagated ban everywhere it
