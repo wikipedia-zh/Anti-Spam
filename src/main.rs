@@ -22,6 +22,10 @@ struct Config {
     data_dir: PathBuf,
     sqlite_path: PathBuf,
     spam_threshold: f64,
+    // Optional: if set, a "bot is up" DM (with version/commit) is sent here
+    // on every startup. Env-configured rather than hardcoded so a personal
+    // Telegram user ID never ends up committed to source control.
+    owner_id: Option<i64>,
 }
 
 impl Config {
@@ -45,6 +49,7 @@ impl Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.85);
+        let owner_id = env::var("OWNER_ID").ok().and_then(|v| v.parse::<i64>().ok());
         Ok(Self {
             bot_token,
             log_channel_id,
@@ -54,6 +59,7 @@ impl Config {
             data_dir: PathBuf::from(data_dir),
             sqlite_path: PathBuf::from(sqlite_path),
             spam_threshold,
+            owner_id,
         })
     }
 }
@@ -1718,6 +1724,7 @@ enum ModerationCommand {
     Check(String),
     Unban(String),
     Unmute(String),
+    Ping,
     Unknown,
 }
 
@@ -1803,6 +1810,7 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/check" => ModerationCommand::Check(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
         "/unban" => ModerationCommand::Unban(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/unmute" => ModerationCommand::Unmute(text.split_whitespace().nth(1).unwrap_or("").to_string()),
+        "/ping" => ModerationCommand::Ping,
         _ => ModerationCommand::Unknown,
     }
 }
@@ -2080,12 +2088,24 @@ fn import_train_payloads(input: &str) -> Vec<String> {
     out
 }
 
+/// Commit hash embedded at compile time by build.rs (falls back to
+/// "unknown" if `.git` wasn't available in the build environment).
+const GIT_HASH: &str = env!("GIT_HASH");
+
+fn version_info_text() -> String {
+    format!(
+        "🏓 Pong！Bot 已啟動並運作中。\n<b>Version</b>: <code>{}</code>\n<b>Commit</b>: <code>{}</code>",
+        env!("CARGO_PKG_VERSION"),
+        GIT_HASH,
+    )
+}
+
 fn help_text() -> String {
     "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n<code>/white</code>：加入本群白名單\n<code>/white -global</code>：加入全域白名單\n<code>/unwhite</code>：移出本群白名單\n<code>/unwhite -global</code>：移出全域白名單\n\n<b>群組管理員可用</b>\n<code>/module &lt;名稱&gt; &lt;on/off&gt;</code>：切換群組模組，名稱支援 NoLongName（英名檢查）/ NoHalal（清真檢查）/ NoSM（服務訊息刪除）/ Flood（洗版偵測，預設開啟）/ Captcha（新成員驗證，預設關閉）/ Netban（跨群組黑名單同步，預設關閉，需自行開啟；開啟後本群的封禁會同步到其他同樣開啟的群組，反之亦然）/ CmdClean（指令權限濫用防護，預設關閉；開啟後，沒有權限的人嘗試使用管理指令會被刪除訊息並警告一次，24 小時內再犯將被禁言 5 分鐘並記錄到日誌頻道。無論是否開啟，此類指令的錯誤提示訊息都會在 10 秒後自動刪除，減少洗版）\n<code>/unban</code>：回覆要解封的用戶、或提供 user_id，解封本群該用戶（僅本群，不影響訓練資料，如需連同撤銷誤判樣本請找維護組）\n<code>/unmute</code>：回覆要解除禁言的用戶、或提供 user_id\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n".to_string()
 }
 
 fn help_op_text() -> String {
-    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可。會解封並在找得到對應案例時一併移除錯誤訓練樣本並重建模型，若該案例曾透過 Netban 同步封禁到其他群組，也會一併在那些群組解封（群組管理員也能用 /unban，但僅解封本群、不影響訓練資料與其他群組）\n<code>/unmute</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可，並會撤銷對應案例（群組管理員也能用 /unmute，但僅解除本群禁言）\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat [chat_id]</code>：設定工作群組。不帶參數時直接綁定目前所在的群組；也可提供 chat_id 從其他地方設定。綁定後，若該群組串連的頻道發文時被 Telegram 自動釘選，機器人會自動取消釘選，避免洗掉手動釘選的訊息\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
+    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可。會解封並在找得到對應案例時一併移除錯誤訓練樣本並重建模型，若該案例曾透過 Netban 同步封禁到其他群組，也會一併在那些群組解封（群組管理員也能用 /unban，但僅解封本群、不影響訓練資料與其他群組）\n<code>/unmute</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可，並會撤銷對應案例（群組管理員也能用 /unmute，但僅解除本群禁言）\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat [chat_id]</code>：設定工作群組。不帶參數時直接綁定目前所在的群組；也可提供 chat_id 從其他地方設定。綁定後，若該群組串連的頻道發文時被 Telegram 自動釘選，機器人會自動取消釘選，避免洗掉手動釘選的訊息\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n<code>/ping</code>：確認機器人在線，並回報目前運行的版本號與 commit hash\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
 }
 
 fn format_score_debug(report: &ScoreDebugReport) -> String {
@@ -4077,6 +4097,10 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             notify_group(&bot, &runtime, &case, log_message_id, "<b>已解除禁言</b>").await.ok();
             bot.send_message(message.chat.id, format!("已解除禁言，並撤銷 case <code>{}</code>。", case.id)).parse_mode(ParseMode::Html).await?;
         }
+        ModerationCommand::Ping => {
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
+            bot.send_message(message.chat.id, version_info_text()).parse_mode(ParseMode::Html).await?;
+        }
         ModerationCommand::Unknown => {
             if message.chat.is_private() {
                 if let Some(pattern) = runtime.pending_rule_addition(from_id).await {
@@ -4348,6 +4372,14 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     let bot = Bot::new(config.bot_token.clone());
     let runtime = Arc::new(Runtime::load(config).await?);
+
+    if let Some(owner_id) = runtime.config.owner_id {
+        // Best-effort: a restart is exactly when this is most useful, but it
+        // shouldn't block (or fail) startup if the DM can't be delivered -
+        // e.g. the owner never having started a chat with the bot.
+        let _ = bot.send_message(ChatId(owner_id), version_info_text()).parse_mode(ParseMode::Html).await;
+    }
+
     let message_handler = Update::filter_message().endpoint({
         let runtime = runtime.clone();
         move |bot: Bot, message: Message| {
@@ -4469,6 +4501,7 @@ mod tests {
             data_dir: dir.clone(),
             sqlite_path: dir.join("bot.db"),
             spam_threshold: 0.85,
+            owner_id: None,
         };
         tokio::fs::create_dir_all(&dir).await.unwrap();
         Runtime::load(config).await.unwrap()
@@ -4540,6 +4573,7 @@ mod tests {
             data_dir: dir.clone(),
             sqlite_path: db_path.clone(),
             spam_threshold: 0.85,
+            owner_id: None,
         };
         let runtime = Runtime::load(config).await.unwrap();
 

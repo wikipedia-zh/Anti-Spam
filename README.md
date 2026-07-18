@@ -37,6 +37,7 @@ Set the following environment variables before running:
 | `MAINTAINER_IDS` | Comma-separated User IDs allowed to manage the model. |
 | `SQLITE_PATH` | Path to the SQLite database (default: `data/bot.db`). |
 | `SPAM_THRESHOLD` | Score threshold for auto-ban (default: `0.85`). |
+| `OWNER_ID` | Optional. Telegram user ID to DM a "bot is up" ping (with version + commit hash) to on every startup. |
 
 ## Quick Start
 
@@ -100,6 +101,7 @@ Set the following environment variables before running:
 | `MAINTAINER_IDS` | 維護人員 User ID (多個以逗號分隔)。 |
 | `SQLITE_PATH` | 資料庫路徑 (預設 `data/bot.db`)。 |
 | `SPAM_THRESHOLD` | 自動封禁門檻 (預設 `0.85`)。 |
+| `OWNER_ID` | 選填。設定後每次啟動都會私訊這個 Telegram User ID，回報機器人已啟動、版本號與 commit hash。 |
 
 ## 快速啟動
 
