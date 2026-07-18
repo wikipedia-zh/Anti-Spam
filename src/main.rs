@@ -71,6 +71,7 @@ enum ActionKind {
     Unbanned,
     Unmuted,
     FloodMute,
+    CmdCleanMute,
 }
 
 impl ActionKind {
@@ -87,6 +88,7 @@ impl ActionKind {
             ActionKind::Unbanned => "unbanned",
             ActionKind::Unmuted => "unmuted",
             ActionKind::FloodMute => "flood_mute",
+            ActionKind::CmdCleanMute => "cmd_clean_mute",
         }
     }
 
@@ -103,6 +105,7 @@ impl ActionKind {
             "unbanned" => ActionKind::Unbanned,
             "unmuted" => ActionKind::Unmuted,
             "flood_mute" => ActionKind::FloodMute,
+            "cmd_clean_mute" => ActionKind::CmdCleanMute,
             _ => ActionKind::AutoBan,
         }
     }
@@ -207,6 +210,10 @@ struct GroupModuleSettings {
     // decision made in a *different* group (outside this group admin's
     // control) can ban someone here too.
     netban: bool,
+    // Escalates repeat permission-denied command attempts to a temporary
+    // mute; opt-in since it's a real moderation consequence for members,
+    // not just cleanup.
+    cmd_clean: bool,
 }
 
 impl Default for GroupModuleSettings {
@@ -219,6 +226,7 @@ impl Default for GroupModuleSettings {
             captcha: false,
             spam_threshold_override: None,
             netban: false,
+            cmd_clean: false,
         }
     }
 }
@@ -415,6 +423,9 @@ impl Runtime {
         if user_version < 4 {
             Self::migrate_v3_to_v4(conn)?;
         }
+        if user_version < 5 {
+            Self::migrate_v4_to_v5(conn)?;
+        }
         Ok(())
     }
 
@@ -458,6 +469,29 @@ impl Runtime {
             [],
         )?;
         tx.execute("PRAGMA user_version = 4", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Adds the `cmd_clean` opt-in flag and `permission_offenses`, which
+    /// tracks the last time each (chat, user) tripped a permission-denied
+    /// guard on a group-admin-tier command - used to detect a repeat offense
+    /// within 24h and escalate to a temporary mute.
+    fn migrate_v4_to_v5(conn: &mut Connection) -> Result<()> {
+        let tx = conn.transaction()?;
+        tx.execute("ALTER TABLE group_module_settings ADD COLUMN cmd_clean INTEGER NOT NULL DEFAULT 0", [])?;
+        tx.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS permission_offenses (
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                last_offense_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, user_id)
+            )
+            "#,
+            [],
+        )?;
+        tx.execute("PRAGMA user_version = 5", [])?;
         tx.commit()?;
         Ok(())
     }
@@ -717,6 +751,37 @@ impl Runtime {
         let case_id = case_id.to_string();
         self.with_conn(move |conn| {
             conn.execute("DELETE FROM network_ban_targets WHERE case_id = ?1", params![case_id])?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Last time (chat_id, user_id) tripped a permission-denied guard on a
+    /// group-admin-tier command, if ever - used by the CmdClean module to
+    /// detect a repeat offense within 24h.
+    async fn last_permission_offense(&self, chat_id: i64, user_id: i64) -> Result<Option<DateTime<Utc>>> {
+        self.with_conn(move |conn| {
+            let value: Option<String> = conn
+                .query_row(
+                    "SELECT last_offense_at FROM permission_offenses WHERE chat_id = ?1 AND user_id = ?2",
+                    params![chat_id, user_id],
+                    |row| row.get(0),
+                )
+                .ok();
+            Ok(match value {
+                Some(v) => Some(DateTime::parse_from_rfc3339(&v)?.with_timezone(&Utc)),
+                None => None,
+            })
+        })
+        .await
+    }
+
+    async fn record_permission_offense(&self, chat_id: i64, user_id: i64) -> Result<()> {
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO permission_offenses (chat_id, user_id, last_offense_at) VALUES (?1, ?2, ?3) ON CONFLICT(chat_id, user_id) DO UPDATE SET last_offense_at = excluded.last_offense_at",
+                params![chat_id, user_id, Utc::now().to_rfc3339()],
+            )?;
             Ok(())
         })
         .await
@@ -1322,7 +1387,7 @@ impl Runtime {
                     "INSERT OR IGNORE INTO group_module_settings (chat_id) VALUES (?1)",
                     params![chat_id],
                 )?;
-                let mut stmt = conn.prepare("SELECT no_long_name, no_halal, no_service_messages, flood_control, captcha, spam_threshold_override, netban FROM group_module_settings WHERE chat_id = ?1")?;
+                let mut stmt = conn.prepare("SELECT no_long_name, no_halal, no_service_messages, flood_control, captcha, spam_threshold_override, netban, cmd_clean FROM group_module_settings WHERE chat_id = ?1")?;
                 let mut rows = stmt.query(params![chat_id])?;
                 if let Some(row) = rows.next()? {
                     Ok(GroupModuleSettings {
@@ -1333,6 +1398,7 @@ impl Runtime {
                         captcha: row.get::<_, i64>(4)? != 0,
                         spam_threshold_override: row.get::<_, Option<f64>>(5)?,
                         netban: row.get::<_, i64>(6)? != 0,
+                        cmd_clean: row.get::<_, i64>(7)? != 0,
                     })
                 } else {
                     Ok(GroupModuleSettings::default())
@@ -1384,6 +1450,12 @@ impl Runtime {
             "netban" => {
                 conn.execute(
                     "UPDATE group_module_settings SET netban = ?2 WHERE chat_id = ?1",
+                    params![chat_id, if enabled { 1 } else { 0 }],
+                )?;
+            }
+            "cmdclean" => {
+                conn.execute(
+                    "UPDATE group_module_settings SET cmd_clean = ?2 WHERE chat_id = ?1",
                     params![chat_id, if enabled { 1 } else { 0 }],
                 )?;
             }
@@ -2009,7 +2081,7 @@ fn import_train_payloads(input: &str) -> Vec<String> {
 }
 
 fn help_text() -> String {
-    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n<code>/white</code>：加入本群白名單\n<code>/white -global</code>：加入全域白名單\n<code>/unwhite</code>：移出本群白名單\n<code>/unwhite -global</code>：移出全域白名單\n\n<b>群組管理員可用</b>\n<code>/module &lt;名稱&gt; &lt;on/off&gt;</code>：切換群組模組，名稱支援 NoLongName（英名檢查）/ NoHalal（清真檢查）/ NoSM（服務訊息刪除）/ Flood（洗版偵測，預設開啟）/ Captcha（新成員驗證，預設關閉）/ Netban（跨群組黑名單同步，預設關閉，需自行開啟；開啟後本群的封禁會同步到其他同樣開啟的群組，反之亦然）\n<code>/unban</code>：回覆要解封的用戶、或提供 user_id，解封本群該用戶（僅本群，不影響訓練資料，如需連同撤銷誤判樣本請找維護組）\n<code>/unmute</code>：回覆要解除禁言的用戶、或提供 user_id\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n".to_string()
+    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n<code>/white</code>：加入本群白名單\n<code>/white -global</code>：加入全域白名單\n<code>/unwhite</code>：移出本群白名單\n<code>/unwhite -global</code>：移出全域白名單\n\n<b>群組管理員可用</b>\n<code>/module &lt;名稱&gt; &lt;on/off&gt;</code>：切換群組模組，名稱支援 NoLongName（英名檢查）/ NoHalal（清真檢查）/ NoSM（服務訊息刪除）/ Flood（洗版偵測，預設開啟）/ Captcha（新成員驗證，預設關閉）/ Netban（跨群組黑名單同步，預設關閉，需自行開啟；開啟後本群的封禁會同步到其他同樣開啟的群組，反之亦然）/ CmdClean（指令權限濫用防護，預設關閉；開啟後，沒有權限的人嘗試使用管理指令會被刪除訊息並警告一次，24 小時內再犯將被禁言 5 分鐘並記錄到日誌頻道。無論是否開啟，此類指令的錯誤提示訊息都會在 10 秒後自動刪除，減少洗版）\n<code>/unban</code>：回覆要解封的用戶、或提供 user_id，解封本群該用戶（僅本群，不影響訓練資料，如需連同撤銷誤判樣本請找維護組）\n<code>/unmute</code>：回覆要解除禁言的用戶、或提供 user_id\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n".to_string()
 }
 
 fn help_op_text() -> String {
@@ -2065,6 +2137,7 @@ fn chinese_case_action(case: &CaseRecord) -> String {
             ActionKind::Unbanned => "已撤銷封禁".to_string(),
             ActionKind::Unmuted => "已解除禁言".to_string(),
             ActionKind::FloodMute => "洗版禁言".to_string(),
+            ActionKind::CmdCleanMute => "指令濫用禁言".to_string(),
         }
     }
 }
@@ -2522,6 +2595,91 @@ async fn kick_user(bot: &Bot, chat_id: ChatId, user_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Sends a plain-text reply and, only in group/supergroup chats, schedules
+/// it for deletion after 10s - same delayed-cleanup pattern as
+/// `notify_group`'s auto-delete and the CAPTCHA success message. Used for
+/// "you used this command wrong" replies, which are transient noise that
+/// shouldn't linger in a group's history - this runs regardless of the
+/// CmdClean module below, since it's just clutter reduction, not a
+/// moderation consequence.
+async fn reply_ephemeral(bot: &Bot, message: &Message, text: impl Into<String>) -> ResponseResult<()> {
+    let sent = bot.send_message(message.chat.id, text.into()).await?;
+    if message.chat.is_group() || message.chat.is_supergroup() {
+        let bot = bot.clone();
+        let chat_id = message.chat.id;
+        let message_id = sent.id;
+        tokio::spawn(async move {
+            sleep(Duration::from_secs(10)).await;
+            let _ = bot.delete_message(chat_id, message_id).await;
+        });
+    }
+    Ok(())
+}
+
+/// Restores full permissions after `after` - a temporary mute that lifts
+/// itself, same shape as the CAPTCHA timeout task and `notify_group`'s
+/// auto-delete. Best-effort: doesn't check whether the user was already
+/// unmuted for some other reason in between, consistent with every other
+/// delayed task in this file.
+fn schedule_temp_unmute(bot: &Bot, chat_id: ChatId, user_id: i64, after: Duration) {
+    let bot = bot.clone();
+    tokio::spawn(async move {
+        sleep(after).await;
+        let _ = bot.restrict_chat_member(chat_id, UserId(user_id as u64), teloxide::types::ChatPermissions::all()).await;
+    });
+}
+
+/// Shared handler for every "only a group admin / maintainer can do this"
+/// rejection on a group-facing command. With CmdClean off, this is just
+/// `reply_ephemeral` - the rejection self-deletes but nothing else happens
+/// (today's behavior, just less cluttered). With CmdClean on: the offending
+/// command message is deleted outright, and a repeat attempt within 24h of
+/// the last one escalates to a 5-minute mute, logged like any other case.
+async fn handle_permission_denied(bot: &Bot, runtime: &Runtime, message: &Message, from: &teloxide::types::User, denial_text: &str) -> ResponseResult<()> {
+    let chat_id = message.chat.id.0;
+    let settings = runtime.get_group_modules(chat_id).await.unwrap_or_default();
+    if !settings.cmd_clean {
+        return reply_ephemeral(bot, message, denial_text).await;
+    }
+
+    let _ = bot.delete_message(message.chat.id, message.id).await;
+    let user_id = from.id.0 as i64;
+    let prior = runtime.last_permission_offense(chat_id, user_id).await.ok().flatten();
+    let _ = runtime.record_permission_offense(chat_id, user_id).await;
+
+    let repeat_within_24h = prior.map(|t| Utc::now() - t < chrono::TimeDelta::hours(24)).unwrap_or(false);
+
+    if repeat_within_24h {
+        let _ = mute_user(bot, message.chat.id, user_id).await;
+        schedule_temp_unmute(bot, message.chat.id, user_id, Duration::from_secs(5 * 60));
+        let case = CaseRecord {
+            id: Uuid::new_v4().to_string(),
+            action: ActionKind::CmdCleanMute,
+            chat_id,
+            target_user_id: user_id,
+            target_name: short_user(from),
+            actor_user_id: None,
+            actor_name: None,
+            source_message_id: Some(message.id.0),
+            evidence_text: message.text().or(message.caption()).unwrap_or("").to_string(),
+            model_score: None,
+            matched_rule_id: None,
+            matched_rule_pattern: Some("PERM_REPEAT".to_string()),
+            status: "auto_muted".to_string(),
+            log_message_id: None,
+            created_at: Utc::now(),
+        };
+        let log_message_id = log_action(bot, runtime, &case).await.unwrap_or_default();
+        let mut updated = case.clone();
+        updated.log_message_id = Some(log_message_id);
+        let _ = store_case(runtime, &updated).await;
+        let _ = notify_group(bot, runtime, &updated, log_message_id, "<b>指令權限濫用禁言</b>").await;
+    } else {
+        let _ = reply_ephemeral(bot, message, "⚠️ 你沒有權限使用此指令，訊息已刪除。24 小時內再次嘗試將被禁言 5 分鐘。").await;
+    }
+    Ok(())
+}
+
 async fn train_spam(runtime: &Runtime, text: &str, case_id: Option<&str>) -> Result<()> {
     let tokens = tokenize(text);
     {
@@ -2968,17 +3126,17 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         }
         ModerationCommand::SpamBan | ModerationCommand::Mute | ModerationCommand::Kick => {
             let Some((target_id, target_name, source_id, evidence_text)) = extract_reply_context(&message).await else {
-                bot.send_message(message.chat.id, "請回覆一條訊息後再使用此指令。").await?;
+                reply_ephemeral(&bot, &message, "請回覆一條訊息後再使用此指令。").await?;
                 return Ok(());
             };
 
             if !is_group_admin(&bot, message.chat.id, from_id).await {
-                bot.send_message(message.chat.id, "只有群組管理員可以執行此指令。").await?;
+                handle_permission_denied(&bot, &runtime, &message, from, "只有群組管理員可以執行此指令。").await?;
                 return Ok(());
             }
 
             if is_group_admin(&bot, message.chat.id, target_id).await || is_special_user(&runtime.config, target_id) {
-                bot.send_message(message.chat.id, "不能對群組管理員或項目維護人員執行此指令。").await?;
+                reply_ephemeral(&bot, &message, "不能對群組管理員或項目維護人員執行此指令。").await?;
                 return Ok(());
             }
 
@@ -3035,7 +3193,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         }
         ModerationCommand::SpamReport => {
             let Some((target_id, target_name, source_id, evidence_text)) = extract_reply_context(&message).await else {
-                bot.send_message(message.chat.id, "請回覆一條疑似 spam 的訊息。").await?;
+                reply_ephemeral(&bot, &message, "請回覆一條疑似 spam 的訊息。").await?;
                 return Ok(());
             };
 
@@ -3290,11 +3448,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         }
         ModerationCommand::Module(module, state) => {
             if !message.chat.is_group() && !message.chat.is_supergroup() {
-                bot.send_message(message.chat.id, "請在群組中使用 /module。") .await?;
+                reply_ephemeral(&bot, &message, "請在群組中使用 /module。").await?;
                 return Ok(());
             }
             if !is_group_admin(&bot, message.chat.id, from_id).await {
-                bot.send_message(message.chat.id, "只有群組管理員可以設定模組。") .await?;
+                handle_permission_denied(&bot, &runtime, &message, from, "只有群組管理員可以設定模組。").await?;
                 return Ok(());
             }
             let enabled = matches!(state.to_lowercase().as_str(), "on" | "enable" | "enabled");
@@ -3306,8 +3464,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 "flood" => { runtime.set_group_module(message.chat.id.0, "flood", enabled).await.ok(); }
                 "captcha" => { runtime.set_group_module(message.chat.id.0, "captcha", enabled).await.ok(); }
                 "netban" => { runtime.set_group_module(message.chat.id.0, "netban", enabled).await.ok(); }
+                "cmdclean" => { runtime.set_group_module(message.chat.id.0, "cmdclean", enabled).await.ok(); }
                 _ => {
-                    bot.send_message(message.chat.id, "模組名稱僅支援 NoLongName / NoHalal / NoSM / Flood / Captcha / Netban。") .await?;
+                    reply_ephemeral(&bot, &message, "模組名稱僅支援 NoLongName / NoHalal / NoSM / Flood / Captcha / Netban / CmdClean。").await?;
                     return Ok(());
                 }
             }
@@ -3315,15 +3474,15 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         }
         ModerationCommand::White(target) => {
             if !message.chat.is_group() && !message.chat.is_supergroup() {
-                bot.send_message(message.chat.id, "請在群組中使用 /white。") .await?;
+                reply_ephemeral(&bot, &message, "請在群組中使用 /white。").await?;
                 return Ok(());
             }
             if !is_group_admin(&bot, message.chat.id, from_id).await {
-                bot.send_message(message.chat.id, "只有群組管理員可以設定白名單。") .await?;
+                handle_permission_denied(&bot, &runtime, &message, from, "只有群組管理員可以設定白名單。").await?;
                 return Ok(());
             }
             let Some(user_id) = target.parse::<i64>().ok().or_else(|| message.reply_to_message().and_then(|m| m.from.as_ref()).map(|u| u.id.0 as i64)) else {
-                bot.send_message(message.chat.id, "請提供 userid 或回覆一位用戶。") .await?;
+                reply_ephemeral(&bot, &message, "請提供 userid 或回覆一位用戶。").await?;
                 return Ok(());
             };
             runtime.set_group_whitelist(message.chat.id.0, user_id, true, Some(from_id)).await.ok();
@@ -3346,15 +3505,15 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         }
         ModerationCommand::Unwhite(target) => {
             if !message.chat.is_group() && !message.chat.is_supergroup() {
-                bot.send_message(message.chat.id, "請在群組中使用 /unwhite。") .await?;
+                reply_ephemeral(&bot, &message, "請在群組中使用 /unwhite。").await?;
                 return Ok(());
             }
             if !is_group_admin(&bot, message.chat.id, from_id).await {
-                bot.send_message(message.chat.id, "只有群組管理員可以設定白名單。") .await?;
+                handle_permission_denied(&bot, &runtime, &message, from, "只有群組管理員可以設定白名單。").await?;
                 return Ok(());
             }
             let Some(user_id) = target.parse::<i64>().ok().or_else(|| message.reply_to_message().and_then(|m| m.from.as_ref()).map(|u| u.id.0 as i64)) else {
-                bot.send_message(message.chat.id, "請提供 userid 或回覆一位用戶。") .await?;
+                reply_ephemeral(&bot, &message, "請提供 userid 或回覆一位用戶。").await?;
                 return Ok(());
             };
             runtime.set_group_whitelist(message.chat.id.0, user_id, false, Some(from_id)).await.ok();
@@ -3377,7 +3536,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         }
         ModerationCommand::Check(target) => {
             if !message.chat.is_group() && !message.chat.is_supergroup() {
-                bot.send_message(message.chat.id, "請在群組中使用 /check。") .await?;
+                reply_ephemeral(&bot, &message, "請在群組中使用 /check。").await?;
                 return Ok(());
             }
             let Some(target_msg) = message.reply_to_message() else {
@@ -3426,7 +3585,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                         }
                     }
                 }
-                bot.send_message(message.chat.id, "請回覆一位用戶後再使用 /check。") .await?;
+                reply_ephemeral(&bot, &message, "請回覆一位用戶後再使用 /check。").await?;
                 return Ok(());
             };
             let Some(user) = target_msg.from.as_ref() else {
@@ -3668,7 +3827,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let is_admin_user = (message.chat.is_group() || message.chat.is_supergroup())
                 && is_group_admin(&bot, message.chat.id, from_id).await;
             if !is_maintainer_user && !is_admin_user {
-                bot.send_message(message.chat.id, "只有群組管理員或項目維護組可以使用此指令。").await?;
+                handle_permission_denied(&bot, &runtime, &message, from, "只有群組管理員或項目維護組可以使用此指令。").await?;
                 return Ok(());
             }
 
@@ -3685,7 +3844,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     arg.trim().parse::<i64>().ok()
                 };
                 let Some(target_user_id) = target_user_id else {
-                    bot.send_message(message.chat.id, "請回覆要解封的用戶，或提供 user_id。").await?;
+                    reply_ephemeral(&bot, &message, "請回覆要解封的用戶，或提供 user_id。").await?;
                     return Ok(());
                 };
                 if let Err(err) = bot.unban_chat_member(message.chat.id, UserId(target_user_id as u64)).await {
@@ -3797,7 +3956,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let is_admin_user = (message.chat.is_group() || message.chat.is_supergroup())
                 && is_group_admin(&bot, message.chat.id, from_id).await;
             if !is_maintainer_user && !is_admin_user {
-                bot.send_message(message.chat.id, "只有群組管理員或項目維護組可以使用此指令。").await?;
+                handle_permission_denied(&bot, &runtime, &message, from, "只有群組管理員或項目維護組可以使用此指令。").await?;
                 return Ok(());
             }
 
@@ -3811,7 +3970,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     arg.trim().parse::<i64>().ok()
                 };
                 let Some(target_user_id) = target_user_id else {
-                    bot.send_message(message.chat.id, "請回覆要解除禁言的用戶，或提供 user_id。").await?;
+                    reply_ephemeral(&bot, &message, "請回覆要解除禁言的用戶，或提供 user_id。").await?;
                     return Ok(());
                 };
                 if let Err(err) = bot.restrict_chat_member(message.chat.id, UserId(target_user_id as u64), teloxide::types::ChatPermissions::all()).await {
@@ -4546,5 +4705,40 @@ mod tests {
         runtime.set_group_module(100, "netban", false).await.unwrap();
         let chats = runtime.list_netban_enabled_chats().await.unwrap();
         assert_eq!(chats, vec![200]);
+    }
+
+    // Backs CmdClean's repeat-offense detection: a fresh (chat, user) has no
+    // recorded offense, and recording one makes it show up as "just now".
+    #[tokio::test]
+    async fn permission_offense_round_trip() {
+        let runtime = test_runtime().await;
+        assert!(runtime.last_permission_offense(100, 200).await.unwrap().is_none());
+
+        let before = Utc::now();
+        runtime.record_permission_offense(100, 200).await.unwrap();
+        let recorded = runtime.last_permission_offense(100, 200).await.unwrap().unwrap();
+        assert!(recorded >= before - chrono::TimeDelta::seconds(2));
+
+        // A different user in the same chat, and the same user in a
+        // different chat, must not see each other's offenses.
+        assert!(runtime.last_permission_offense(100, 999).await.unwrap().is_none());
+        assert!(runtime.last_permission_offense(999, 200).await.unwrap().is_none());
+    }
+
+    // handle_permission_denied's escalation decision is "was the last
+    // offense within 24h" - this confirms recording an offense always
+    // updates to the latest timestamp (not just the first), which is what
+    // that comparison relies on to correctly track a rolling window.
+    #[tokio::test]
+    async fn permission_offense_updates_to_latest_on_repeat() {
+        let runtime = test_runtime().await;
+        runtime.record_permission_offense(100, 200).await.unwrap();
+        let first = runtime.last_permission_offense(100, 200).await.unwrap().unwrap();
+
+        sleep(Duration::from_millis(10)).await;
+        runtime.record_permission_offense(100, 200).await.unwrap();
+        let second = runtime.last_permission_offense(100, 200).await.unwrap().unwrap();
+
+        assert!(second >= first);
     }
 }
