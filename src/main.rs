@@ -2191,7 +2191,7 @@ fn global_whitelist_check_text() -> String {
 }
 
 fn build_blacklist_reason_text(_runtime: &Runtime) -> String {
-    "<b>❖ 封禁代號說明</b>\n\n- <code>NLDIGIT</code>: 英名含數字\n- <code>NL13</code>: 英名多段且總長度 >= 13\n- <code>NLTAIL</code>: 英名多段且尾段過長\n- <code>NLSINGLE</code>: 英名單段且長度 >= 11\n- <code>ARABIC</code>: 偵測到清真\n- <code>REGEX</code>: 觸發正則規則\n\n申訴找 @SEELE_01_BOT".to_string()
+    "<b>❖ 封禁代號說明</b>\n\n- <code>NLDIGIT</code>: 英名含數字\n- <code>NL13</code>: 英名多段且總長度 >= 13\n- <code>NLTAIL</code>: 英名多段且尾段過長\n- <code>NLSINGLE</code>: 英名單段且長度 >= 11\n- <code>ARABIC</code>: 偵測到清真\n- <code>REGEX</code>: 觸發正則規則\n- <code>FLOOD</code>: 洗版偵測（5 秒內傳送 5 條以上訊息）\n- <code>PERM_REPEAT</code>: 24 小時內重複嘗試使用無權限的指令\n\n申訴找 @SEELE_01_BOT".to_string()
 }
 
 fn format_case_lookup(case: &CaseRecord, link: &str, reason_link: &str) -> String {
