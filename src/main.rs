@@ -2609,6 +2609,21 @@ async fn mute_user(bot: &Bot, chat_id: ChatId, user_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Like `mute_user`, but sets Telegram's own `until_date` so the restriction
+/// expires on Telegram's side regardless of whether this process is still
+/// running - unlike relying purely on a `tokio::spawn` timer (see
+/// `schedule_temp_unmute`), which silently never fires if the bot restarts
+/// during the window, leaving the mute permanent. Telegram treats anything
+/// under 30 seconds from now as "forever", so this only makes sense for
+/// durations meaningfully longer than that.
+async fn mute_user_until(bot: &Bot, chat_id: ChatId, user_id: i64, until: DateTime<Utc>) -> Result<()> {
+    let permissions = teloxide::types::ChatPermissions::empty();
+    bot.restrict_chat_member(chat_id, UserId(user_id as u64), permissions)
+        .until_date(until)
+        .await?;
+    Ok(())
+}
+
 async fn kick_user(bot: &Bot, chat_id: ChatId, user_id: i64) -> Result<()> {
     bot.ban_chat_member(chat_id, UserId(user_id as u64)).await?;
     bot.unban_chat_member(chat_id, UserId(user_id as u64)).await?;
@@ -2670,7 +2685,7 @@ async fn handle_permission_denied(bot: &Bot, runtime: &Runtime, message: &Messag
     let repeat_within_24h = prior.map(|t| Utc::now() - t < chrono::TimeDelta::hours(24)).unwrap_or(false);
 
     if repeat_within_24h {
-        let _ = mute_user(bot, message.chat.id, user_id).await;
+        let _ = mute_user_until(bot, message.chat.id, user_id, Utc::now() + chrono::TimeDelta::minutes(5)).await;
         schedule_temp_unmute(bot, message.chat.id, user_id, Duration::from_secs(5 * 60));
         let case = CaseRecord {
             id: Uuid::new_v4().to_string(),
