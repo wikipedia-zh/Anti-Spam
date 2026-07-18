@@ -58,7 +58,7 @@ impl Config {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 enum ActionKind {
     AutoDelete,
     AutoBan,
@@ -203,6 +203,10 @@ struct GroupModuleSettings {
     // visible friction for every legitimate new member.
     captcha: bool,
     spam_threshold_override: Option<f64>,
+    // Cross-group ban propagation ("netban"): opt-in, since it means a ban
+    // decision made in a *different* group (outside this group admin's
+    // control) can ban someone here too.
+    netban: bool,
 }
 
 impl Default for GroupModuleSettings {
@@ -214,6 +218,7 @@ impl Default for GroupModuleSettings {
             flood_control: true,
             captcha: false,
             spam_threshold_override: None,
+            netban: false,
         }
     }
 }
@@ -407,6 +412,9 @@ impl Runtime {
         if user_version < 3 {
             Self::migrate_v2_to_v3(conn)?;
         }
+        if user_version < 4 {
+            Self::migrate_v3_to_v4(conn)?;
+        }
         Ok(())
     }
 
@@ -426,6 +434,30 @@ impl Runtime {
         tx.execute("ALTER TABLE group_module_settings ADD COLUMN captcha INTEGER NOT NULL DEFAULT 0", [])?;
         tx.execute("ALTER TABLE group_module_settings ADD COLUMN spam_threshold_override REAL", [])?;
         tx.execute("PRAGMA user_version = 3", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Adds the `netban` opt-in flag and `network_ban_targets`, the
+    /// historical record of exactly which chats got a propagated ban for a
+    /// given case (needed since a group's netban membership can change over
+    /// time, so reversal can't just re-derive "which chats" from current
+    /// settings - it has to know which chats were actually hit).
+    fn migrate_v3_to_v4(conn: &mut Connection) -> Result<()> {
+        let tx = conn.transaction()?;
+        tx.execute("ALTER TABLE group_module_settings ADD COLUMN netban INTEGER NOT NULL DEFAULT 0", [])?;
+        tx.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS network_ban_targets (
+                case_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (case_id, chat_id)
+            )
+            "#,
+            [],
+        )?;
+        tx.execute("PRAGMA user_version = 4", [])?;
         tx.commit()?;
         Ok(())
     }
@@ -614,6 +646,78 @@ impl Runtime {
             }
             let mut rows = stmt.query(bound.as_slice())?;
             rows.next()?.map(case_from_row).transpose()
+        })
+        .await
+    }
+
+    async fn list_netban_enabled_chats(&self) -> Result<Vec<i64>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT chat_id FROM group_module_settings WHERE netban = 1")?;
+            let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Finds the most recent active ban for `user_id` whose origin chat has
+    /// netban enabled - i.e. "is this user currently network-banned".
+    /// Reuses the same "reversal mutates action in place" property as
+    /// `load_latest_case_by_actions`: once reversed, a case's action becomes
+    /// `Unbanned` and stops matching the `IN (...)` filter here too, so no
+    /// separate "is this stale" bookkeeping is needed.
+    async fn find_active_network_ban(&self, user_id: i64) -> Result<Option<CaseRecord>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                r#"SELECT c.id, c.action, c.chat_id, c.target_user_id, c.target_name, c.actor_user_id, c.actor_name, c.source_message_id, c.evidence_text, c.model_score, c.matched_rule_id, c.matched_rule_pattern, c.status, c.log_message_id, c.created_at
+                   FROM cases c
+                   JOIN group_module_settings g ON g.chat_id = c.chat_id
+                   WHERE c.target_user_id = ?1 AND g.netban = 1 AND c.action IN ('auto_ban', 'spam_ban', 'report_approved')
+                   ORDER BY c.created_at DESC LIMIT 1"#,
+            )?;
+            let mut rows = stmt.query(params![user_id])?;
+            rows.next()?.map(case_from_row).transpose()
+        })
+        .await
+    }
+
+    /// Records that `case_id`'s ban was propagated to `chat_id` - the
+    /// historical record `/unban` needs to know exactly which chats to
+    /// reverse, since a group's netban membership can change after the fact.
+    async fn record_network_ban_target(&self, case_id: &str, chat_id: i64) -> Result<()> {
+        let case_id = case_id.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO network_ban_targets (case_id, chat_id, created_at) VALUES (?1, ?2, ?3)",
+                params![case_id, chat_id, Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn list_network_ban_targets(&self, case_id: &str) -> Result<Vec<i64>> {
+        let case_id = case_id.to_string();
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare("SELECT chat_id FROM network_ban_targets WHERE case_id = ?1")?;
+            let rows = stmt.query_map(params![case_id], |row| row.get::<_, i64>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn clear_network_ban_targets(&self, case_id: &str) -> Result<()> {
+        let case_id = case_id.to_string();
+        self.with_conn(move |conn| {
+            conn.execute("DELETE FROM network_ban_targets WHERE case_id = ?1", params![case_id])?;
+            Ok(())
         })
         .await
     }
@@ -1218,7 +1322,7 @@ impl Runtime {
                     "INSERT OR IGNORE INTO group_module_settings (chat_id) VALUES (?1)",
                     params![chat_id],
                 )?;
-                let mut stmt = conn.prepare("SELECT no_long_name, no_halal, no_service_messages, flood_control, captcha, spam_threshold_override FROM group_module_settings WHERE chat_id = ?1")?;
+                let mut stmt = conn.prepare("SELECT no_long_name, no_halal, no_service_messages, flood_control, captcha, spam_threshold_override, netban FROM group_module_settings WHERE chat_id = ?1")?;
                 let mut rows = stmt.query(params![chat_id])?;
                 if let Some(row) = rows.next()? {
                     Ok(GroupModuleSettings {
@@ -1228,6 +1332,7 @@ impl Runtime {
                         flood_control: row.get::<_, i64>(3)? != 0,
                         captcha: row.get::<_, i64>(4)? != 0,
                         spam_threshold_override: row.get::<_, Option<f64>>(5)?,
+                        netban: row.get::<_, i64>(6)? != 0,
                     })
                 } else {
                     Ok(GroupModuleSettings::default())
@@ -1273,6 +1378,12 @@ impl Runtime {
             "captcha" => {
                 conn.execute(
                     "UPDATE group_module_settings SET captcha = ?2 WHERE chat_id = ?1",
+                    params![chat_id, if enabled { 1 } else { 0 }],
+                )?;
+            }
+            "netban" => {
+                conn.execute(
+                    "UPDATE group_module_settings SET netban = ?2 WHERE chat_id = ?1",
                     params![chat_id, if enabled { 1 } else { 0 }],
                 )?;
             }
@@ -1898,11 +2009,11 @@ fn import_train_payloads(input: &str) -> Vec<String> {
 }
 
 fn help_text() -> String {
-    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n<code>/white</code>：加入本群白名單\n<code>/white -global</code>：加入全域白名單\n<code>/unwhite</code>：移出本群白名單\n<code>/unwhite -global</code>：移出全域白名單\n\n<b>群組管理員可用</b>\n<code>/module &lt;名稱&gt; &lt;on/off&gt;</code>：切換群組模組，名稱支援 NoLongName（英名檢查）/ NoHalal（清真檢查）/ NoSM（服務訊息刪除）/ Flood（洗版偵測，預設開啟）/ Captcha（新成員驗證，預設關閉）\n<code>/unban</code>：回覆要解封的用戶、或提供 user_id，解封本群該用戶（僅本群，不影響訓練資料，如需連同撤銷誤判樣本請找維護組）\n<code>/unmute</code>：回覆要解除禁言的用戶、或提供 user_id\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n".to_string()
+    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n<code>/white</code>：加入本群白名單\n<code>/white -global</code>：加入全域白名單\n<code>/unwhite</code>：移出本群白名單\n<code>/unwhite -global</code>：移出全域白名單\n\n<b>群組管理員可用</b>\n<code>/module &lt;名稱&gt; &lt;on/off&gt;</code>：切換群組模組，名稱支援 NoLongName（英名檢查）/ NoHalal（清真檢查）/ NoSM（服務訊息刪除）/ Flood（洗版偵測，預設開啟）/ Captcha（新成員驗證，預設關閉）/ Netban（跨群組黑名單同步，預設關閉，需自行開啟；開啟後本群的封禁會同步到其他同樣開啟的群組，反之亦然）\n<code>/unban</code>：回覆要解封的用戶、或提供 user_id，解封本群該用戶（僅本群，不影響訓練資料，如需連同撤銷誤判樣本請找維護組）\n<code>/unmute</code>：回覆要解除禁言的用戶、或提供 user_id\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n".to_string()
 }
 
 fn help_op_text() -> String {
-    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可。會解封並在找得到對應案例時一併移除錯誤訓練樣本並重建模型（群組管理員也能用 /unban，但僅解封本群、不影響訓練資料）\n<code>/unmute</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可，並會撤銷對應案例（群組管理員也能用 /unmute，但僅解除本群禁言）\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat &lt;chat_id&gt;</code>：設定工作群組\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
+    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可。會解封並在找得到對應案例時一併移除錯誤訓練樣本並重建模型，若該案例曾透過 Netban 同步封禁到其他群組，也會一併在那些群組解封（群組管理員也能用 /unban，但僅解封本群、不影響訓練資料與其他群組）\n<code>/unmute</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可，並會撤銷對應案例（群組管理員也能用 /unmute，但僅解除本群禁言）\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat &lt;chat_id&gt;</code>：設定工作群組\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
 }
 
 fn format_score_debug(report: &ScoreDebugReport) -> String {
@@ -2234,6 +2345,31 @@ async fn notify_bot_added(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) 
                 updated.log_message_id = Some(log_message_id);
                 let _ = store_case(runtime, &updated).await;
                 let _ = notify_group(bot, runtime, &updated, log_message_id, "<b>自動模組封禁</b>").await;
+                propagate_network_ban(bot, runtime, &updated).await;
+            }
+        }
+
+        // Join-time netban catch-up: this group only learns about a network
+        // ban when it's checked (there's no way to scan existing members via
+        // the Bot API to backfill), so check every new joiner. A known-bad
+        // user doesn't need a CAPTCHA challenge, so this takes priority over
+        // that check.
+        if !banned && enabled.netban {
+            if let Ok(Some(prior_case)) = runtime.find_active_network_ban(user.id.0 as i64).await {
+                banned = true;
+                let _ = bot.delete_message(message.chat.id, message.id).await;
+                let _ = bot.ban_chat_member(message.chat.id, user.id).await;
+                let _ = runtime.record_network_ban_target(&prior_case.id, message.chat.id.0).await;
+                let _ = bot
+                    .send_message(
+                        message.chat.id,
+                        format!(
+                            "<b>跨群組黑名單同步封禁</b>\n用戶 <code>{}</code> 已因跨群組黑名單同步封禁。\n原始案例: <code>{}</code>",
+                            user.id.0, prior_case.id,
+                        ),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await;
             }
         }
 
@@ -2328,6 +2464,45 @@ async fn notify_group(bot: &Bot, runtime: &Runtime, case: &CaseRecord, log_messa
         let _ = bot.delete_message(chat_id, message_id).await;
     });
     Ok(())
+}
+
+/// Propagates a ban case to every other group that has opted into `netban`.
+/// Called right after the 5 places in this file that create a ban-type case
+/// (AutoBan/SpamBan/ReportApproved) - purely additive, doesn't change any
+/// existing behavior at those call sites. No-ops immediately if the
+/// *origin* group hasn't opted in, since propagation is symmetric: a group
+/// only sends bans out to (and receives bans from) other opted-in groups.
+async fn propagate_network_ban(bot: &Bot, runtime: &Runtime, case: &CaseRecord) {
+    let origin = runtime.get_group_modules(case.chat_id).await.unwrap_or_default();
+    if !origin.netban {
+        return;
+    }
+    if runtime.is_global_whitelisted(case.target_user_id).await.unwrap_or(false) {
+        return;
+    }
+
+    let targets = runtime.list_netban_enabled_chats().await.unwrap_or_default();
+    for chat_id in targets {
+        if chat_id == case.chat_id {
+            continue;
+        }
+        if runtime.is_group_whitelisted(chat_id, case.target_user_id).await.unwrap_or(false) {
+            continue;
+        }
+        if bot.ban_chat_member(ChatId(chat_id), UserId(case.target_user_id as u64)).await.is_ok() {
+            let _ = runtime.record_network_ban_target(&case.id, chat_id).await;
+            let _ = bot
+                .send_message(
+                    ChatId(chat_id),
+                    format!(
+                        "<b>跨群組黑名單同步封禁</b>\n用戶 <code>{}</code> 已因跨群組黑名單同步封禁。\n原始案例: <code>{}</code>",
+                        case.target_user_id, case.id,
+                    ),
+                )
+                .parse_mode(ParseMode::Html)
+                .await;
+        }
+    }
 }
 
 async fn ban_user(bot: &Bot, chat_id: ChatId, user_id: i64) -> Result<()> {
@@ -2633,6 +2808,62 @@ async fn check_flood_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Messag
     Ok(true)
 }
 
+/// Message-time safety net for netban: catches members who were already in
+/// a group before it turned netban on, or who joined between propagation
+/// events - cases the join-time check in `notify_bot_added` can't reach,
+/// since the Bot API has no way to enumerate existing members to backfill
+/// against. Only does its DB lookup when the current chat has netban
+/// enabled, so groups that never opt in pay zero extra cost per message.
+async fn check_netban_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) -> bool {
+    if !message.chat.is_group() && !message.chat.is_supergroup() {
+        return false;
+    }
+    let Some(user) = message.from.as_ref() else { return false; };
+    if user.is_bot {
+        return false;
+    }
+    let chat_id = message.chat.id.0;
+    let user_id = user.id.0 as i64;
+
+    if is_special_user(&runtime.config, user_id) {
+        return false;
+    }
+
+    let settings = runtime.get_group_modules(chat_id).await.unwrap_or_default();
+    if !settings.netban {
+        return false;
+    }
+
+    if runtime.is_global_whitelisted(user_id).await.unwrap_or(false) {
+        return false;
+    }
+    if runtime.is_group_whitelisted(chat_id, user_id).await.unwrap_or(false) {
+        return false;
+    }
+    if is_group_admin(bot, message.chat.id, user_id).await {
+        return false;
+    }
+
+    let Ok(Some(prior_case)) = runtime.find_active_network_ban(user_id).await else {
+        return false;
+    };
+
+    let _ = bot.delete_message(message.chat.id, message.id).await;
+    let _ = bot.ban_chat_member(message.chat.id, user.id).await;
+    let _ = runtime.record_network_ban_target(&prior_case.id, chat_id).await;
+    let _ = bot
+        .send_message(
+            message.chat.id,
+            format!(
+                "<b>跨群組黑名單同步封禁</b>\n用戶 <code>{user_id}</code> 已因跨群組黑名單同步封禁。\n原始案例: <code>{}</code>",
+                prior_case.id,
+            ),
+        )
+        .parse_mode(ParseMode::Html)
+        .await;
+    true
+}
+
 async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> ResponseResult<()> {
     let Some(text) = message.text() else { return Ok(()); };
     let cmd = parse_command(text);
@@ -2795,7 +3026,10 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             case.log_message_id = Some(log_message_id);
             store_case(&runtime, &case).await.ok();
             notify_group(&bot, &runtime, &case, log_message_id, "<b>已執行管理操作</b>").await.ok();
-            
+            if action == ActionKind::SpamBan {
+                propagate_network_ban(&bot, &runtime, &case).await;
+            }
+
             // Delete the command message to minimize group disruption
             let _ = bot.delete_message(message.chat.id, message.id).await;
         }
@@ -3071,8 +3305,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 "nosm" => { runtime.set_group_module(message.chat.id.0, "nosm", enabled).await.ok(); }
                 "flood" => { runtime.set_group_module(message.chat.id.0, "flood", enabled).await.ok(); }
                 "captcha" => { runtime.set_group_module(message.chat.id.0, "captcha", enabled).await.ok(); }
+                "netban" => { runtime.set_group_module(message.chat.id.0, "netban", enabled).await.ok(); }
                 _ => {
-                    bot.send_message(message.chat.id, "模組名稱僅支援 NoLongName / NoHalal / NoSM / Flood / Captcha。") .await?;
+                    bot.send_message(message.chat.id, "模組名稱僅支援 NoLongName / NoHalal / NoSM / Flood / Captcha / Netban。") .await?;
                     return Ok(());
                 }
             }
@@ -3529,6 +3764,18 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             if removed > 0 {
                 let _ = runtime.rebuild_model().await;
             }
+
+            // If netban had propagated this ban elsewhere, undo it everywhere
+            // it actually landed - not just wherever's currently opted in,
+            // since that can have changed since the ban happened.
+            let network_targets = runtime.list_network_ban_targets(&case.id).await.unwrap_or_default();
+            for target_chat_id in &network_targets {
+                let _ = bot.unban_chat_member(ChatId(*target_chat_id), UserId(target_user_id as u64)).await;
+            }
+            if !network_targets.is_empty() {
+                let _ = runtime.clear_network_ban_targets(&case.id).await;
+            }
+
             case.action = ActionKind::Unbanned;
             case.status = "reversed".to_string();
             case.actor_user_id = Some(from_id);
@@ -3538,7 +3785,12 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             case.log_message_id = Some(log_message_id);
             store_case(&runtime, &case).await.ok();
             notify_group(&bot, &runtime, &case, log_message_id, "<b>已撤銷封禁</b>").await.ok();
-            bot.send_message(message.chat.id, format!("已解封用戶，並撤銷 case <code>{}</code>、移除 {removed} 筆對應訓練樣本。", case.id)).parse_mode(ParseMode::Html).await?;
+            let network_note = if network_targets.is_empty() {
+                String::new()
+            } else {
+                format!("，並在 {} 個跨群組黑名單同步的群組中解封", network_targets.len())
+            };
+            bot.send_message(message.chat.id, format!("已解封用戶，並撤銷 case <code>{}</code>、移除 {removed} 筆對應訓練樣本{network_note}。", case.id)).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::Unmute(arg) => {
             let is_maintainer_user = is_maintainer(&bot, &runtime.config, from_id).await;
@@ -3725,6 +3977,7 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
                     log_callback_error(&bot, &runtime, &case, "store_case", &err.to_string()).await;
                 }
             }
+            propagate_network_ban(&bot, &runtime, &updated).await;
             let body = format!(
                 "<b>新的 /spam 申請</b>\n\n<b>對象</b>: {} ({})\n<b>發起人</b>: {}\n<b>內容</b>: <blockquote>{}</blockquote>\n<b>案例</b>: <code>{}</code>\n<b>狀態</b>: 已受理並封禁\n<b>處理者</b>: <code>{}</code>",
                 escape_html(&case.target_name),
@@ -3810,6 +4063,7 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
             updated.log_message_id = Some(log_message_id);
             let _ = store_case(&runtime, &updated).await;
             let _ = notify_group(&bot, &runtime, &updated, log_message_id, "<b>自動模組封禁</b>").await;
+            propagate_network_ban(&bot, &runtime, &updated).await;
             return Ok(());
         }
     }
@@ -3850,6 +4104,7 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
     case.log_message_id = Some(log_message_id);
     store_case(&runtime, &case).await.ok();
     notify_group(&bot, &runtime, &case, log_message_id, "<b>自動機器學習封禁</b>").await.ok();
+    propagate_network_ban(&bot, &runtime, &case).await;
     Ok(())
 }
 
@@ -3914,6 +4169,14 @@ async fn main() -> Result<()> {
                 // this message is either the answer or noise from a still-muted
                 // member, never a real command/content to process further.
                 if check_captcha_and_act(&bot, &runtime, &message).await {
+                    return Ok(());
+                }
+
+                // Netban safety net: catches members already in a group before
+                // it opted in, or who joined between propagation events.
+                if runtime.config.test_group_id != Some(message.chat.id.0)
+                    && check_netban_and_act(&bot, &runtime, &message).await
+                {
                     return Ok(());
                 }
 
@@ -4213,5 +4476,75 @@ mod tests {
 
         let found = runtime.load_latest_case_by_actions(100, 200, &["auto_ban", "spam_ban", "report_approved"]).await.unwrap();
         assert!(found.is_none(), "reversed case should no longer match a ban-action search");
+    }
+
+    // A ban only counts as "network-banned" if its origin chat has netban
+    // enabled - a group that never opted in shouldn't leak bans to others.
+    #[tokio::test]
+    async fn find_active_network_ban_requires_netban_enabled_origin() {
+        let runtime = test_runtime().await;
+        let case = dummy_case(ActionKind::AutoBan, 100, 200, Utc::now());
+        runtime.persist_case(&case).await.unwrap();
+
+        assert!(
+            runtime.find_active_network_ban(200).await.unwrap().is_none(),
+            "chat 100 hasn't opted into netban, so this ban shouldn't count as a network ban"
+        );
+
+        runtime.set_group_module(100, "netban", true).await.unwrap();
+        let found = runtime.find_active_network_ban(200).await.unwrap();
+        assert_eq!(found.map(|c| c.id), Some(case.id.clone()));
+    }
+
+    // Same "reversal mutates action in place" property as
+    // load_latest_case_by_actions - once reversed, it must stop being an
+    // active network ban.
+    #[tokio::test]
+    async fn find_active_network_ban_excludes_reversed_case() {
+        let runtime = test_runtime().await;
+        runtime.set_group_module(100, "netban", true).await.unwrap();
+        let mut case = dummy_case(ActionKind::SpamBan, 100, 200, Utc::now());
+        runtime.persist_case(&case).await.unwrap();
+        assert!(runtime.find_active_network_ban(200).await.unwrap().is_some());
+
+        case.action = ActionKind::Unbanned;
+        runtime.persist_case(&case).await.unwrap();
+        assert!(runtime.find_active_network_ban(200).await.unwrap().is_none());
+    }
+
+    // Backs /unban's ability to reverse a propagated ban everywhere it
+    // actually landed: record targets for a case across a couple of chats,
+    // confirm they list back correctly, then confirm clearing empties it.
+    #[tokio::test]
+    async fn network_ban_targets_round_trip() {
+        let runtime = test_runtime().await;
+        let case_id = "case-netban-1";
+        runtime.record_network_ban_target(case_id, 100).await.unwrap();
+        runtime.record_network_ban_target(case_id, 200).await.unwrap();
+        // Recording the same (case, chat) pair twice must not duplicate it.
+        runtime.record_network_ban_target(case_id, 100).await.unwrap();
+
+        let mut targets = runtime.list_network_ban_targets(case_id).await.unwrap();
+        targets.sort();
+        assert_eq!(targets, vec![100, 200]);
+
+        runtime.clear_network_ban_targets(case_id).await.unwrap();
+        assert!(runtime.list_network_ban_targets(case_id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_netban_enabled_chats_reflects_toggles() {
+        let runtime = test_runtime().await;
+        runtime.set_group_module(100, "netban", true).await.unwrap();
+        runtime.set_group_module(200, "netban", true).await.unwrap();
+        runtime.set_group_module(300, "netban", false).await.unwrap();
+
+        let mut chats = runtime.list_netban_enabled_chats().await.unwrap();
+        chats.sort();
+        assert_eq!(chats, vec![100, 200]);
+
+        runtime.set_group_module(100, "netban", false).await.unwrap();
+        let chats = runtime.list_netban_enabled_chats().await.unwrap();
+        assert_eq!(chats, vec![200]);
     }
 }
