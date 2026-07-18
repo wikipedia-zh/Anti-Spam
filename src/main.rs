@@ -2920,8 +2920,11 @@ async fn reverse_mute_case(bot: &Bot, runtime: &Runtime, mut case: CaseRecord, a
 /// appeal flow has nothing to do with which groups opted into netban.
 async fn broadcast_ban_status(bot: &Bot, runtime: &Runtime, user_id: i64, banned: bool) {
     let Some(chat) = runtime.exchange_channel().await else { return };
-    let action = if banned { "add" } else { "remove" };
-    send_exchange_message(bot, chat, action, "bad", serde_json::json!({ "id": user_id })).await;
+    // "report"/"bad" with an explicit is_banned field, matching bad_detail's
+    // shape - not the old add/remove-verb encoding. request_id is genuinely
+    // absent here (there's nothing to correlate an unsolicited push to),
+    // unlike handle_exchange_query_bad's reply below.
+    send_exchange_message(bot, chat, "report", "bad", serde_json::json!({ "id": user_id, "is_banned": banned })).await;
 }
 
 /// Propagates a ban case to every other group that has opted into `netban`.
@@ -4977,8 +4980,10 @@ async fn handle_exchange_query_bad(bot: &Bot, runtime: &Runtime, chat: i64, data
     let Some(user_id) = data.get("id").and_then(|v| v.as_i64()) else { return };
     let request_id = data.get("request_id").and_then(|v| v.as_str()).unwrap_or_default();
     let banned = runtime.find_active_bans_for_user(user_id).await.map(|cases| !cases.is_empty()).unwrap_or(false);
-    let action = if banned { "add" } else { "remove" };
-    send_exchange_message(bot, chat, action, "bad", serde_json::json!({ "id": user_id, "request_id": request_id })).await;
+    // "report"/"bad" with an explicit is_banned field, mirroring bad_detail's
+    // shape - not the old add/remove-verb encoding (easy to misread: which
+    // verb means "banned" isn't obvious out of context).
+    send_exchange_message(bot, chat, "report", "bad", serde_json::json!({ "id": user_id, "request_id": request_id, "is_banned": banned })).await;
 }
 
 async fn handle_exchange_query_bad_detail(bot: &Bot, runtime: &Runtime, chat: i64, data: serde_json::Value) {
