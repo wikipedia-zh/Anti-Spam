@@ -2880,7 +2880,7 @@ async fn reverse_ban_case(bot: &Bot, runtime: &Runtime, mut case: CaseRecord, ac
     case.log_message_id = Some(log_message_id);
     store_case(runtime, &case).await.ok();
     notify_group(bot, runtime, &case, log_message_id, "<b>已撤銷封禁</b>").await.ok();
-    broadcast_ban_status(bot, runtime, case.target_user_id, false).await;
+    broadcast_unban_if_fully_clear(bot, runtime, case.target_user_id).await;
 
     let network_note = if network_targets.is_empty() {
         String::new()
@@ -2925,6 +2925,17 @@ async fn broadcast_ban_status(bot: &Bot, runtime: &Runtime, user_id: i64, banned
     // absent here (there's nothing to correlate an unsolicited push to),
     // unlike handle_exchange_query_bad's reply below.
     send_exchange_message(bot, chat, "report", "bad", serde_json::json!({ "id": user_id, "is_banned": banned })).await;
+}
+
+/// A ban lifted in just one group doesn't mean the user is clear
+/// everywhere - they may have an independent active ban in another,
+/// unrelated group. Only announce "not banned" once none remain anywhere;
+/// otherwise stay silent rather than falsely clearing PM's cache.
+async fn broadcast_unban_if_fully_clear(bot: &Bot, runtime: &Runtime, user_id: i64) {
+    let still_banned = runtime.find_active_bans_for_user(user_id).await.map(|cases| !cases.is_empty()).unwrap_or(true);
+    if !still_banned {
+        broadcast_ban_status(bot, runtime, user_id, false).await;
+    }
 }
 
 /// Propagates a ban case to every other group that has opted into `netban`.
@@ -4027,6 +4038,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 .unwrap_or(false);
             if was_banned {
                 let _ = bot.unban_chat_member(message.chat.id, UserId(user_id as u64)).await;
+                broadcast_unban_if_fully_clear(&bot, &runtime, user_id).await;
                 bot.send_message(message.chat.id, format!("已將 <code>{user_id}</code> 加入本群白名單，並解除其在本群的封禁。")).parse_mode(ParseMode::Html).await?;
             } else {
                 bot.send_message(message.chat.id, format!("已將 <code>{user_id}</code> 加入本群白名單。",)).parse_mode(ParseMode::Html).await?;
@@ -4417,6 +4429,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     bot.send_message(message.chat.id, format!("解封失敗：{err}")).await?;
                     return Ok(());
                 }
+                broadcast_unban_if_fully_clear(&bot, &runtime, target_user_id).await;
                 let _ = bot
                     .send_message(
                         ChatId(runtime.config.log_channel_id),
