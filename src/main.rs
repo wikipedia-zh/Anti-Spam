@@ -2633,15 +2633,20 @@ async fn notify_bot_added(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) 
         return false;
     }
 
-    if users.iter().any(|u| u.is_bot) {
-        let title = message.chat.title().unwrap_or("unknown");
-        let text = format!(
-            "<b>機器人已加入</b>\n<b>群組</b>: <code>{}</code>\n<b>標題</b>: {}\n<b>來源</b>: <code>{}</code>",
-            message.chat.id.0,
-            escape_html(title),
-            message.from.as_ref().map(short_user).unwrap_or_else(|| "unknown".to_string())
-        );
-        let _ = bot.send_message(ChatId(runtime.config.report_channel_id), text).parse_mode(ParseMode::Html).await;
+    // Only notify when this bot itself is the one joining - not any other
+    // bot a group happens to add alongside it. `is_bot` alone matches any
+    // bot account, which was wrongly firing this for third-party bots too.
+    if let Ok(me) = bot.get_me().await {
+        if users.iter().any(|u| u.id == me.id) {
+            let title = message.chat.title().unwrap_or("unknown");
+            let text = format!(
+                "<b>機器人已加入</b>\n<b>群組</b>: <code>{}</code>\n<b>標題</b>: {}\n<b>來源</b>: <code>{}</code>",
+                message.chat.id.0,
+                escape_html(title),
+                message.from.as_ref().map(short_user).unwrap_or_else(|| "unknown".to_string())
+            );
+            let _ = bot.send_message(ChatId(runtime.config.report_channel_id), text).parse_mode(ParseMode::Html).await;
+        }
     }
 
     for user in users {
@@ -2712,16 +2717,7 @@ async fn notify_bot_added(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) 
                 let _ = bot.delete_message(message.chat.id, message.id).await;
                 let _ = bot.ban_chat_member(message.chat.id, user.id).await;
                 let _ = runtime.record_network_ban_target(&prior_case.id, message.chat.id.0).await;
-                let _ = bot
-                    .send_message(
-                        message.chat.id,
-                        format!(
-                            "<b>跨群組黑名單同步封禁</b>\n用戶 <code>{}</code> 已因跨群組黑名單同步封禁。\n原始案例: <code>{}</code>",
-                            user.id.0, prior_case.id,
-                        ),
-                    )
-                    .parse_mode(ParseMode::Html)
-                    .await;
+                notify_netban_sync(bot, message.chat.id, user.id.0 as i64, &prior_case.id).await;
             }
         }
 
@@ -2818,6 +2814,20 @@ async fn notify_group(bot: &Bot, runtime: &Runtime, case: &CaseRecord, log_messa
     Ok(())
 }
 
+/// Same self-delete window as `notify_group` - this is routine ambient
+/// noise for group admins (a netban sync landing), not something that
+/// needs to stick around in the chat permanently.
+async fn notify_netban_sync(bot: &Bot, chat_id: ChatId, target_user_id: i64, case_id: &str) {
+    let text = format!("<b>跨群組黑名單同步封禁</b>\n用戶 <code>{target_user_id}</code> 已因跨群組黑名單同步封禁。\n原始案例: <code>{case_id}</code>");
+    let Ok(sent) = bot.send_message(chat_id, text).parse_mode(ParseMode::Html).await else { return };
+    let bot = bot.clone();
+    let message_id = sent.id;
+    tokio::spawn(async move {
+        sleep(Duration::from_secs(180)).await;
+        let _ = bot.delete_message(chat_id, message_id).await;
+    });
+}
+
 /// Records a state-changing maintainer command and, if `/set_audit_log` has
 /// been configured, posts it to the private audit channel with its new
 /// `action_id` and a `/revert` hint (unless `undo` is `NotRevertible`).
@@ -2833,8 +2843,12 @@ async fn log_maintainer_action(bot: &Bot, runtime: &Runtime, actor_id: i64, acto
         } else {
             "（無法復原）".to_string()
         };
+        let group_line = match chat_id {
+            Some(id) => format!("\n<b>群組</b>: <code>{id}</code>"),
+            None => String::new(),
+        };
         let text = format!(
-            "<b>維護操作 #{action_id}</b>\n<b>指令</b>: <code>{}</code>\n<b>操作者</b>: {} (<code>{actor_id}</code>)\n<b>內容</b>: {}\n{revert_hint}",
+            "<b>維護操作 #{action_id}</b>\n<b>指令</b>: <code>{}</code>\n<b>操作者</b>: {} (<code>{actor_id}</code>){group_line}\n<b>內容</b>: {}\n{revert_hint}",
             escape_html(command),
             escape_html(actor_name),
             escape_html(summary),
@@ -2963,16 +2977,7 @@ async fn propagate_network_ban(bot: &Bot, runtime: &Runtime, case: &CaseRecord) 
         }
         if bot.ban_chat_member(ChatId(chat_id), UserId(case.target_user_id as u64)).await.is_ok() {
             let _ = runtime.record_network_ban_target(&case.id, chat_id).await;
-            let _ = bot
-                .send_message(
-                    ChatId(chat_id),
-                    format!(
-                        "<b>跨群組黑名單同步封禁</b>\n用戶 <code>{}</code> 已因跨群組黑名單同步封禁。\n原始案例: <code>{}</code>",
-                        case.target_user_id, case.id,
-                    ),
-                )
-                .parse_mode(ParseMode::Html)
-                .await;
+            notify_netban_sync(bot, ChatId(chat_id), case.target_user_id, &case.id).await;
         }
     }
 }
@@ -3445,16 +3450,7 @@ async fn check_netban_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Messa
     let _ = bot.delete_message(message.chat.id, message.id).await;
     let _ = bot.ban_chat_member(message.chat.id, user.id).await;
     let _ = runtime.record_network_ban_target(&prior_case.id, chat_id).await;
-    let _ = bot
-        .send_message(
-            message.chat.id,
-            format!(
-                "<b>跨群組黑名單同步封禁</b>\n用戶 <code>{user_id}</code> 已因跨群組黑名單同步封禁。\n原始案例: <code>{}</code>",
-                prior_case.id,
-            ),
-        )
-        .parse_mode(ParseMode::Html)
-        .await;
+    notify_netban_sync(bot, message.chat.id, user_id, &prior_case.id).await;
     true
 }
 
