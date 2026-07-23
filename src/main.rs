@@ -2844,7 +2844,13 @@ async fn log_maintainer_action(bot: &Bot, runtime: &Runtime, actor_id: i64, acto
             "（無法復原）".to_string()
         };
         let group_line = match chat_id {
-            Some(id) => format!("\n<b>群組</b>: <code>{id}</code>"),
+            Some(id) => {
+                let title = bot.get_chat(ChatId(id)).await.ok().and_then(|c| c.title().map(escape_html));
+                match title {
+                    Some(title) => format!("\n<b>群組</b>: {title} (<code>{id}</code>)"),
+                    None => format!("\n<b>群組</b>: <code>{id}</code>"),
+                }
+            }
             None => String::new(),
         };
         let text = format!(
