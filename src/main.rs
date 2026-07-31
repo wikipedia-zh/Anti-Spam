@@ -269,6 +269,11 @@ struct GroupModuleSettings {
     // mute; opt-in since it's a real moderation consequence for members,
     // not just cleanup.
     cmd_clean: bool,
+    // Customized, non-public warning-escalates-to-ban module ("warn-pol").
+    // Unlike every other module here, a group admin can't just turn this on
+    // - it only takes effect if the chat is also on `module_allowlist`,
+    // set via the maintainer-only `/magic` command. See ModerationCommand::Module.
+    pol: bool,
 }
 
 impl Default for GroupModuleSettings {
@@ -282,6 +287,7 @@ impl Default for GroupModuleSettings {
             spam_threshold_override: None,
             netban: false,
             cmd_clean: false,
+            pol: false,
         }
     }
 }
@@ -488,6 +494,9 @@ impl Runtime {
         if user_version < 6 {
             Self::migrate_v5_to_v6(conn)?;
         }
+        if user_version < 7 {
+            Self::migrate_v6_to_v7(conn)?;
+        }
         Ok(())
     }
 
@@ -581,6 +590,45 @@ impl Runtime {
             [],
         )?;
         tx.execute("PRAGMA user_version = 6", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Adds the `pol` opt-in flag (only settable once a chat is on
+    /// `module_allowlist` - see `/magic`), `module_allowlist` itself (a
+    /// generic maintainer-controlled per-(module, chat) gate, not specific
+    /// to `pol` - a future customized module reuses this same table), and
+    /// `pol_warnings`, a persistent per-(chat, user) count that - unlike
+    /// `permission_offenses` - never expires: a second warning is always a
+    /// ban, no matter how long ago the first one was.
+    fn migrate_v6_to_v7(conn: &mut Connection) -> Result<()> {
+        let tx = conn.transaction()?;
+        tx.execute("ALTER TABLE group_module_settings ADD COLUMN pol INTEGER NOT NULL DEFAULT 0", [])?;
+        tx.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS module_allowlist (
+                module TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                added_by INTEGER,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (module, chat_id)
+            )
+            "#,
+            [],
+        )?;
+        tx.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS pol_warnings (
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                warn_count INTEGER NOT NULL DEFAULT 0,
+                last_warned_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, user_id)
+            )
+            "#,
+            [],
+        )?;
+        tx.execute("PRAGMA user_version = 7", [])?;
         tx.commit()?;
         Ok(())
     }
@@ -1645,7 +1693,7 @@ impl Runtime {
                     "INSERT OR IGNORE INTO group_module_settings (chat_id) VALUES (?1)",
                     params![chat_id],
                 )?;
-                let mut stmt = conn.prepare("SELECT no_long_name, no_halal, no_service_messages, flood_control, captcha, spam_threshold_override, netban, cmd_clean FROM group_module_settings WHERE chat_id = ?1")?;
+                let mut stmt = conn.prepare("SELECT no_long_name, no_halal, no_service_messages, flood_control, captcha, spam_threshold_override, netban, cmd_clean, pol FROM group_module_settings WHERE chat_id = ?1")?;
                 let mut rows = stmt.query(params![chat_id])?;
                 if let Some(row) = rows.next()? {
                     Ok(GroupModuleSettings {
@@ -1657,6 +1705,7 @@ impl Runtime {
                         spam_threshold_override: row.get::<_, Option<f64>>(5)?,
                         netban: row.get::<_, i64>(6)? != 0,
                         cmd_clean: row.get::<_, i64>(7)? != 0,
+                        pol: row.get::<_, i64>(8)? != 0,
                     })
                 } else {
                     Ok(GroupModuleSettings::default())
@@ -1714,6 +1763,12 @@ impl Runtime {
             "cmdclean" => {
                 conn.execute(
                     "UPDATE group_module_settings SET cmd_clean = ?2 WHERE chat_id = ?1",
+                    params![chat_id, if enabled { 1 } else { 0 }],
+                )?;
+            }
+            "warn-pol" => {
+                conn.execute(
+                    "UPDATE group_module_settings SET pol = ?2 WHERE chat_id = ?1",
                     params![chat_id, if enabled { 1 } else { 0 }],
                 )?;
             }
@@ -1789,6 +1844,85 @@ impl Runtime {
                     params![chat_id, user_id],
                 )?;
             }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Generic maintainer-controlled gate: has `module` been granted to
+    /// `chat_id` via `/magic`? Only gates *enabling* a module through
+    /// `/module` - turning one off is never gated. Not specific to `pol`,
+    /// so a future customized module reuses this same table.
+    async fn is_module_allowed(&self, module: &str, chat_id: i64) -> Result<bool> {
+        let module = module.to_string();
+        self.with_conn(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM module_allowlist WHERE module = ?1 AND chat_id = ?2",
+                params![module, chat_id],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
+        })
+        .await
+    }
+
+    async fn set_module_allowed(&self, module: &str, chat_id: i64, enabled: bool, added_by: Option<i64>) -> Result<()> {
+        let module = module.to_string();
+        self.with_conn(move |conn| {
+            if enabled {
+                conn.execute(
+                    "INSERT OR IGNORE INTO module_allowlist (module, chat_id, added_by, created_at) VALUES (?1, ?2, ?3, ?4)",
+                    params![module, chat_id, added_by, Utc::now().to_rfc3339()],
+                )?;
+            } else {
+                conn.execute(
+                    "DELETE FROM module_allowlist WHERE module = ?1 AND chat_id = ?2",
+                    params![module, chat_id],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Current warn count for (chat_id, user_id) under the "warn-pol"
+    /// module - 0 if they've never been warned there. Never expires,
+    /// unlike `permission_offenses`.
+    async fn pol_warn_count(&self, chat_id: i64, user_id: i64) -> Result<i64> {
+        self.with_conn(move |conn| {
+            let count: Option<i64> = conn
+                .query_row(
+                    "SELECT warn_count FROM pol_warnings WHERE chat_id = ?1 AND user_id = ?2",
+                    params![chat_id, user_id],
+                    |row| row.get(0),
+                )
+                .ok();
+            Ok(count.unwrap_or(0))
+        })
+        .await
+    }
+
+    /// Records a warning (or ban) event and returns the new total count.
+    async fn increment_pol_warn(&self, chat_id: i64, user_id: i64) -> Result<i64> {
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO pol_warnings (chat_id, user_id, warn_count, last_warned_at) VALUES (?1, ?2, 1, ?3)
+                 ON CONFLICT(chat_id, user_id) DO UPDATE SET warn_count = warn_count + 1, last_warned_at = excluded.last_warned_at",
+                params![chat_id, user_id, Utc::now().to_rfc3339()],
+            )?;
+            let count: i64 = conn.query_row(
+                "SELECT warn_count FROM pol_warnings WHERE chat_id = ?1 AND user_id = ?2",
+                params![chat_id, user_id],
+                |row| row.get(0),
+            )?;
+            Ok(count)
+        })
+        .await
+    }
+
+    async fn clear_pol_warns(&self, chat_id: i64, user_id: i64) -> Result<()> {
+        self.with_conn(move |conn| {
+            conn.execute("DELETE FROM pol_warnings WHERE chat_id = ?1 AND user_id = ?2", params![chat_id, user_id])?;
             Ok(())
         })
         .await
@@ -1980,6 +2114,8 @@ enum ModerationCommand {
     SetAuditLog(String),
     Revert(String),
     SetExchangeChannel(String),
+    Magic(String, String, String),
+    Pol(String),
     Unknown,
 }
 
@@ -2069,6 +2205,15 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/set_audit_log" => ModerationCommand::SetAuditLog(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/revert" => ModerationCommand::Revert(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/set_exchange_channel" => ModerationCommand::SetExchangeChannel(text.split_whitespace().nth(1).unwrap_or("").to_string()),
+        "/magic" => {
+            let mut parts = text.split_whitespace();
+            let _ = parts.next();
+            let module = parts.next().unwrap_or("").to_string();
+            let chat_id = parts.next().unwrap_or("").to_string();
+            let action = parts.next().unwrap_or("").to_string();
+            ModerationCommand::Magic(module, chat_id, action)
+        }
+        "/pol" => ModerationCommand::Pol(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         _ => ModerationCommand::Unknown,
     }
 }
@@ -2363,7 +2508,7 @@ fn help_text() -> String {
 }
 
 fn help_op_text() -> String {
-    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>（別名 <code>/mark_spam</code>）：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可。會解封並在找得到對應案例時一併移除錯誤訓練樣本並重建模型，若該案例曾透過 Netban 同步封禁到其他群組，也會一併在那些群組解封（群組管理員也能用 /unban，但僅解封本群、不影響訓練資料與其他群組）\n<code>/unmute</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可，並會撤銷對應案例（群組管理員也能用 /unmute，但僅解除本群禁言）\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat [chat_id]</code>：設定工作群組。不帶參數時直接綁定目前所在的群組；也可提供 chat_id 從其他地方設定。綁定後，若該群組串連的頻道發文時被 Telegram 自動釘選，機器人會自動取消釘選，避免洗掉手動釘選的訊息\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n<code>/ping</code>：確認機器人在線，並回報目前運行的版本號與 commit hash\n<code>/set_audit_log [chat_id]</code>：設定維護操作日誌頻道。不帶參數時綁定目前所在的群組/頻道。設定後，每個會改變狀態的維護指令（門檻、白名單、模組開關、規則異動、封禁/禁言等）都會記錄在這裡，並附上 action id\n<code>/revert &lt;action_id&gt;</code>：復原指定的維護操作，回到變更前的狀態；封禁/禁言類會重用 /unban、/unmute 的邏輯。少數沒有明確「復原前狀態」的操作無法自動復原，會直接告知\n<code>/set_exchange_channel &lt;chat_id&gt;</code>：設定 PM 申訴機器人橋接用的交換頻道。設定後，機器人會回應 PM 透過該頻道發出的封禁查詢與解封請求，讓被封禁用戶能透過 PM 自助查詢並申訴\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
+    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>（別名 <code>/mark_spam</code>）：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可。會解封並在找得到對應案例時一併移除錯誤訓練樣本並重建模型，若該案例曾透過 Netban 同步封禁到其他群組，也會一併在那些群組解封（群組管理員也能用 /unban，但僅解封本群、不影響訓練資料與其他群組）\n<code>/unmute</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可，並會撤銷對應案例（群組管理員也能用 /unmute，但僅解除本群禁言）\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat [chat_id]</code>：設定工作群組。不帶參數時直接綁定目前所在的群組；也可提供 chat_id 從其他地方設定。綁定後，若該群組串連的頻道發文時被 Telegram 自動釘選，機器人會自動取消釘選，避免洗掉手動釘選的訊息\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n<code>/ping</code>：確認機器人在線，並回報目前運行的版本號與 commit hash\n<code>/set_audit_log [chat_id]</code>：設定維護操作日誌頻道。不帶參數時綁定目前所在的群組/頻道。設定後，每個會改變狀態的維護指令（門檻、白名單、模組開關、規則異動、封禁/禁言等）都會記錄在這裡，並附上 action id\n<code>/revert &lt;action_id&gt;</code>：復原指定的維護操作，回到變更前的狀態；封禁/禁言類會重用 /unban、/unmute 的邏輯。少數沒有明確「復原前狀態」的操作無法自動復原，會直接告知\n<code>/set_exchange_channel &lt;chat_id&gt;</code>：設定 PM 申訴機器人橋接用的交換頻道。設定後，機器人會回應 PM 透過該頻道發出的封禁查詢與解封請求，讓被封禁用戶能透過 PM 自助查詢並申訴\n<code>/pol show</code>：回覆一位用戶，查詢其在本群目前的警告次數\n<code>/pol clear</code>：回覆一位用戶，清除其在本群的所有警告\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
 }
 
 fn format_score_debug(report: &ScoreDebugReport) -> String {
@@ -2393,6 +2538,13 @@ fn escape_html(input: &str) -> String {
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// A clickable mention that works even without a reply to hook onto (the
+/// original message is already gone by the time a `/pol` warning sends) and
+/// even for users with no @username, since it targets a user_id directly.
+fn mention_link(user_id: i64, name: &str) -> String {
+    format!("<a href=\"tg://user?id={user_id}\">{}</a>", escape_html(name))
 }
 
 fn utc8_display(dt: DateTime<Utc>) -> String {
@@ -3590,6 +3742,30 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             runtime.set_exchange_channel(value).await;
             bot.send_message(message.chat.id, format!("已設定 PM 申訴橋接交換頻道為 <code>{value}</code>。")).parse_mode(ParseMode::Html).await?;
         }
+        ModerationCommand::Magic(module, chat_id, action) => {
+            require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用此指令。");
+            let module = module.trim().to_string();
+            let usage = "用法：/magic <module> <chat_id> <allow|disallow>";
+            let Some(target_chat_id) = chat_id.trim().parse::<i64>().ok() else {
+                bot.send_message(message.chat.id, usage).await?;
+                return Ok(());
+            };
+            let allow = match action.trim().to_lowercase().as_str() {
+                "allow" => true,
+                "disallow" => false,
+                _ => {
+                    bot.send_message(message.chat.id, usage).await?;
+                    return Ok(());
+                }
+            };
+            runtime.set_module_allowed(&module, target_chat_id, allow, Some(from_id)).await.ok();
+            log_maintainer_action(
+                &bot, &runtime, from_id, &short_user(from), Some(target_chat_id), "/magic",
+                &format!("module={module} chat_id={target_chat_id} allow={allow}"),
+                UndoData::NotRevertible,
+            ).await;
+            bot.send_message(message.chat.id, format!("已將群組 <code>{target_chat_id}</code> 的 <code>{module}</code> 存取設為 {}。", if allow { "允許" } else { "不允許" })).parse_mode(ParseMode::Html).await?;
+        }
         ModerationCommand::Leave(reason) => {
             require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用 /leave。");
             let (target_chat_id, reason) = parse_leave_args(&reason);
@@ -3686,6 +3862,96 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
 
             // Delete the command message to minimize group disruption
             let _ = bot.delete_message(message.chat.id, message.id).await;
+        }
+        ModerationCommand::Pol(sub) => {
+            if !message.chat.is_group() && !message.chat.is_supergroup() {
+                return Ok(());
+            }
+            let chat_id = message.chat.id.0;
+            let settings = runtime.get_group_modules(chat_id).await.unwrap_or_default();
+            let authorized = settings.pol
+                && (is_maintainer(&bot, &runtime.config, from_id).await || is_group_admin(&bot, message.chat.id, from_id).await);
+            if !authorized {
+                // Unauthorized use - module not enabled here, or the caller
+                // isn't an admin/maintainer - is completely silent. Deleting
+                // the command and saying nothing is what keeps this module's
+                // existence from ever being revealed to someone who isn't
+                // already supposed to know about it.
+                let _ = bot.delete_message(message.chat.id, message.id).await;
+                return Ok(());
+            }
+
+            match sub.trim().to_lowercase().as_str() {
+                "show" => {
+                    let Some((target_id, target_name, _, _)) = extract_reply_context(&message).await else {
+                        reply_ephemeral(&bot, &message, "請回覆一位用戶的訊息。").await?;
+                        return Ok(());
+                    };
+                    let count = runtime.pol_warn_count(chat_id, target_id).await.unwrap_or(0);
+                    bot.send_message(message.chat.id, format!("{} 目前在本群有 {count} 次警告。", escape_html(&target_name))).parse_mode(ParseMode::Html).await?;
+                }
+                "clear" => {
+                    let Some((target_id, target_name, _, _)) = extract_reply_context(&message).await else {
+                        reply_ephemeral(&bot, &message, "請回覆一位用戶的訊息。").await?;
+                        return Ok(());
+                    };
+                    runtime.clear_pol_warns(chat_id, target_id).await.ok();
+                    bot.send_message(message.chat.id, format!("已清除 {} 在本群的所有警告。", escape_html(&target_name))).parse_mode(ParseMode::Html).await?;
+                }
+                "" => {
+                    let Some((target_id, target_name, source_id, _)) = extract_reply_context(&message).await else {
+                        reply_ephemeral(&bot, &message, "請回覆一條訊息後再使用此指令。").await?;
+                        return Ok(());
+                    };
+                    if is_group_admin(&bot, message.chat.id, target_id).await || is_special_user(&runtime.config, target_id) {
+                        reply_ephemeral(&bot, &message, "不能對群組管理員或項目維護人員執行此指令。").await?;
+                        return Ok(());
+                    }
+
+                    let _ = bot.delete_message(message.chat.id, MessageId(source_id)).await;
+                    let prior_count = runtime.pol_warn_count(chat_id, target_id).await.unwrap_or(0);
+                    let new_count = runtime.increment_pol_warn(chat_id, target_id).await.unwrap_or(prior_count + 1);
+
+                    if prior_count == 0 {
+                        // Warns never expire - the very next /pol on this user,
+                        // whenever it happens, is a ban rather than a second warning.
+                        let text = format!(
+                            "{} 由于本群的公开性质及未来可能将与墙内社交平台连接，请勿讨论敏感内容，谢谢合作。为了群员的安全，您的原消息已撤回，警告一次，感谢理解。",
+                            mention_link(target_id, &target_name),
+                        );
+                        let group_rules_button = InlineKeyboardMarkup::new(vec![vec![
+                            InlineKeyboardButton::url("请按此查看群规", Url::parse("https://t.me/Chinese_wikimedia_activities/1/180").unwrap()),
+                        ]]);
+                        if let Ok(sent) = bot.send_message(message.chat.id, text).parse_mode(ParseMode::Html).reply_markup(group_rules_button).await {
+                            let bot = bot.clone();
+                            let warn_chat_id = message.chat.id;
+                            let message_id = sent.id;
+                            tokio::spawn(async move {
+                                sleep(Duration::from_secs(24 * 60 * 60)).await;
+                                let _ = bot.delete_message(warn_chat_id, message_id).await;
+                            });
+                        }
+                    } else {
+                        // Deliberately lightweight: a raw ban plus a private
+                        // audit-log note, not a full CaseRecord - this stays
+                        // outside /case, netban propagation, and the PM
+                        // appeal bridge, matching this module's contained,
+                        // non-public scope. /unban's existing case-less
+                        // fallback already handles reversing it if needed.
+                        let _ = ban_user(&bot, message.chat.id, target_id).await;
+                        log_maintainer_action(
+                            &bot, &runtime, from_id, &short_user(from), Some(chat_id), "/pol",
+                            &format!("warn-pol 自動封禁 對象={target_id} warn_count={new_count}"),
+                            UndoData::NotRevertible,
+                        ).await;
+                    }
+
+                    let _ = bot.delete_message(message.chat.id, message.id).await;
+                }
+                _ => {
+                    reply_ephemeral(&bot, &message, "用法：/pol（回覆訊息）、/pol show（回覆訊息）、/pol clear（回覆訊息）。").await?;
+                }
+            }
         }
         ModerationCommand::SpamReport => {
             let Some((target_id, target_name, source_id, evidence_text)) = extract_reply_context(&message).await else {
@@ -3980,8 +4246,19 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 "captcha" => Some(old_settings.captcha),
                 "netban" => Some(old_settings.netban),
                 "cmdclean" => Some(old_settings.cmd_clean),
+                "warn-pol" => Some(old_settings.pol),
                 _ => None,
             };
+            // "warn-pol" is a customized module - not open for public use.
+            // Enabling it (never disabling) requires the chat to already be
+            // on the maintainer-only allowlist (set via /magic). If it
+            // isn't, fall through to the exact same "unsupported module
+            // name" error as any typo - anyone not already allowlisted
+            // can't tell "warn-pol" is a real module from that message.
+            if key == "warn-pol" && enabled && !runtime.is_module_allowed("warn-pol", message.chat.id.0).await.unwrap_or(false) {
+                reply_ephemeral(&bot, &message, "模組名稱僅支援 NoLongName / NoHalal / NoSM / Flood / Captcha / Netban / CmdClean。").await?;
+                return Ok(());
+            }
             match key.as_str() {
                 "nolongname" => { runtime.set_group_module(message.chat.id.0, "nolongname", enabled).await.ok(); }
                 "nohalal" => { runtime.set_group_module(message.chat.id.0, "nohalal", enabled).await.ok(); }
@@ -3990,6 +4267,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 "captcha" => { runtime.set_group_module(message.chat.id.0, "captcha", enabled).await.ok(); }
                 "netban" => { runtime.set_group_module(message.chat.id.0, "netban", enabled).await.ok(); }
                 "cmdclean" => { runtime.set_group_module(message.chat.id.0, "cmdclean", enabled).await.ok(); }
+                "warn-pol" => { runtime.set_group_module(message.chat.id.0, "warn-pol", enabled).await.ok(); }
                 _ => {
                     reply_ephemeral(&bot, &message, "模組名稱僅支援 NoLongName / NoHalal / NoSM / Flood / Captcha / Netban / CmdClean。").await?;
                     return Ok(());
@@ -5762,5 +6040,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((spam_after, ham_after), (3, 7));
+    }
+
+    // Backs /magic: a chat starts un-allowed for any module, allowing it
+    // flips is_module_allowed, and disallowing removes it again - and this
+    // must be scoped per (module, chat_id), not global.
+    #[tokio::test]
+    async fn module_allowlist_round_trip_and_scoped_per_module() {
+        let runtime = test_runtime().await;
+        assert!(!runtime.is_module_allowed("warn-pol", 100).await.unwrap());
+
+        runtime.set_module_allowed("warn-pol", 100, true, Some(1)).await.unwrap();
+        assert!(runtime.is_module_allowed("warn-pol", 100).await.unwrap());
+        // A different module, or a different chat, must not be affected.
+        assert!(!runtime.is_module_allowed("some-other-module", 100).await.unwrap());
+        assert!(!runtime.is_module_allowed("warn-pol", 200).await.unwrap());
+
+        runtime.set_module_allowed("warn-pol", 100, false, Some(1)).await.unwrap();
+        assert!(!runtime.is_module_allowed("warn-pol", 100).await.unwrap());
+    }
+
+    // Backs /pol's warn-then-ban escalation: a fresh (chat, user) pair has
+    // no warnings, incrementing accumulates a real count (not just a
+    // boolean flag), and /pol clear resets it back to zero.
+    #[tokio::test]
+    async fn pol_warnings_increment_and_clear() {
+        let runtime = test_runtime().await;
+        assert_eq!(runtime.pol_warn_count(100, 200).await.unwrap(), 0);
+
+        let after_first = runtime.increment_pol_warn(100, 200).await.unwrap();
+        assert_eq!(after_first, 1);
+        assert_eq!(runtime.pol_warn_count(100, 200).await.unwrap(), 1);
+
+        let after_second = runtime.increment_pol_warn(100, 200).await.unwrap();
+        assert_eq!(after_second, 2);
+
+        // A different chat's count for the same user must be independent -
+        // warns are per-group, not global.
+        assert_eq!(runtime.pol_warn_count(999, 200).await.unwrap(), 0);
+
+        runtime.clear_pol_warns(100, 200).await.unwrap();
+        assert_eq!(runtime.pol_warn_count(100, 200).await.unwrap(), 0);
+    }
+
+    // Backs /module warn-pol on|off: the pol flag round-trips through
+    // get_group_modules/set_group_module exactly like every other module.
+    #[tokio::test]
+    async fn warn_pol_module_flag_round_trips() {
+        let runtime = test_runtime().await;
+        assert!(!runtime.get_group_modules(100).await.unwrap().pol);
+        runtime.set_group_module(100, "warn-pol", true).await.unwrap();
+        assert!(runtime.get_group_modules(100).await.unwrap().pol);
+        runtime.set_group_module(100, "warn-pol", false).await.unwrap();
+        assert!(!runtime.get_group_modules(100).await.unwrap().pol);
     }
 }
