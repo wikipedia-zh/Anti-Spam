@@ -1118,6 +1118,123 @@ impl Runtime {
         .await
     }
 
+    /// Maintenance pass over `training_samples`, idempotent (safe to
+    /// re-run): drops empty/whitespace-only samples entirely (zero token
+    /// signal even singly, just pollutes the doc-count denominator), and
+    /// for every exact-duplicate (label, text) group beyond the first
+    /// occurrence, rolls back its word_frequencies/doc-count contribution
+    /// and deletes the row - same accounting as `purge_training_by_case`,
+    /// just applied per-duplicate-row instead of per-case_id (many mass-
+    /// imported duplicates never had a real case_id to key off of at all).
+    /// Returns (duplicates_removed, empty_removed). Caller must call
+    /// `rebuild_model()` afterward.
+    async fn dedupe_training_samples(&self) -> Result<(usize, usize)> {
+        self.with_conn(move |conn| {
+            let tx = conn.transaction()?;
+            let mut spam_docs: i64 = tx.query_row("SELECT COALESCE(value, '0') FROM model_meta WHERE key = 'spam_docs'", [], |row| row.get::<_, String>(0))?.parse().unwrap_or(0);
+            let mut ham_docs: i64 = tx.query_row("SELECT COALESCE(value, '0') FROM model_meta WHERE key = 'ham_docs'", [], |row| row.get::<_, String>(0))?.parse().unwrap_or(0);
+
+            fn rollback(tx: &rusqlite::Transaction, text: &str, label: &str) -> rusqlite::Result<()> {
+                for token in tokenize(text) {
+                    let counts = tx.query_row(
+                        "SELECT spam_count, ham_count FROM word_frequencies WHERE word = ?1",
+                        params![&token],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    );
+                    if let Ok((mut spam_count, mut ham_count)) = counts {
+                        match label {
+                            "spam" => spam_count = (spam_count - 1).max(0),
+                            "ham" => ham_count = (ham_count - 1).max(0),
+                            _ => {}
+                        }
+                        if spam_count == 0 && ham_count == 0 {
+                            tx.execute("DELETE FROM word_frequencies WHERE word = ?1", params![&token])?;
+                        } else {
+                            tx.execute(
+                                "UPDATE word_frequencies SET spam_count = ?2, ham_count = ?3 WHERE word = ?1",
+                                params![&token, spam_count, ham_count],
+                            )?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            // Empty/whitespace-only samples: remove every copy, no signal even singly.
+            let mut empty_removed = 0usize;
+            {
+                let to_delete: Vec<(i64, String)> = {
+                    let mut stmt = tx.prepare("SELECT rowid, label FROM training_samples WHERE trim(text) = ''")?;
+                    let mut rows = stmt.query([])?;
+                    let mut out = Vec::new();
+                    while let Some(row) = rows.next()? {
+                        out.push((row.get::<_, i64>(0)?, row.get::<_, String>(1)?));
+                    }
+                    out
+                };
+                for (rowid, label) in to_delete {
+                    match label.as_str() {
+                        "spam" => spam_docs = (spam_docs - 1).max(0),
+                        "ham" => ham_docs = (ham_docs - 1).max(0),
+                        _ => {}
+                    }
+                    tx.execute("DELETE FROM training_samples WHERE rowid = ?1", params![rowid])?;
+                    empty_removed += 1;
+                }
+            }
+
+            // Exact-duplicate (label, text) groups: keep the earliest row, purge the rest.
+            let mut dup_removed = 0usize;
+            {
+                let groups: Vec<(String, String, i64)> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT label, text, MIN(rowid) FROM training_samples WHERE trim(text) != '' GROUP BY label, text HAVING COUNT(*) > 1",
+                    )?;
+                    let mut rows = stmt.query([])?;
+                    let mut out = Vec::new();
+                    while let Some(row) = rows.next()? {
+                        out.push((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?));
+                    }
+                    out
+                };
+                for (label, text, keep_rowid) in groups {
+                    let extra_rowids: Vec<i64> = {
+                        let mut stmt = tx.prepare("SELECT rowid FROM training_samples WHERE label = ?1 AND text = ?2 AND rowid != ?3")?;
+                        let mut rows = stmt.query(params![&label, &text, keep_rowid])?;
+                        let mut out = Vec::new();
+                        while let Some(row) = rows.next()? {
+                            out.push(row.get::<_, i64>(0)?);
+                        }
+                        out
+                    };
+                    for rowid in extra_rowids {
+                        rollback(&tx, &text, &label)?;
+                        match label.as_str() {
+                            "spam" => spam_docs = (spam_docs - 1).max(0),
+                            "ham" => ham_docs = (ham_docs - 1).max(0),
+                            _ => {}
+                        }
+                        tx.execute("DELETE FROM training_samples WHERE rowid = ?1", params![rowid])?;
+                        dup_removed += 1;
+                    }
+                }
+            }
+
+            tx.execute(
+                "INSERT INTO model_meta (key, value) VALUES ('spam_docs', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![spam_docs.to_string()],
+            )?;
+            tx.execute(
+                "INSERT INTO model_meta (key, value) VALUES ('ham_docs', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![ham_docs.to_string()],
+            )?;
+
+            tx.commit()?;
+            Ok((dup_removed, empty_removed))
+        })
+        .await
+    }
+
     /// Refreshes the in-memory model from disk. This only reads — the DB is
     /// always the source of truth and callers that changed the DB (train_spam,
     /// purge, undo, set_token_probability, ...) have already persisted their
@@ -2088,6 +2205,7 @@ enum ModerationCommand {
     MlPurge(String),
     MlPurgeText(String),
     MlRebuild,
+    MlDedupe,
     MlFinishMassTrain,
     MlStartMassHam,
     MlFinishMassHam,
@@ -2149,6 +2267,7 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/ml_purge" => ModerationCommand::MlPurge(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/ml_purge_text" => ModerationCommand::MlPurgeText(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
         "/ml_rebuild" => ModerationCommand::MlRebuild,
+        "/ml_dedupe" => ModerationCommand::MlDedupe,
         "/ml_start_mass_train" => ModerationCommand::MlStartMassTrainWithMode("smart".to_string()),
         "/ml_finish_mass_train" => ModerationCommand::MlFinishMassTrain,
         "/ml_start_mass_ham" => ModerationCommand::MlStartMassHam,
@@ -4107,6 +4226,36 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let rebuilt = runtime.rebuild_model().await.unwrap_or_default();
             bot.send_message(message.chat.id, format!("已重建模型，spam_docs={} ham_docs={}", rebuilt.spam_docs, rebuilt.ham_docs)).await?;
         }
+        ModerationCommand::MlDedupe => {
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
+
+            // Confirmed false positives from a manual audit of a training
+            // export on 2026-07-31 (see conversation/commit history) -
+            // ordinary messages that were mistakenly trained as spam.
+            // Each is purged from spam and retrained as ham.
+            const RECLASSIFY_TO_HAM: &[(&str, &str)] = &[
+                ("aac024d0-3529-42d1-a71e-d74f99654620", "哪里人？"),
+                ("6f1b5155-4d99-4297-a3af-d58884eac33b", "Apologize"),
+                ("7bcf74ca-89e5-4423-b46f-b0dbc582d37c", "怎么排名"),
+                ("9488f3ec-bf53-4026-883b-706780c4e0e1", "大家好，有没有人可以帮忙加百科的呀"),
+            ];
+            let mut reclassified = 0usize;
+            for (case_id, text) in RECLASSIFY_TO_HAM {
+                if runtime.purge_training_by_case(case_id).await.unwrap_or(0) > 0 && train_ham(&runtime, text, None).await.is_ok() {
+                    reclassified += 1;
+                }
+            }
+
+            let (dup_removed, empty_removed) = runtime.dedupe_training_samples().await.unwrap_or((0, 0));
+            let rebuilt = runtime.rebuild_model().await.unwrap_or_default();
+
+            let summary = format!(
+                "重分類 {reclassified} 筆、移除重複樣本 {dup_removed} 筆、移除空白樣本 {empty_removed} 筆，重建後 spam_docs={} ham_docs={}",
+                rebuilt.spam_docs, rebuilt.ham_docs,
+            );
+            log_maintainer_action(&bot, &runtime, from_id, &short_user(from), None, "/ml_dedupe", &summary, UndoData::NotRevertible).await;
+            bot.send_message(message.chat.id, format!("已完成訓練資料清理。\n{summary}")).await?;
+        }
         ModerationCommand::MlStats => {
             require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
             let (spam, ham, total) = runtime.word_stats().await.unwrap_or((0, 0, 0));
@@ -4671,11 +4820,19 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let samples = runtime.finish_mass_train(from_id).await;
             let mut imported = Vec::new();
             let mut count = 0usize;
+            // Each buffered entry is one *Telegram message*, which may
+            // itself be a pasted multi-line block (e.g. a chat log dump) -
+            // split on newlines so each original line becomes its own ham
+            // sample, rather than training the whole pasted block as one
+            // mixed-signal document.
             for sample in samples {
-                if sample.trim().is_empty() { continue; }
-                imported.push(sample.clone());
-                train_ham(&runtime, &sample, None).await.ok();
-                count += 1;
+                for line in sample.lines() {
+                    let line = line.trim();
+                    if line.is_empty() { continue; }
+                    imported.push(line.to_string());
+                    train_ham(&runtime, line, None).await.ok();
+                    count += 1;
+                }
             }
             bot.send_message(message.chat.id, format!("批量訓練完成。ham: {count}\n\n已提取並訓練的字串：\n{}", if imported.is_empty() { "無可提取樣本".to_string() } else { imported.join("\n---\n") })).await?;
             runtime.clear_mass_train(from_id).await;
@@ -6093,5 +6250,39 @@ mod tests {
         assert!(runtime.get_group_modules(100).await.unwrap().pol);
         runtime.set_group_module(100, "warn-pol", false).await.unwrap();
         assert!(!runtime.get_group_modules(100).await.unwrap().pol);
+    }
+
+    // Backs /ml_dedupe: simulates the real dirty-data shape (a spam phrase
+    // mass-imported 3 times, an empty-text sample, and one clean distinct
+    // sample of each label) and confirms dedup collapses duplicates to one
+    // copy, drops the empty sample entirely, and leaves distinct samples
+    // and doc/token counts consistent with what's actually left.
+    #[tokio::test]
+    async fn dedupe_training_samples_collapses_duplicates_and_drops_empty() {
+        let runtime = test_runtime().await;
+        train_spam(&runtime, "重複垃圾訊息", None).await.unwrap();
+        train_spam(&runtime, "重複垃圾訊息", None).await.unwrap();
+        train_spam(&runtime, "重複垃圾訊息", None).await.unwrap();
+        train_spam(&runtime, "獨特垃圾訊息", None).await.unwrap();
+        train_spam(&runtime, "", None).await.unwrap();
+        train_ham(&runtime, "正常聊天內容", None).await.unwrap();
+
+        let (dup_removed, empty_removed) = runtime.dedupe_training_samples().await.unwrap();
+        assert_eq!(dup_removed, 2, "3 copies of the same text should collapse to 1, removing 2");
+        assert_eq!(empty_removed, 1);
+
+        let rebuilt = runtime.rebuild_model().await.unwrap();
+        assert_eq!(rebuilt.spam_docs, 2, "one surviving copy of the duplicate + the distinct sample");
+        assert_eq!(rebuilt.ham_docs, 1);
+
+        let remaining: i64 = runtime
+            .with_conn(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM training_samples WHERE label = 'spam' AND text = '重複垃圾訊息'", [], |row| row.get(0))?))
+            .await
+            .unwrap();
+        assert_eq!(remaining, 1);
+
+        // Re-running must be a no-op - nothing left to deduplicate.
+        let (dup_removed_again, empty_removed_again) = runtime.dedupe_training_samples().await.unwrap();
+        assert_eq!((dup_removed_again, empty_removed_again), (0, 0));
     }
 }
