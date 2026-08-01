@@ -3428,8 +3428,25 @@ async fn train_ham(runtime: &Runtime, text: &str, case_id: Option<&str>) -> Resu
     runtime.persist_doc_counts().await
 }
 
-async fn extract_reply_context(message: &Message) -> Option<(i64, String, i32, String)> {
+/// A `reply_to_message()` that's an actual reply the user made - not the
+/// synthetic reply Telegram automatically attaches to every message sent
+/// inside a forum topic, which points at that topic's own creation/service
+/// message. That message's `from` is whoever *created the topic*, not
+/// whoever's currently posting, and it carries no real text - so treating
+/// it as a genuine reply would silently target/train on the topic creator
+/// for a bare command nobody actually replied with. Every place in this
+/// file that resolves a command's target or content from a reply must go
+/// through this, not raw `.reply_to_message()`.
+fn real_reply(message: &Message) -> Option<&Message> {
     let reply = message.reply_to_message()?;
+    if reply.forum_topic_created().is_some() {
+        return None;
+    }
+    Some(reply)
+}
+
+async fn extract_reply_context(message: &Message) -> Option<(i64, String, i32, String)> {
+    let reply = real_reply(message)?;
     let user = reply.from.as_ref()?;
     let text = extract_full_text(reply);
     Some((user.id.0 as i64, short_user(user), reply.id.0, text))
@@ -3760,8 +3777,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         }
         ModerationCommand::MyId => {
             let requester = message.from.as_ref();
-            let target_user = message
-                .reply_to_message()
+            let target_user = real_reply(&message)
                 .and_then(|m| m.from.as_ref())
                 .or(requester);
             let uid = target_user.map(|u| u.id.0.to_string()).unwrap_or_else(|| "unknown".to_string());
@@ -3779,7 +3795,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         }
         ModerationCommand::ScoreTest(text) => {
             require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用 /ml_score。");
-            let target_msg = message.reply_to_message().unwrap_or(&message);
+            let target_msg = real_reply(&message).unwrap_or(&message);
             let text = if text.trim().is_empty() {
                 extract_full_text(target_msg)
             } else {
@@ -4146,7 +4162,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         }
         ModerationCommand::MlTrainSpam | ModerationCommand::MlCleanSpam => {
             require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
-            let target_msg = message.reply_to_message().unwrap_or(&message);
+            let target_msg = real_reply(&message).unwrap_or(&message);
             let text = extract_full_text(target_msg);
             if text.trim().is_empty() {
                 bot.send_message(message.chat.id, "請回覆一條訊息來訓練或清洗模型。").await?;
@@ -4172,7 +4188,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         }
         ModerationCommand::MarkHam => {
             require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用 /mark_ham。");
-            let target_msg = message.reply_to_message().unwrap_or(&message);
+            let target_msg = real_reply(&message).unwrap_or(&message);
             let text = extract_full_text(target_msg);
             if text.trim().is_empty() {
                 bot.send_message(message.chat.id, "請回覆一條訊息作為 ham 樣本。") .await?;
@@ -4186,7 +4202,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         ModerationCommand::MlUndoCleanSpam => {
             require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
             let raw_text = message.text().or(message.caption()).unwrap_or("");
-            let text = if let Some(target_msg) = message.reply_to_message() {
+            let text = if let Some(target_msg) = real_reply(&message) {
                 extract_full_text(target_msg)
             } else {
                 let args = raw_text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
@@ -4452,7 +4468,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 handle_permission_denied(&bot, &runtime, &message, from, "只有群組管理員可以設定白名單。").await?;
                 return Ok(());
             }
-            let Some(user_id) = target.parse::<i64>().ok().or_else(|| message.reply_to_message().and_then(|m| m.from.as_ref()).map(|u| u.id.0 as i64)) else {
+            let Some(user_id) = target.parse::<i64>().ok().or_else(|| real_reply(&message).and_then(|m| m.from.as_ref()).map(|u| u.id.0 as i64)) else {
                 reply_ephemeral(&bot, &message, "請提供 userid 或回覆一位用戶。").await?;
                 return Ok(());
             };
@@ -4484,7 +4500,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         }
         ModerationCommand::WhiteGlobal(target) => {
             require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
-            let Some(user_id) = target.parse::<i64>().ok().or_else(|| message.reply_to_message().and_then(|m| m.from.as_ref()).map(|u| u.id.0 as i64)) else {
+            let Some(user_id) = target.parse::<i64>().ok().or_else(|| real_reply(&message).and_then(|m| m.from.as_ref()).map(|u| u.id.0 as i64)) else {
                 bot.send_message(message.chat.id, "請提供 userid 或回覆一位用戶。") .await?;
                 return Ok(());
             };
@@ -4505,7 +4521,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 handle_permission_denied(&bot, &runtime, &message, from, "只有群組管理員可以設定白名單。").await?;
                 return Ok(());
             }
-            let Some(user_id) = target.parse::<i64>().ok().or_else(|| message.reply_to_message().and_then(|m| m.from.as_ref()).map(|u| u.id.0 as i64)) else {
+            let Some(user_id) = target.parse::<i64>().ok().or_else(|| real_reply(&message).and_then(|m| m.from.as_ref()).map(|u| u.id.0 as i64)) else {
                 reply_ephemeral(&bot, &message, "請提供 userid 或回覆一位用戶。").await?;
                 return Ok(());
             };
@@ -4519,7 +4535,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         }
         ModerationCommand::UnwhiteGlobal(target) => {
             require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
-            let Some(user_id) = target.parse::<i64>().ok().or_else(|| message.reply_to_message().and_then(|m| m.from.as_ref()).map(|u| u.id.0 as i64)) else {
+            let Some(user_id) = target.parse::<i64>().ok().or_else(|| real_reply(&message).and_then(|m| m.from.as_ref()).map(|u| u.id.0 as i64)) else {
                 bot.send_message(message.chat.id, "請提供 userid 或回覆一位用戶。") .await?;
                 return Ok(());
             };
@@ -4536,7 +4552,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 reply_ephemeral(&bot, &message, "請在群組中使用 /check。").await?;
                 return Ok(());
             }
-            let Some(target_msg) = message.reply_to_message() else {
+            let Some(target_msg) = real_reply(&message) else {
                 if let Ok(user_id) = target.parse::<i64>() {
                     if runtime.is_global_whitelisted(user_id).await.unwrap_or(false) {
                         bot.send_message(message.chat.id, global_whitelist_check_text()).parse_mode(ParseMode::Html).await?;
@@ -4698,7 +4714,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         }
         ModerationCommand::MlImport => {
             require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用 /import。");
-            let target_msg = message.reply_to_message().unwrap_or(&message);
+            let target_msg = real_reply(&message).unwrap_or(&message);
             let text = extract_full_text(target_msg);
             if text.trim().is_empty() {
                 bot.send_message(message.chat.id, "請回覆一段匯出列表或輸出結果。") .await?;
@@ -4743,7 +4759,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "只允許維護者在私訊中使用 /ml_debug_parse。") .await?;
                 return Ok(());
             }
-            let target_msg = message.reply_to_message().unwrap_or(&message);
+            let target_msg = real_reply(&message).unwrap_or(&message);
             let text = extract_full_text(target_msg);
             if text.trim().is_empty() {
                 bot.send_message(message.chat.id, "請回覆一段日誌或訊息內容。") .await?;
@@ -4759,7 +4775,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         }
         ModerationCommand::MlScoreDebug => {
             require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用 /ml_score_debug。");
-            let target_msg = message.reply_to_message().unwrap_or(&message);
+            let target_msg = real_reply(&message).unwrap_or(&message);
             let text = extract_full_text(target_msg);
             if text.trim().is_empty() {
                 bot.send_message(message.chat.id, "請回覆一條消息或提供內容。") .await?;
@@ -4859,7 +4875,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 // that judgment call (was this actually a false positive?)
                 // needs someone with visibility across the whole project,
                 // not just this one group.
-                let target_user_id = if let Some(target_msg) = message.reply_to_message() {
+                let target_user_id = if let Some(target_msg) = real_reply(&message) {
                     target_msg.from.as_ref().map(|u| u.id.0 as i64)
                 } else {
                     arg.trim().parse::<i64>().ok()
@@ -4896,7 +4912,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             // manually by another admin, by a different bot, or from before
             // this project was even involved - so unbanning can't depend on a
             // case existing at all.
-            let resolved = if let Some(target_msg) = message.reply_to_message() {
+            let resolved = if let Some(target_msg) = real_reply(&message) {
                 target_msg.from.as_ref().map(|u| (message.chat.id.0, u.id.0 as i64, None::<CaseRecord>))
             } else if let Ok(user_id) = arg.trim().parse::<i64>() {
                 Some((message.chat.id.0, user_id, None))
@@ -4958,7 +4974,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 // Same reasoning as /unban: a group admin can free their own
                 // group's member right away, but reversing the case is left
                 // to a maintainer's judgment call.
-                let target_user_id = if let Some(target_msg) = message.reply_to_message() {
+                let target_user_id = if let Some(target_msg) = real_reply(&message) {
                     target_msg.from.as_ref().map(|u| u.id.0 as i64)
                 } else {
                     arg.trim().parse::<i64>().ok()
@@ -4989,7 +5005,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             // Maintainer path: same three targeting modes as /unban (reply /
             // user_id / case_id) - a mute can also come from outside this
             // bot's tracking.
-            let resolved = if let Some(target_msg) = message.reply_to_message() {
+            let resolved = if let Some(target_msg) = real_reply(&message) {
                 target_msg.from.as_ref().map(|u| (message.chat.id.0, u.id.0 as i64, None::<CaseRecord>))
             } else if let Ok(user_id) = arg.trim().parse::<i64>() {
                 Some((message.chat.id.0, user_id, None))
@@ -6290,5 +6306,33 @@ mod tests {
         // Re-running must be a no-op - nothing left to deduplicate.
         let (dup_removed_again, empty_removed_again) = runtime.dedupe_training_samples().await.unwrap();
         assert_eq!((dup_removed_again, empty_removed_again), (0, 0));
+    }
+
+    // Regression test for the /spam-mistargets-topic-creator bug: every
+    // message sent inside a forum topic carries a synthetic
+    // reply_to_message pointing at that topic's own creation service
+    // message (real payload shape confirmed against teloxide-core's own
+    // "topic_message" test fixture) - its `from` is whoever created the
+    // topic, not whoever's currently posting, and real_reply must not treat
+    // it as a genuine reply.
+    #[test]
+    fn real_reply_ignores_synthetic_forum_topic_root() {
+        let topic_root_reply_json = r#"{"chat":{"id":-1001847508954,"is_forum":true,"title":"twest","type":"supergroup"},"date":1675229140,"from":{"first_name":"вафель'","id":1253681278,"is_bot":false,"language_code":"en","username":"wafflelapkin"},"is_topic_message":true,"message_id":5,"message_thread_id":4,"reply_to_message":{"chat":{"id":-1001847508954,"is_forum":true,"title":"twest","type":"supergroup"},"date":1675229139,"forum_topic_created":{"icon_color":9367192,"icon_custom_emoji_id":"5312536423851630001","name":"???"},"from":{"first_name":"вафель'","id":1253681278,"is_bot":false,"language_code":"en","username":"wafflelapkin"},"is_topic_message":true,"message_id":4,"message_thread_id":4},"text":"/spam"}"#;
+        let message: Message = serde_json::from_str(topic_root_reply_json).unwrap();
+
+        assert!(message.reply_to_message().is_some(), "Telegram really does attach a reply_to_message here");
+        assert!(
+            message.reply_to_message().unwrap().forum_topic_created().is_some(),
+            "and it's the topic-creation service message, not a real reply"
+        );
+        assert!(real_reply(&message).is_none(), "real_reply must filter this out");
+
+        // A genuine reply (same shape, but the replied-to message is an
+        // ordinary text message, not a topic-creation service message)
+        // must still work normally.
+        let genuine_reply_json = r#"{"chat":{"id":-1001847508954,"is_forum":true,"title":"twest","type":"supergroup"},"date":1675229140,"from":{"first_name":"вафель'","id":1253681278,"is_bot":false,"language_code":"en","username":"wafflelapkin"},"is_topic_message":true,"message_id":6,"message_thread_id":4,"reply_to_message":{"chat":{"id":-1001847508954,"is_forum":true,"title":"twest","type":"supergroup"},"date":1675229139,"from":{"first_name":"SpammerBot","id":999,"is_bot":false},"is_topic_message":true,"message_id":5,"message_thread_id":4,"text":"buy now"},"text":"/sb"}"#;
+        let message: Message = serde_json::from_str(genuine_reply_json).unwrap();
+        let reply = real_reply(&message).expect("a genuine reply must still be returned");
+        assert_eq!(reply.from.as_ref().unwrap().id.0, 999);
     }
 }
