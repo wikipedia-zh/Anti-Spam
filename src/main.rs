@@ -78,6 +78,7 @@ enum ActionKind {
     Unmuted,
     FloodMute,
     CmdCleanMute,
+    GuestBotBan,
 }
 
 impl ActionKind {
@@ -95,6 +96,7 @@ impl ActionKind {
             ActionKind::Unmuted => "unmuted",
             ActionKind::FloodMute => "flood_mute",
             ActionKind::CmdCleanMute => "cmd_clean_mute",
+            ActionKind::GuestBotBan => "guest_bot_ban",
         }
     }
 
@@ -112,6 +114,7 @@ impl ActionKind {
             "unmuted" => ActionKind::Unmuted,
             "flood_mute" => ActionKind::FloodMute,
             "cmd_clean_mute" => ActionKind::CmdCleanMute,
+            "guest_bot_ban" => ActionKind::GuestBotBan,
             _ => ActionKind::AutoBan,
         }
     }
@@ -274,6 +277,14 @@ struct GroupModuleSettings {
     // - it only takes effect if the chat is also on `module_allowlist`,
     // set via the maintainer-only `/magic` command. See ModerationCommand::Module.
     pol: bool,
+    // Bans any message "from" a bot account that isn't actually a member of
+    // the chat - the signature of Telegram's "guest mode" (any user can
+    // @-mention a bot into posting directly into a group it was never added
+    // to: https://core.telegram.org/api/bots/guest-mode). Defaults on, like
+    // flood_control: baseline hygiene against an actively-exploited feature,
+    // not an opinionated per-group choice, and it only ever fires on
+    // messages from bots that were never legitimately added anyway.
+    guest_ban: bool,
 }
 
 impl Default for GroupModuleSettings {
@@ -288,6 +299,7 @@ impl Default for GroupModuleSettings {
             netban: false,
             cmd_clean: false,
             pol: false,
+            guest_ban: true,
         }
     }
 }
@@ -497,6 +509,9 @@ impl Runtime {
         if user_version < 7 {
             Self::migrate_v6_to_v7(conn)?;
         }
+        if user_version < 8 {
+            Self::migrate_v7_to_v8(conn)?;
+        }
         Ok(())
     }
 
@@ -629,6 +644,17 @@ impl Runtime {
             [],
         )?;
         tx.execute("PRAGMA user_version = 7", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Adds the `guest_ban` opt-in flag (defaults on - see the field's doc
+    /// comment on `GroupModuleSettings`) backing the new guest-mode-bot
+    /// auto-ban check.
+    fn migrate_v7_to_v8(conn: &mut Connection) -> Result<()> {
+        let tx = conn.transaction()?;
+        tx.execute("ALTER TABLE group_module_settings ADD COLUMN guest_ban INTEGER NOT NULL DEFAULT 1", [])?;
+        tx.execute("PRAGMA user_version = 8", [])?;
         tx.commit()?;
         Ok(())
     }
@@ -1810,7 +1836,7 @@ impl Runtime {
                     "INSERT OR IGNORE INTO group_module_settings (chat_id) VALUES (?1)",
                     params![chat_id],
                 )?;
-                let mut stmt = conn.prepare("SELECT no_long_name, no_halal, no_service_messages, flood_control, captcha, spam_threshold_override, netban, cmd_clean, pol FROM group_module_settings WHERE chat_id = ?1")?;
+                let mut stmt = conn.prepare("SELECT no_long_name, no_halal, no_service_messages, flood_control, captcha, spam_threshold_override, netban, cmd_clean, pol, guest_ban FROM group_module_settings WHERE chat_id = ?1")?;
                 let mut rows = stmt.query(params![chat_id])?;
                 if let Some(row) = rows.next()? {
                     Ok(GroupModuleSettings {
@@ -1823,6 +1849,7 @@ impl Runtime {
                         netban: row.get::<_, i64>(6)? != 0,
                         cmd_clean: row.get::<_, i64>(7)? != 0,
                         pol: row.get::<_, i64>(8)? != 0,
+                        guest_ban: row.get::<_, i64>(9)? != 0,
                     })
                 } else {
                     Ok(GroupModuleSettings::default())
@@ -1886,6 +1913,12 @@ impl Runtime {
             "warn-pol" => {
                 conn.execute(
                     "UPDATE group_module_settings SET pol = ?2 WHERE chat_id = ?1",
+                    params![chat_id, if enabled { 1 } else { 0 }],
+                )?;
+            }
+            "guestban" => {
+                conn.execute(
+                    "UPDATE group_module_settings SET guest_ban = ?2 WHERE chat_id = ?1",
                     params![chat_id, if enabled { 1 } else { 0 }],
                 )?;
             }
@@ -2623,7 +2656,7 @@ fn version_info_text() -> String {
 }
 
 fn help_text() -> String {
-    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n<code>/white</code>：加入本群白名單；若該用戶目前在本群被封禁，會一併解除封禁\n<code>/white -global</code>：加入全域白名單\n<code>/unwhite</code>：移出本群白名單\n<code>/unwhite -global</code>：移出全域白名單\n\n<b>群組管理員可用</b>\n<code>/module &lt;名稱&gt; &lt;on/off&gt;</code>：切換群組模組，名稱支援 NoLongName（英名檢查）/ NoHalal（清真檢查）/ NoSM（服務訊息刪除）/ Flood（洗版偵測，預設開啟）/ Captcha（新成員驗證，預設關閉）/ Netban（跨群組黑名單同步，預設關閉，需自行開啟；開啟後本群的封禁會同步到其他同樣開啟的群組，反之亦然）/ CmdClean（指令權限濫用防護，預設關閉；開啟後，沒有權限的人嘗試使用管理指令會被刪除訊息並警告一次，24 小時內再犯將被禁言 5 分鐘並記錄到日誌頻道。無論是否開啟，此類指令的錯誤提示訊息都會在 10 秒後自動刪除，減少洗版）\n<code>/unban</code>：回覆要解封的用戶、或提供 user_id，解封本群該用戶（僅本群，不影響訓練資料，如需連同撤銷誤判樣本請找維護組）\n<code>/unmute</code>：回覆要解除禁言的用戶、或提供 user_id\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n".to_string()
+    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n<code>/white</code>：加入本群白名單；若該用戶目前在本群被封禁，會一併解除封禁\n<code>/white -global</code>：加入全域白名單\n<code>/unwhite</code>：移出本群白名單\n<code>/unwhite -global</code>：移出全域白名單\n\n<b>群組管理員可用</b>\n<code>/module &lt;名稱&gt; &lt;on/off&gt;</code>：切換群組模組，名稱支援 NoLongName（英名檢查）/ NoHalal（清真檢查）/ NoSM（服務訊息刪除）/ Flood（洗版偵測，預設開啟）/ Captcha（新成員驗證，預設關閉）/ Netban（跨群組黑名單同步，預設關閉，需自行開啟；開啟後本群的封禁會同步到其他同樣開啟的群組，反之亦然）/ CmdClean（指令權限濫用防護，預設關閉；開啟後，沒有權限的人嘗試使用管理指令會被刪除訊息並警告一次，24 小時內再犯將被禁言 5 分鐘並記錄到日誌頻道。無論是否開啟，此類指令的錯誤提示訊息都會在 10 秒後自動刪除，減少洗版）/ GuestBan（防範 Telegram 訪客模式機器人濫用，預設開啟；任何人都能透過 @ 一個機器人使其在未加入本群的情況下直接發文，此模組會偵測並非本群成員卻發文的機器人帳號，直接刪除訊息並封禁）\n<code>/unban</code>：回覆要解封的用戶、或提供 user_id，解封本群該用戶（僅本群，不影響訓練資料，如需連同撤銷誤判樣本請找維護組）\n<code>/unmute</code>：回覆要解除禁言的用戶、或提供 user_id\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n".to_string()
 }
 
 fn help_op_text() -> String {
@@ -2687,6 +2720,7 @@ fn chinese_case_action(case: &CaseRecord) -> String {
             ActionKind::Unmuted => "已解除禁言".to_string(),
             ActionKind::FloodMute => "洗版禁言".to_string(),
             ActionKind::CmdCleanMute => "指令濫用禁言".to_string(),
+            ActionKind::GuestBotBan => "訪客模式機器人封禁".to_string(),
         }
     }
 }
@@ -3748,6 +3782,87 @@ async fn check_netban_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Messa
     true
 }
 
+/// Telegram's "guest mode" (https://core.telegram.org/api/bots/guest-mode)
+/// lets any user @-mention a bot into posting directly into a group that bot
+/// was never added to. Bot API delivers the resulting message like any
+/// other - `from` is the guest bot's own account - but with nothing linking
+/// it back to whoever actually invoked it. Every other message-time check in
+/// this file (check_flood_and_act, check_netban_and_act, auto_moderate,
+/// score_only) deliberately skips `is_bot` messages, so it never moderates a
+/// legitimately-added utility bot - which is exactly what let guest-mode
+/// posts slip through completely unchecked. The only reliable way to tell a
+/// guest-mode post apart from a real member bot's message is chat
+/// membership: a properly-added bot comes back "member"/"administrator"/
+/// "restricted"; a guest-mode poster was never added at all, so it comes
+/// back "left" - or the lookup just fails outright. A lookup error is
+/// treated as "don't know" and skipped, never as "assume guest", since a
+/// transient API hiccup must never be grounds for banning a real member bot.
+async fn check_guest_bot_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) -> bool {
+    if !message.chat.is_group() && !message.chat.is_supergroup() {
+        return false;
+    }
+    let Some(user) = message.from.as_ref() else { return false; };
+    if !user.is_bot {
+        return false;
+    }
+    let chat_id = message.chat.id.0;
+    let user_id = user.id.0 as i64;
+
+    let settings = runtime.get_group_modules(chat_id).await.unwrap_or_default();
+    if !settings.guest_ban {
+        return false;
+    }
+
+    // Reuses the existing whitelist commands as an escape hatch: a
+    // maintainer/admin who wants to keep some other legitimately-invited
+    // guest bot around can just /white its account id.
+    if runtime.is_global_whitelisted(user_id).await.unwrap_or(false) {
+        return false;
+    }
+    if runtime.is_group_whitelisted(chat_id, user_id).await.unwrap_or(false) {
+        return false;
+    }
+    if let Ok(me) = bot.get_me().await {
+        if user.id == me.id {
+            return false;
+        }
+    }
+
+    let Ok(member) = bot.get_chat_member(message.chat.id, user.id).await else { return false; };
+    if !matches!(member.kind, teloxide::types::ChatMemberKind::Left | teloxide::types::ChatMemberKind::Banned(_)) {
+        return false;
+    }
+
+    let _ = bot.delete_message(message.chat.id, message.id).await;
+    let _ = bot.ban_chat_member(message.chat.id, user.id).await;
+
+    let case = CaseRecord {
+        id: Uuid::new_v4().to_string(),
+        action: ActionKind::GuestBotBan,
+        chat_id,
+        target_user_id: user_id,
+        target_name: short_user(user),
+        actor_user_id: None,
+        actor_name: None,
+        source_message_id: Some(message.id.0),
+        evidence_text: extract_full_text(message),
+        model_score: None,
+        matched_rule_id: None,
+        matched_rule_pattern: Some("GUEST_MODE".to_string()),
+        status: "guest_bot_banned".to_string(),
+        log_message_id: None,
+        created_at: Utc::now(),
+    };
+    let log_message_id = log_action(bot, runtime, &case).await.unwrap_or_default();
+    let mut updated = case.clone();
+    updated.log_message_id = Some(log_message_id);
+    let _ = store_case(runtime, &updated).await;
+    let _ = notify_group(bot, runtime, &updated, log_message_id, "<b>訪客模式機器人已封鎖</b>").await;
+    propagate_network_ban(bot, runtime, &updated).await;
+    broadcast_ban_status(bot, runtime, updated.target_user_id, true).await;
+    true
+}
+
 async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> ResponseResult<()> {
     let Some(text) = message.text() else { return Ok(()); };
     let cmd = parse_command(text);
@@ -4418,6 +4533,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 "netban" => Some(old_settings.netban),
                 "cmdclean" => Some(old_settings.cmd_clean),
                 "warn-pol" => Some(old_settings.pol),
+                "guestban" => Some(old_settings.guest_ban),
                 _ => None,
             };
             // "warn-pol" is a customized module - not open for public use.
@@ -4427,7 +4543,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             // name" error as any typo - anyone not already allowlisted
             // can't tell "warn-pol" is a real module from that message.
             if key == "warn-pol" && enabled && !runtime.is_module_allowed("warn-pol", message.chat.id.0).await.unwrap_or(false) {
-                reply_ephemeral(&bot, &message, "模組名稱僅支援 NoLongName / NoHalal / NoSM / Flood / Captcha / Netban / CmdClean。").await?;
+                reply_ephemeral(&bot, &message, "模組名稱僅支援 NoLongName / NoHalal / NoSM / Flood / Captcha / Netban / CmdClean / GuestBan。").await?;
                 return Ok(());
             }
             match key.as_str() {
@@ -4439,8 +4555,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 "netban" => { runtime.set_group_module(message.chat.id.0, "netban", enabled).await.ok(); }
                 "cmdclean" => { runtime.set_group_module(message.chat.id.0, "cmdclean", enabled).await.ok(); }
                 "warn-pol" => { runtime.set_group_module(message.chat.id.0, "warn-pol", enabled).await.ok(); }
+                "guestban" => { runtime.set_group_module(message.chat.id.0, "guestban", enabled).await.ok(); }
                 _ => {
-                    reply_ephemeral(&bot, &message, "模組名稱僅支援 NoLongName / NoHalal / NoSM / Flood / Captcha / Netban / CmdClean。").await?;
+                    reply_ephemeral(&bot, &message, "模組名稱僅支援 NoLongName / NoHalal / NoSM / Flood / Captcha / Netban / CmdClean / GuestBan。").await?;
                     return Ok(());
                 }
             }
@@ -5656,6 +5773,17 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
 
+                // Guest-mode spam: a message "from" a bot account that was
+                // never actually added to this chat (see
+                // check_guest_bot_and_act). Runs before netban/flood since
+                // those already skip is_bot messages entirely and would
+                // otherwise waste a lookup on every one.
+                if runtime.config.test_group_id != Some(message.chat.id.0)
+                    && check_guest_bot_and_act(&bot, &runtime, &message).await
+                {
+                    return Ok(());
+                }
+
                 // Netban safety net: catches members already in a group before
                 // it opted in, or who joined between propagation events.
                 if runtime.config.test_group_id != Some(message.chat.id.0)
@@ -6272,6 +6400,22 @@ mod tests {
         assert!(runtime.get_group_modules(100).await.unwrap().pol);
         runtime.set_group_module(100, "warn-pol", false).await.unwrap();
         assert!(!runtime.get_group_modules(100).await.unwrap().pol);
+    }
+
+    // Backs check_guest_bot_and_act / /module guestban on|off: unlike every
+    // other opt-in content-policy module, guest_ban must default to true for
+    // a brand-new chat (baseline hygiene against an actively-exploited
+    // Telegram feature, matching flood_control's own default-on precedent),
+    // and still round-trips through get_group_modules/set_group_module like
+    // any other flag.
+    #[tokio::test]
+    async fn guest_ban_module_flag_defaults_on_and_toggles() {
+        let runtime = test_runtime().await;
+        assert!(runtime.get_group_modules(100).await.unwrap().guest_ban);
+        runtime.set_group_module(100, "guestban", false).await.unwrap();
+        assert!(!runtime.get_group_modules(100).await.unwrap().guest_ban);
+        runtime.set_group_module(100, "guestban", true).await.unwrap();
+        assert!(runtime.get_group_modules(100).await.unwrap().guest_ban);
     }
 
     // Backs /ml_dedupe: simulates the real dirty-data shape (a spam phrase
