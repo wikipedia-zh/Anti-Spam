@@ -706,17 +706,17 @@ impl Runtime {
     }
 
     fn load_model(conn: &Connection) -> Result<ModelState> {
-        let mut model = ModelState::default();
-        let mut stmt = conn.prepare("SELECT key, value FROM model_meta")?;
-        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
-        for row in rows {
-            let (key, value) = row?;
-            match key.as_str() {
-                "spam_docs" => model.spam_docs = value.parse().unwrap_or(0),
-                "ham_docs" => model.ham_docs = value.parse().unwrap_or(0),
-                _ => {}
-            }
-        }
+        // spam_docs/ham_docs are derived from training_samples directly, not
+        // read back from the model_meta counters those same rows are
+        // supposed to keep in sync - a maintenance pass (bulk import, a
+        // manual data-cleanup script) that touched training_samples without
+        // going through train_spam/train_ham's increment would otherwise
+        // leave model_meta silently drifted from reality forever. Deriving
+        // it fresh here makes every restart (and every rebuild_model call
+        // below) self-healing regardless of how the drift happened.
+        let spam_docs = conn.query_row("SELECT COUNT(*) FROM training_samples WHERE label = 'spam'", [], |row| row.get::<_, i64>(0))? as u64;
+        let ham_docs = conn.query_row("SELECT COUNT(*) FROM training_samples WHERE label = 'ham'", [], |row| row.get::<_, i64>(0))? as u64;
+        let mut model = ModelState { spam_docs, ham_docs, ..Default::default() };
 
         let mut stmt = conn.prepare("SELECT word, spam_count, ham_count FROM word_frequencies")?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?, row.get::<_, u64>(2)?)))?;
@@ -898,6 +898,24 @@ impl Runtime {
                    ORDER BY c.created_at DESC LIMIT 1"#,
             )?;
             let mut rows = stmt.query(params![user_id])?;
+            rows.next()?.map(case_from_row).transpose()
+        })
+        .await
+    }
+
+    /// Finds the most recent active ban for `user_id` in this *exact* chat,
+    /// with no netban involvement at all - that flag only governs whether a
+    /// ban propagates to *other* chats, and is irrelevant to "did this
+    /// specific chat already ban this person". Backs check_reban_and_act's
+    /// same-chat ban-evasion safety net.
+    async fn find_active_ban_in_chat(&self, chat_id: i64, user_id: i64) -> Result<Option<CaseRecord>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, action, chat_id, target_user_id, target_name, actor_user_id, actor_name, source_message_id, evidence_text, model_score, matched_rule_id, matched_rule_pattern, status, log_message_id, created_at
+                 FROM cases WHERE chat_id = ?1 AND target_user_id = ?2 AND action IN ('auto_ban', 'spam_ban', 'report_approved')
+                 ORDER BY created_at DESC LIMIT 1",
+            )?;
+            let mut rows = stmt.query(params![chat_id, user_id])?;
             rows.next()?.map(case_from_row).transpose()
         })
         .await
@@ -1268,17 +1286,12 @@ impl Runtime {
     async fn rebuild_model(&self) -> Result<ModelState> {
         let rebuilt = self
             .with_conn(|conn| {
-                let mut rebuilt = ModelState::default();
-                let mut stmt = conn.prepare("SELECT key, value FROM model_meta")?;
-                let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
-                for row in rows {
-                    let (key, value) = row?;
-                    match key.as_str() {
-                        "spam_docs" => rebuilt.spam_docs = value.parse().unwrap_or(0),
-                        "ham_docs" => rebuilt.ham_docs = value.parse().unwrap_or(0),
-                        _ => {}
-                    }
-                }
+                // See load_model's comment: derived from training_samples,
+                // not the separately-tracked model_meta counters, so this
+                // self-heals any drift between the two instead of persisting it.
+                let spam_docs = conn.query_row("SELECT COUNT(*) FROM training_samples WHERE label = 'spam'", [], |row| row.get::<_, i64>(0))? as u64;
+                let ham_docs = conn.query_row("SELECT COUNT(*) FROM training_samples WHERE label = 'ham'", [], |row| row.get::<_, i64>(0))? as u64;
+                let mut rebuilt = ModelState { spam_docs, ham_docs, ..Default::default() };
                 let mut stmt = conn.prepare("SELECT word, spam_count, ham_count FROM word_frequencies ORDER BY word ASC")?;
                 let mut rows = stmt.query([])?;
                 while let Some(row) = rows.next()? {
@@ -3133,6 +3146,20 @@ async fn notify_netban_sync(bot: &Bot, chat_id: ChatId, target_user_id: i64, cas
     });
 }
 
+/// Same shape as `notify_netban_sync`, but for check_reban_and_act's
+/// same-chat case - worth flagging to admins since a ban that let its
+/// target back in once might do so again, unlike a routine netban sync.
+async fn notify_reban_sync(bot: &Bot, chat_id: ChatId, target_user_id: i64, case_id: &str) {
+    let text = format!("<b>已封禁用戶再次發言</b>\n用戶 <code>{target_user_id}</code> 在本群仍有生效中的封禁記錄，但成功再次發言，已刪除訊息並重新封禁。\n原始案例: <code>{case_id}</code>");
+    let Ok(sent) = bot.send_message(chat_id, text).parse_mode(ParseMode::Html).await else { return };
+    let bot = bot.clone();
+    let message_id = sent.id;
+    tokio::spawn(async move {
+        sleep(Duration::from_secs(180)).await;
+        let _ = bot.delete_message(chat_id, message_id).await;
+    });
+}
+
 /// Records a state-changing maintainer command and, if `/set_audit_log` has
 /// been configured, posts it to the private audit channel with its new
 /// `action_id` and a `/revert` hint (unless `undo` is `NotRevertible`).
@@ -3779,6 +3806,47 @@ async fn check_netban_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Messa
     let _ = bot.ban_chat_member(message.chat.id, user.id).await;
     let _ = runtime.record_network_ban_target(&prior_case.id, chat_id).await;
     notify_netban_sync(bot, message.chat.id, user_id, &prior_case.id).await;
+    true
+}
+
+/// Same-chat ban-evasion safety net: a Telegram ban is supposed to make
+/// re-posting in that exact chat impossible, so this should normally never
+/// trip - but if it somehow does (a ban that silently failed to take, a
+/// Telegram-side enforcement gap, anything else outside this bot's control),
+/// this catches the repost instead of letting it fall through to ordinary
+/// scoring, which might not flag it at all if the content itself looks
+/// innocuous. Deliberately has nothing to do with netban - that flag only
+/// controls whether a ban *propagates to other chats*, not whether this
+/// chat remembers its own past bans, so unlike check_netban_and_act this
+/// always applies regardless of any module setting.
+async fn check_reban_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) -> bool {
+    if !message.chat.is_group() && !message.chat.is_supergroup() {
+        return false;
+    }
+    let Some(user) = message.from.as_ref() else { return false; };
+    if user.is_bot {
+        return false;
+    }
+    let chat_id = message.chat.id.0;
+    let user_id = user.id.0 as i64;
+
+    if is_special_user(&runtime.config, user_id) {
+        return false;
+    }
+    if runtime.is_global_whitelisted(user_id).await.unwrap_or(false) {
+        return false;
+    }
+    if runtime.is_group_whitelisted(chat_id, user_id).await.unwrap_or(false) {
+        return false;
+    }
+
+    let Ok(Some(prior_case)) = runtime.find_active_ban_in_chat(chat_id, user_id).await else {
+        return false;
+    };
+
+    let _ = bot.delete_message(message.chat.id, message.id).await;
+    let _ = bot.ban_chat_member(message.chat.id, user.id).await;
+    notify_reban_sync(bot, message.chat.id, user_id, &prior_case.id).await;
     true
 }
 
@@ -5792,6 +5860,16 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
 
+                // Same-chat ban-evasion safety net: this chat's own past ban
+                // should already have stopped a repost, but if it didn't,
+                // catch it here rather than falling through to ordinary
+                // content scoring.
+                if runtime.config.test_group_id != Some(message.chat.id.0)
+                    && check_reban_and_act(&bot, &runtime, &message).await
+                {
+                    return Ok(());
+                }
+
                 // Behavioral flood check runs before anything content-based, and
                 // for every message type - skip it in the test group, which is
                 // score-only by design (see score_only below) and never enforces.
@@ -5926,6 +6004,39 @@ mod tests {
         let export = runtime.export_training_data().await.unwrap();
         assert!(export.contains("spam"));
         assert!(export.contains("case-1"));
+    }
+
+    // Regression check for the spam_docs/ham_docs=0 incident found live in
+    // production after /ml_dedupe: a prior bulk data-cleanup pass had
+    // inserted rows straight into training_samples (bypassing train_spam/
+    // train_ham's increment), so model_meta's spam_docs/ham_docs counters
+    // never reflected the real row count - dedup's decrement-by-1-per-
+    // removed-row then clamped them to 0 well before accounting for every
+    // real row. Simulates exactly that: seed training_samples directly with
+    // real rows while model_meta's counters stay wrong/stale, and confirm
+    // rebuild_model (and by extension load_model, the startup path) derives
+    // spam_docs/ham_docs from the actual training_samples rows rather than
+    // trusting the drifted counter.
+    #[tokio::test]
+    async fn rebuild_model_derives_doc_counts_from_training_samples_not_stale_model_meta() {
+        let runtime = test_runtime().await;
+        runtime
+            .with_conn(|conn| {
+                conn.execute("INSERT INTO training_samples (label, text, created_at) VALUES ('spam', 'a', '2026-01-01')", [])?;
+                conn.execute("INSERT INTO training_samples (label, text, created_at) VALUES ('spam', 'b', '2026-01-01')", [])?;
+                conn.execute("INSERT INTO training_samples (label, text, created_at) VALUES ('ham', 'c', '2026-01-01')", [])?;
+                // Stale/wrong on purpose - this is what a bulk import that
+                // skipped train_spam/train_ham would leave behind.
+                conn.execute("INSERT INTO model_meta (key, value) VALUES ('spam_docs', '0')", [])?;
+                conn.execute("INSERT INTO model_meta (key, value) VALUES ('ham_docs', '0')", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let rebuilt = runtime.rebuild_model().await.unwrap();
+        assert_eq!(rebuilt.spam_docs, 2);
+        assert_eq!(rebuilt.ham_docs, 1);
     }
 
     // Regression check for the /set corruption incident: seeds a v1-shaped DB
@@ -6117,6 +6228,28 @@ mod tests {
         runtime.set_group_module(100, "netban", true).await.unwrap();
         let found = runtime.find_active_network_ban(200).await.unwrap();
         assert_eq!(found.map(|c| c.id), Some(case.id.clone()));
+    }
+
+    // Backs check_reban_and_act's same-chat ban-evasion safety net. Unlike
+    // find_active_network_ban, this must NOT require netban - that flag only
+    // controls cross-group propagation, not whether a chat remembers its own
+    // past bans - and must be scoped strictly per-chat (a ban in chat 100
+    // must not match a lookup in chat 300, even for the same user).
+    #[tokio::test]
+    async fn find_active_ban_in_chat_ignores_netban_and_is_scoped_per_chat() {
+        let runtime = test_runtime().await;
+        let case = dummy_case(ActionKind::AutoBan, 100, 200, Utc::now());
+        runtime.persist_case(&case).await.unwrap();
+
+        assert!(
+            runtime.find_active_ban_in_chat(100, 200).await.unwrap().is_some(),
+            "netban being off must not hide a same-chat ban"
+        );
+        assert!(
+            runtime.find_active_ban_in_chat(300, 200).await.unwrap().is_none(),
+            "a ban in chat 100 must not count as active in an unrelated chat 300"
+        );
+        assert!(runtime.find_active_ban_in_chat(100, 999).await.unwrap().is_none());
     }
 
     // Same "reversal mutates action in place" property as
