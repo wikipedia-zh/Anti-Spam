@@ -4111,16 +4111,22 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 case_id
             );
 
-            let sent = bot
+            bot
                 .send_message(ChatId(runtime.config.report_channel_id), text)
                 .parse_mode(ParseMode::Html)
                 .reply_markup(keyboard)
                 .await?;
 
-            let mut stored = case.clone();
-            stored.log_message_id = Some(sent.id.0);
-            stored.status = "pending_review".to_string();
-            store_case(&runtime, &stored).await.ok();
+            // log_message_id stays None here (not the report-review card's
+            // message id, which lives in report_channel_id, a different
+            // chat) - public_log_link() always builds its URL against
+            // log_channel_id, so storing a different chat's message id
+            // here previously produced a link to a numerically-coincidental
+            // but completely unrelated log-channel message. It's only ever
+            // meaningful once something actually calls log_action, which
+            // only the "approve" review outcome does; "reject" correctly
+            // leaves it unset, and /case already renders that as "-".
+            store_case(&runtime, &case).await.ok();
 
             bot.send_message(message.chat.id, "已送交舉報處理頻道審核。")
                 .await?;
