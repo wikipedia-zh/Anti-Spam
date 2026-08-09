@@ -2335,6 +2335,7 @@ enum ModerationCommand {
     AddRule(String),
     EditRule(String, String),
     UpdateBL,
+    RefreshBL,
     ListRules,
     CheckRules,
     DelRule(String),
@@ -2405,6 +2406,7 @@ fn parse_command(text: &str) -> ModerationCommand {
             ModerationCommand::EditRule(rule_id, pattern)
         }
         "/updatebl" => ModerationCommand::UpdateBL,
+        "/refreshbl" => ModerationCommand::RefreshBL,
         "/list_rules" => ModerationCommand::ListRules,
         "/check_rules" => ModerationCommand::CheckRules,
         "/del_rule" => ModerationCommand::DelRule(text.split_whitespace().nth(1).unwrap_or("").to_string()),
@@ -2746,7 +2748,7 @@ fn help_text() -> String {
 }
 
 fn help_op_text() -> String {
-    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>（別名 <code>/mark_spam</code>）：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可。會解封並在找得到對應案例時一併移除錯誤訓練樣本並重建模型，若該案例曾透過 Netban 同步封禁到其他群組，也會一併在那些群組解封（群組管理員也能用 /unban，但僅解封本群、不影響訓練資料與其他群組）\n<code>/unmute</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可，並會撤銷對應案例（群組管理員也能用 /unmute，但僅解除本群禁言）\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat [chat_id]</code>：設定工作群組。不帶參數時直接綁定目前所在的群組；也可提供 chat_id 從其他地方設定。綁定後，若該群組串連的頻道發文時被 Telegram 自動釘選，機器人會自動取消釘選，避免洗掉手動釘選的訊息\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n<code>/ping</code>：確認機器人在線，並回報目前運行的版本號與 commit hash\n<code>/set_audit_log [chat_id]</code>：設定維護操作日誌頻道。不帶參數時綁定目前所在的群組/頻道。設定後，每個會改變狀態的維護指令（門檻、白名單、模組開關、規則異動、封禁/禁言等）都會記錄在這裡，並附上 action id\n<code>/revert &lt;action_id&gt;</code>：復原指定的維護操作，回到變更前的狀態；封禁/禁言類會重用 /unban、/unmute 的邏輯。少數沒有明確「復原前狀態」的操作無法自動復原，會直接告知\n<code>/set_exchange_channel &lt;chat_id&gt;</code>：設定 PM 申訴機器人橋接用的交換頻道。設定後，機器人會回應 PM 透過該頻道發出的封禁查詢與解封請求，讓被封禁用戶能透過 PM 自助查詢並申訴\n<code>/pol show</code>：回覆一位用戶，查詢其在本群目前的警告次數\n<code>/pol clear</code>：回覆一位用戶，清除其在本群的所有警告\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
+    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>（別名 <code>/mark_spam</code>）：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可。會解封並在找得到對應案例時一併移除錯誤訓練樣本並重建模型，若該案例曾透過 Netban 同步封禁到其他群組，也會一併在那些群組解封（群組管理員也能用 /unban，但僅解封本群、不影響訓練資料與其他群組）\n<code>/unmute</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可，並會撤銷對應案例（群組管理員也能用 /unmute，但僅解除本群禁言）\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat [chat_id]</code>：設定工作群組。不帶參數時直接綁定目前所在的群組；也可提供 chat_id 從其他地方設定。綁定後，若該群組串連的頻道發文時被 Telegram 自動釘選，機器人會自動取消釘選，避免洗掉手動釘選的訊息\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n<code>/ping</code>：確認機器人在線，並回報目前運行的版本號與 commit hash\n<code>/set_audit_log [chat_id]</code>：設定維護操作日誌頻道。不帶參數時綁定目前所在的群組/頻道。設定後，每個會改變狀態的維護指令（門檻、白名單、模組開關、規則異動、封禁/禁言等）都會記錄在這裡，並附上 action id\n<code>/revert &lt;action_id&gt;</code>：復原指定的維護操作，回到變更前的狀態；封禁/禁言類會重用 /unban、/unmute 的邏輯。少數沒有明確「復原前狀態」的操作無法自動復原，會直接告知\n<code>/set_exchange_channel &lt;chat_id&gt;</code>：設定 PM 申訴機器人橋接用的交換頻道。設定後，機器人會回應 PM 透過該頻道發出的封禁查詢與解封請求，讓被封禁用戶能透過 PM 自助查詢並申訴\n<code>/pol show</code>：回覆一位用戶，查詢其在本群目前的警告次數\n<code>/pol clear</code>：回覆一位用戶，清除其在本群的所有警告\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明（重新發文並釘選）\n<code>/refreshBL</code>：就地編輯上一則封禁代號說明，不重新發文/釘選\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
 }
 
 fn format_score_debug(report: &ScoreDebugReport) -> String {
@@ -2841,7 +2843,7 @@ fn global_whitelist_check_text() -> String {
 }
 
 fn build_blacklist_reason_text(_runtime: &Runtime) -> String {
-    "<b>❖ 封禁代號說明</b>\n\n- <code>NLDIGIT</code>: 英名含數字\n- <code>NL13</code>: 英名多段且總長度 >= 13\n- <code>NLTAIL</code>: 英名多段且尾段過長\n- <code>NLSINGLE</code>: 英名單段且長度 >= 11\n- <code>ARABIC</code>: 偵測到清真\n- <code>REGEX</code>: 觸發正則規則\n- <code>FLOOD</code>: 洗版偵測（5 秒內傳送 5 條以上訊息）\n- <code>PERM_REPEAT</code>: 24 小時內重複嘗試使用無權限的指令\n\n申訴找 @SEELE_01_BOT".to_string()
+    "<b>❖ 封禁代號說明</b>\n\n- <code>NLDIGIT</code>: 英名含數字\n- <code>NL13</code>: 英名多段且總長度 >= 13\n- <code>NLTAIL</code>: 英名多段且尾段過長\n- <code>NLSINGLE</code>: 英名單段且長度 >= 11\n- <code>ARABIC</code>: 偵測到清真\n- <code>REGEX</code>: 觸發正則規則\n- <code>FLOOD</code>: 洗版偵測（5 秒內傳送 5 條以上訊息）\n- <code>PERM_REPEAT</code>: 24 小時內重複嘗試使用無權限的指令\n- <code>GUEST_MODE</code>: 訪客模式機器人（未加入本群卻發文）\n- <code>GUEST_MODE_INVOKER</code>: 召喚訪客模式機器人的人\n\n申訴找 @SEELE_01_BOT".to_string()
 }
 
 fn format_case_lookup(case: &CaseRecord, link: &str, reason_link: &str) -> String {
@@ -4719,6 +4721,22 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let _ = bot.pin_chat_message(ChatId(runtime.config.log_channel_id), sent.id).await;
             let _ = runtime.set_blacklist_reason_message_id(sent.id.0).await;
             bot.send_message(message.chat.id, format!("已更新封禁代號說明：<code>{}</code>", sent.id.0)).parse_mode(ParseMode::Html).await?;
+        }
+        ModerationCommand::RefreshBL => {
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
+            let Some(existing_id) = runtime.blacklist_reason_message_id().await.ok().flatten() else {
+                bot.send_message(message.chat.id, "還沒發過封禁代號說明，先用 /updateBL。").await?;
+                return Ok(());
+            };
+            let text = build_blacklist_reason_text(&runtime);
+            match bot.edit_message_text(ChatId(runtime.config.log_channel_id), MessageId(existing_id), text).parse_mode(ParseMode::Html).await {
+                Ok(_) => {
+                    bot.send_message(message.chat.id, format!("已就地更新，沒有重新發文/釘選：<code>{}</code>", existing_id)).parse_mode(ParseMode::Html).await?;
+                }
+                Err(err) => {
+                    bot.send_message(message.chat.id, format!("編輯失敗（訊息可能已被刪除），改用 /updateBL：{err}")).await?;
+                }
+            }
         }
         ModerationCommand::Module(module, state) => {
             if !message.chat.is_group() && !message.chat.is_supergroup() {
