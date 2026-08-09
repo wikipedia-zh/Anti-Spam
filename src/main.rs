@@ -79,6 +79,7 @@ enum ActionKind {
     FloodMute,
     CmdCleanMute,
     GuestBotBan,
+    GuestInvokerBan,
 }
 
 impl ActionKind {
@@ -97,6 +98,7 @@ impl ActionKind {
             ActionKind::FloodMute => "flood_mute",
             ActionKind::CmdCleanMute => "cmd_clean_mute",
             ActionKind::GuestBotBan => "guest_bot_ban",
+            ActionKind::GuestInvokerBan => "guest_invoker_ban",
         }
     }
 
@@ -115,6 +117,7 @@ impl ActionKind {
             "flood_mute" => ActionKind::FloodMute,
             "cmd_clean_mute" => ActionKind::CmdCleanMute,
             "guest_bot_ban" => ActionKind::GuestBotBan,
+            "guest_invoker_ban" => ActionKind::GuestInvokerBan,
             _ => ActionKind::AutoBan,
         }
     }
@@ -242,6 +245,24 @@ struct Runtime {
     /// their next message, or the timeout task (also lost on restart)
     /// simply never fires — no harm either way, just re-issue on demand.
     pending_captcha: Mutex<HashMap<(i64, i64), PendingCaptcha>>,
+    /// chat_id -> last few human (non-bot) messages, newest last. Backs
+    /// check_guest_bot_and_act's invoker correlation: Bot API never tells us
+    /// who summoned a guest-mode bot (that link only exists in MTProto's
+    /// `guestchat_via_from`, not the classic Bot API surface teloxide uses),
+    /// so the only way to catch the human who typed `@thatbot` is to look at
+    /// what was actually said just before the guest reply landed. In-memory
+    /// only, small fixed cap per chat (see record_recent_message) - this is
+    /// short-lived correlation context, not something worth persisting.
+    recent_messages: Mutex<HashMap<i64, VecDeque<RecentMessage>>>,
+}
+
+/// One entry in `Runtime::recent_messages`. See that field's doc comment.
+struct RecentMessage {
+    user_id: i64,
+    message_id: MessageId,
+    display_name: String,
+    text: String,
+    seen_at: Instant,
 }
 
 struct PendingCaptcha {
@@ -375,6 +396,7 @@ impl Runtime {
             group_module_cache: RwLock::new(HashMap::new()),
             flood_tracker: Mutex::new(HashMap::new()),
             pending_captcha: Mutex::new(HashMap::new()),
+            recent_messages: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1982,6 +2004,57 @@ impl Runtime {
         timestamps.len() >= LIMIT
     }
 
+    /// Records a human message for check_guest_bot_and_act's invoker
+    /// correlation (see `recent_messages`'s doc comment for why this exists
+    /// at all). Capped at a handful of entries per chat - this only ever
+    /// needs to answer "what did someone say a few seconds ago", not build
+    /// any real history.
+    async fn record_recent_message(&self, chat_id: i64, user_id: i64, message_id: MessageId, display_name: &str, text: &str) {
+        const CAP: usize = 8;
+        let mut buffers = self.recent_messages.lock().await;
+        let entries = buffers.entry(chat_id).or_default();
+        entries.push_back(RecentMessage {
+            user_id,
+            message_id,
+            display_name: display_name.to_string(),
+            text: text.to_string(),
+            seen_at: Instant::now(),
+        });
+        while entries.len() > CAP {
+            entries.pop_front();
+        }
+    }
+
+    /// Scans this chat's recent human messages (most recent first) for one
+    /// that bare-mentions `bot_username` - the literal way guest mode is
+    /// invoked - within the last `WINDOW` of real time. "Bare" means what's
+    /// left after stripping the `@mention` is short: real conversation that
+    /// happens to reference a bot by name reads nothing like a guest-mode
+    /// summon, which per Telegram's own docs is just the @-mention on its
+    /// own. This is a heuristic, not a certainty - Bot API has no field
+    /// linking a guest reply back to whoever triggered it - so callers
+    /// should treat a match as strong evidence, not proof.
+    async fn find_recent_guest_invoker(&self, chat_id: i64, bot_username: &str) -> Option<(i64, MessageId, String, String)> {
+        const WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+        const BARE_MAX_REMAINDER: usize = 8;
+        let mention = format!("@{}", bot_username.to_lowercase());
+        let now = Instant::now();
+        let buffers = self.recent_messages.lock().await;
+        let entries = buffers.get(&chat_id)?;
+        entries.iter().rev().find_map(|entry| {
+            if now.duration_since(entry.seen_at) > WINDOW {
+                return None;
+            }
+            let lower = entry.text.to_lowercase();
+            let remainder = lower.replace(&mention, "");
+            if lower.contains(&mention) && remainder.trim().chars().count() <= BARE_MAX_REMAINDER {
+                Some((entry.user_id, entry.message_id, entry.display_name.clone(), entry.text.clone()))
+            } else {
+                None
+            }
+        })
+    }
+
     async fn is_group_whitelisted(&self, chat_id: i64, user_id: i64) -> Result<bool> {
         self.with_conn(move |conn| {
             let count: i64 = conn.query_row(
@@ -2734,6 +2807,7 @@ fn chinese_case_action(case: &CaseRecord) -> String {
             ActionKind::FloodMute => "洗版禁言".to_string(),
             ActionKind::CmdCleanMute => "指令濫用禁言".to_string(),
             ActionKind::GuestBotBan => "訪客模式機器人封禁".to_string(),
+            ActionKind::GuestInvokerBan => "訪客模式召喚者封禁".to_string(),
         }
     }
 }
@@ -3928,6 +4002,53 @@ async fn check_guest_bot_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Me
     let _ = notify_group(bot, runtime, &updated, log_message_id, "<b>訪客模式機器人已封鎖</b>").await;
     propagate_network_ban(bot, runtime, &updated).await;
     broadcast_ban_status(bot, runtime, updated.target_user_id, true).await;
+
+    // The guest bot's own account is only half the problem - whoever typed
+    // `@thatbot` to summon it is a real member who chose to invite spam into
+    // the chat, and their message (plus their spammy profile, per the
+    // report that led to this) stays behind untouched otherwise. Bot API
+    // gives no way to identify them directly (see this function's doc
+    // comment), so this falls back to the best available signal: the most
+    // recent bare `@thatbot` mention in this chat. See
+    // find_recent_guest_invoker for exactly what counts as a match.
+    if let Some(bot_username) = user.username.as_deref() {
+        if let Some((invoker_id, invoker_msg_id, invoker_name, invoker_text)) = runtime.find_recent_guest_invoker(chat_id, bot_username).await {
+            let invoker_exempt = is_special_user(&runtime.config, invoker_id)
+                || runtime.is_global_whitelisted(invoker_id).await.unwrap_or(false)
+                || runtime.is_group_whitelisted(chat_id, invoker_id).await.unwrap_or(false)
+                || is_group_admin(bot, message.chat.id, invoker_id).await;
+            if !invoker_exempt {
+                let _ = bot.delete_message(message.chat.id, invoker_msg_id).await;
+                let _ = bot.ban_chat_member(message.chat.id, UserId(invoker_id as u64)).await;
+
+                let invoker_case = CaseRecord {
+                    id: Uuid::new_v4().to_string(),
+                    action: ActionKind::GuestInvokerBan,
+                    chat_id,
+                    target_user_id: invoker_id,
+                    target_name: invoker_name,
+                    actor_user_id: None,
+                    actor_name: None,
+                    source_message_id: Some(invoker_msg_id.0),
+                    evidence_text: invoker_text,
+                    model_score: None,
+                    matched_rule_id: None,
+                    matched_rule_pattern: Some("GUEST_MODE_INVOKER".to_string()),
+                    status: "guest_invoker_banned".to_string(),
+                    log_message_id: None,
+                    created_at: Utc::now(),
+                };
+                let invoker_log_id = log_action(bot, runtime, &invoker_case).await.unwrap_or_default();
+                let mut invoker_updated = invoker_case.clone();
+                invoker_updated.log_message_id = Some(invoker_log_id);
+                let _ = store_case(runtime, &invoker_updated).await;
+                let _ = notify_group(bot, runtime, &invoker_updated, invoker_log_id, "<b>訪客模式召喚者已封鎖</b>").await;
+                propagate_network_ban(bot, runtime, &invoker_updated).await;
+                broadcast_ban_status(bot, runtime, invoker_updated.target_user_id, true).await;
+            }
+        }
+    }
+
     true
 }
 
@@ -5829,6 +5950,19 @@ async fn main() -> Result<()> {
                 // still needs to inspect it either way.
                 unpin_channel_autopin(&bot, &runtime, &message).await;
 
+                // Feeds check_guest_bot_and_act's invoker correlation - has
+                // to run unconditionally, before any check below might
+                // delete/short-circuit on this message, since a bare
+                // `@thatbot` mention (the message we most need to catch)
+                // never trips any other check on its own.
+                if (message.chat.is_group() || message.chat.is_supergroup()) && !message.from.as_ref().map(|u| u.is_bot).unwrap_or(true) {
+                    if let (Some(user), Some(text)) = (message.from.as_ref(), message.text().or(message.caption())) {
+                        if !text.trim().is_empty() {
+                            runtime.record_recent_message(message.chat.id.0, user.id.0 as i64, message.id, &short_user(user), text).await;
+                        }
+                    }
+                }
+
                 // First, check and delete service messages if enabled
                 if delete_service_message_if_enabled(&bot, &runtime, &message).await? {
                     return Ok(());
@@ -6250,6 +6384,32 @@ mod tests {
             "a ban in chat 100 must not count as active in an unrelated chat 300"
         );
         assert!(runtime.find_active_ban_in_chat(100, 999).await.unwrap().is_none());
+    }
+
+    // Backs check_guest_bot_and_act's invoker correlation: a bare
+    // `@botusername` mention (how guest mode is actually invoked) must
+    // match case-insensitively and return the most recent one, but a longer
+    // message that merely references the bot in passing must not - that's
+    // ordinary conversation, not a guest-mode summon, and banning over it
+    // would be a real false positive.
+    #[tokio::test]
+    async fn find_recent_guest_invoker_matches_bare_mention_not_ordinary_conversation() {
+        let runtime = test_runtime().await;
+        runtime.record_recent_message(100, 111, MessageId(1), "Alice", "hello everyone").await;
+        runtime.record_recent_message(100, 222, MessageId(2), "Bob", "hey has anyone actually used @iurfdervfbot before, is it any good?").await;
+        runtime.record_recent_message(100, 333, MessageId(3), "Carol", "@IURFdervfBOT").await;
+
+        let found = runtime.find_recent_guest_invoker(100, "iurfdervfbot").await;
+        assert_eq!(found.map(|(id, _, _, _)| id), Some(333), "must match case-insensitively and prefer the most recent bare mention, skipping Bob's ordinary sentence");
+
+        assert!(
+            runtime.find_recent_guest_invoker(200, "iurfdervfbot").await.is_none(),
+            "must be scoped per chat - nothing was recorded in chat 200"
+        );
+        assert!(
+            runtime.find_recent_guest_invoker(100, "someotherbot").await.is_none(),
+            "must not match a bot username nobody actually mentioned"
+        );
     }
 
     // Same "reversal mutates action in place" property as
