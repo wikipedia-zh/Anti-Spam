@@ -2909,6 +2909,24 @@ fn is_special_user(config: &Config, user_id: i64) -> bool {
     config.maintainer_ids.contains(&user_id)
 }
 
+/// Telegram's own reserved pseudo-accounts, not real chat members and never
+/// bannable in any way that matters. 777000 ("Telegram") is reused as the
+/// immediate sender for messages auto-forwarded from a linked channel into
+/// its discussion group (and for platform service notifications) - a group
+/// whose channel is linked will see routine, legitimate channel content
+/// arrive "from" this id constantly. 1087968824 ("GroupAnonymousBot") and
+/// 136817688 ("Channel") are the pseudo-senders for anonymous-admin posts
+/// and anonymous channel posts respectively. None of these identify an
+/// actual person to hold accountable, so every message-time moderation
+/// check must treat them like `is_special_user` - an incident where the
+/// classifier auto-banned 777000 for a forwarded post's content, and the
+/// same-chat reban safety net then kept re-deleting every legitimate
+/// announcement that followed, is exactly why this exists.
+fn is_platform_pseudo_user(user_id: i64) -> bool {
+    const IDS: &[i64] = &[777000, 1087968824, 136817688];
+    IDS.contains(&user_id)
+}
+
 const CAPTCHA_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Not cryptographically random and not meant to be - this only needs to be
@@ -3042,7 +3060,7 @@ async fn notify_bot_added(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) 
     }
 
     for user in users {
-        if is_special_user(&runtime.config, user.id.0 as i64) {
+        if is_special_user(&runtime.config, user.id.0 as i64) || is_platform_pseudo_user(user.id.0 as i64) {
             continue;
         }
         if runtime.is_global_whitelisted(user.id.0 as i64).await.unwrap_or(false) {
@@ -3788,7 +3806,7 @@ async fn check_flood_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Messag
     let chat_id = message.chat.id.0;
     let user_id = user.id.0 as i64;
 
-    if is_special_user(&runtime.config, user_id) {
+    if is_special_user(&runtime.config, user_id) || is_platform_pseudo_user(user_id) {
         return Ok(false);
     }
     if runtime.is_global_whitelisted(user_id).await.unwrap_or(false) {
@@ -3853,7 +3871,7 @@ async fn check_netban_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Messa
     let chat_id = message.chat.id.0;
     let user_id = user.id.0 as i64;
 
-    if is_special_user(&runtime.config, user_id) {
+    if is_special_user(&runtime.config, user_id) || is_platform_pseudo_user(user_id) {
         return false;
     }
 
@@ -3904,7 +3922,7 @@ async fn check_reban_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Messag
     let chat_id = message.chat.id.0;
     let user_id = user.id.0 as i64;
 
-    if is_special_user(&runtime.config, user_id) {
+    if is_special_user(&runtime.config, user_id) || is_platform_pseudo_user(user_id) {
         return false;
     }
     if runtime.is_global_whitelisted(user_id).await.unwrap_or(false) {
@@ -4014,6 +4032,7 @@ async fn check_guest_bot_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Me
     if let Some(bot_username) = user.username.as_deref() {
         if let Some((invoker_id, invoker_msg_id, invoker_name, invoker_text)) = runtime.find_recent_guest_invoker(chat_id, bot_username).await {
             let invoker_exempt = is_special_user(&runtime.config, invoker_id)
+                || is_platform_pseudo_user(invoker_id)
                 || runtime.is_global_whitelisted(invoker_id).await.unwrap_or(false)
                 || runtime.is_group_whitelisted(chat_id, invoker_id).await.unwrap_or(false)
                 || is_group_admin(bot, message.chat.id, invoker_id).await;
@@ -4233,7 +4252,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 return Ok(());
             }
 
-            if is_group_admin(&bot, message.chat.id, target_id).await || is_special_user(&runtime.config, target_id) {
+            if is_group_admin(&bot, message.chat.id, target_id).await || is_special_user(&runtime.config, target_id) || is_platform_pseudo_user(target_id) {
                 reply_ephemeral(&bot, &message, "不能對群組管理員或項目維護人員執行此指令。").await?;
                 return Ok(());
             }
@@ -4342,7 +4361,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                         reply_ephemeral(&bot, &message, "請回覆一條訊息後再使用此指令。").await?;
                         return Ok(());
                     };
-                    if is_group_admin(&bot, message.chat.id, target_id).await || is_special_user(&runtime.config, target_id) {
+                    if is_group_admin(&bot, message.chat.id, target_id).await || is_special_user(&runtime.config, target_id) || is_platform_pseudo_user(target_id) {
                         reply_ephemeral(&bot, &message, "不能對群組管理員或項目維護人員執行此指令。").await?;
                         return Ok(());
                     }
@@ -5600,7 +5619,7 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
 
 async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> ResponseResult<()> {
     let Some(user) = message.from.as_ref() else { return Ok(()); };
-    if user.is_bot {
+    if user.is_bot || is_platform_pseudo_user(user.id.0 as i64) {
         return Ok(());
     }
     if runtime.is_global_whitelisted(user.id.0 as i64).await.unwrap_or(false) {
@@ -5688,7 +5707,7 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
 
 async fn score_only(bot: &Bot, runtime: &Runtime, message: &Message) -> ResponseResult<()> {
     let Some(user) = message.from.as_ref() else { return Ok(()); };
-    if user.is_bot {
+    if user.is_bot || is_platform_pseudo_user(user.id.0 as i64) {
         return Ok(());
     }
     let text = extract_full_text(message);
@@ -6410,6 +6429,19 @@ mod tests {
             runtime.find_recent_guest_invoker(100, "someotherbot").await.is_none(),
             "must not match a bot username nobody actually mentioned"
         );
+    }
+
+    // Regression check for the 777000 ("Telegram") incident: the reban
+    // safety net kept deleting/re-banning routine linked-channel-forward
+    // announcements because it didn't know 777000 isn't a real, bannable
+    // account. Every id on the exemption list must be recognized, and an
+    // ordinary user id must not accidentally match.
+    #[test]
+    fn platform_pseudo_user_ids_are_recognized() {
+        assert!(is_platform_pseudo_user(777000), "777000 = Telegram service/linked-channel-forward pseudo-account");
+        assert!(is_platform_pseudo_user(1087968824), "GroupAnonymousBot");
+        assert!(is_platform_pseudo_user(136817688), "Channel (anonymous channel post pseudo-sender)");
+        assert!(!is_platform_pseudo_user(200), "an ordinary user id must not be treated as a platform pseudo-account");
     }
 
     // Same "reversal mutates action in place" property as
