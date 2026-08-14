@@ -732,10 +732,13 @@ impl Runtime {
     ///    silently retracted every ban it had ever contributed, and
     ///    toggling it on retroactively promoted its whole ban history.
     ///
-    /// Backfill reproduces the old rule (origin group currently on the
-    /// network) so nothing already enforced is dropped, and additionally
-    /// admits past bans that clear the global bar on score alone - those
-    /// are exactly the ones the new rule would have accepted anyway.
+    /// Backfill applies `netban_eligible`'s rule to the existing history
+    /// rather than preserving whatever the old JOIN happened to return.
+    /// That deliberately *drops* past entries the new rule rejects - `/sb`
+    /// bans and unscored module bans that only qualified because their group
+    /// was on the network. Those are exactly the group-level decisions that
+    /// shouldn't have been project-wide, so leaving them in place would keep
+    /// enforcing the thing this change exists to stop.
     fn migrate_v8_to_v9(conn: &mut Connection) -> Result<()> {
         let threshold = Self::load_threshold(conn)?.unwrap_or(0.85);
         let tx = conn.transaction()?;
@@ -743,11 +746,8 @@ impl Runtime {
         tx.execute(
             r#"
             UPDATE cases SET netban_eligible = 1
-            WHERE action IN ('auto_ban', 'spam_ban', 'report_approved')
-              AND (
-                chat_id IN (SELECT chat_id FROM group_module_settings WHERE netban = 1)
-                OR (model_score IS NOT NULL AND model_score >= ?1)
-              )
+            WHERE action IN ('report_approved', 'guest_bot_ban', 'guest_invoker_ban')
+               OR (action = 'auto_ban' AND model_score IS NOT NULL AND model_score >= ?1)
             "#,
             params![threshold],
         )?;
@@ -1031,9 +1031,16 @@ impl Runtime {
     async fn find_active_network_ban(&self, user_id: i64) -> Result<Option<CaseRecord>> {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
+                // The action filter is only here to drop reversed cases -
+                // /unban rewrites `action` to 'unbanned' in place, so a
+                // lifted ban stops matching. Guest-mode bans are listed
+                // because they're netban-eligible (see `netban_eligible`);
+                // without them here a guest bot would be propagated at ban
+                // time but forgotten by the time it joined somewhere new.
                 "SELECT id, action, chat_id, target_user_id, target_name, actor_user_id, actor_name, source_message_id, evidence_text, model_score, matched_rule_id, matched_rule_pattern, status, log_message_id, created_at
                  FROM cases
-                 WHERE target_user_id = ?1 AND netban_eligible = 1 AND action IN ('auto_ban', 'spam_ban', 'report_approved')
+                 WHERE target_user_id = ?1 AND netban_eligible = 1
+                   AND action IN ('auto_ban', 'spam_ban', 'report_approved', 'guest_bot_ban', 'guest_invoker_ban')
                  ORDER BY created_at DESC LIMIT 1",
             )?;
             let mut rows = stmt.query(params![user_id])?;
@@ -2977,7 +2984,7 @@ fn version_info_text() -> String {
 }
 
 fn help_text() -> String {
-    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n<code>/white</code>：加入本群白名單；若該用戶目前在本群被封禁，會一併解除封禁\n<code>/white -global</code>：加入全域白名單\n<code>/unwhite</code>：移出本群白名單\n<code>/unwhite -global</code>：移出全域白名單\n\n<b>群組管理員可用</b>\n<code>/module &lt;名稱&gt; &lt;on/off&gt;</code>：切換群組模組，名稱支援 NoLongName（英名檢查）/ NoHalal（清真檢查）/ NoSM（服務訊息刪除）/ Flood（洗版偵測，預設開啟）/ Captcha（新成員驗證，預設關閉）/ Netban（跨群組黑名單同步，預設關閉，需自行開啟；開啟後本群的封禁會同步到其他同樣開啟的群組，反之亦然）/ CmdClean（指令權限濫用防護，預設關閉；開啟後，沒有權限的人嘗試使用管理指令會被刪除訊息並警告一次，24 小時內再犯將被禁言 5 分鐘並記錄到日誌頻道。無論是否開啟，此類指令的錯誤提示訊息都會在 10 秒後自動刪除，減少洗版）/ GuestBan（防範 Telegram 訪客模式機器人濫用，預設開啟；任何人都能透過 @ 一個機器人使其在未加入本群的情況下直接發文，此模組會偵測並非本群成員卻發文的機器人帳號，直接刪除訊息並封禁）\n<code>/module</code>（不帶參數）：查看本群所有模組目前的開關狀態\n<code>/module all on/off</code>：一次開啟或關閉全部公開模組\n<code>/unban</code>：回覆要解封的用戶、或提供 user_id，解封本群該用戶（僅本群，不影響訓練資料，如需連同撤銷誤判樣本請找維護組）\n<code>/unmute</code>：回覆要解除禁言的用戶、或提供 user_id\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n".to_string()
+    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，刪除該訊息並封禁該用戶（僅限本群；訊息內容會送交項目組審核，經批准後才會用於訓練模型）\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n<code>/white</code>：加入本群白名單；若該用戶目前在本群被封禁，會一併解除封禁\n<code>/white -global</code>：加入全域白名單\n<code>/unwhite</code>：移出本群白名單\n<code>/unwhite -global</code>：移出全域白名單\n\n<b>群組管理員可用</b>\n<code>/module &lt;名稱&gt; &lt;on/off&gt;</code>：切換群組模組，名稱支援 NoLongName（英名檢查）/ NoHalal（清真檢查）/ NoSM（服務訊息刪除）/ Flood（洗版偵測，預設開啟）/ Captcha（新成員驗證，預設關閉）/ Netban（跨群組黑名單同步，預設關閉，需自行開啟；開啟後本群的封禁會同步到其他同樣開啟的群組，反之亦然）/ CmdClean（指令權限濫用防護，預設關閉；開啟後，沒有權限的人嘗試使用管理指令會被刪除訊息並警告一次，24 小時內再犯將被禁言 5 分鐘並記錄到日誌頻道。無論是否開啟，此類指令的錯誤提示訊息都會在 10 秒後自動刪除，減少洗版）/ GuestBan（防範 Telegram 訪客模式機器人濫用，預設開啟；任何人都能透過 @ 一個機器人使其在未加入本群的情況下直接發文，此模組會偵測並非本群成員卻發文的機器人帳號，直接刪除訊息並封禁）\n<code>/module</code>（不帶參數）：查看本群所有模組目前的開關狀態\n<code>/module all on/off</code>：一次開啟或關閉全部公開模組\n<code>/unban</code>：回覆要解封的用戶、或提供 user_id，解封本群該用戶（僅本群，不影響訓練資料，如需連同撤銷誤判樣本請找維護組）\n<code>/unmute</code>：回覆要解除禁言的用戶、或提供 user_id\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n".to_string()
 }
 
 fn help_op_text() -> String {
@@ -3740,11 +3747,33 @@ async fn broadcast_unban_if_fully_clear(bot: &Bot, runtime: &Runtime, user_id: i
 /// `propagate_network_ban` so the rule itself is directly testable - it's
 /// the boundary that decides what one group can impose on every other, so
 /// it deserves to be pinned down rather than only exercised through a live
-/// Telegram call. See that function for the reasoning behind each arm.
-fn netban_eligible(model_score: Option<f64>, global_threshold: f64, origin_netban: bool) -> bool {
-    match model_score {
-        Some(score) => score >= global_threshold,
-        None => origin_netban,
+/// Telegram call.
+///
+/// The dividing line is whether the *project* decided, or one group did:
+///
+/// - `ReportApproved` - a maintainer reviewed it in the report channel and
+///   pressed approve. The strongest signal there is.
+/// - `GuestBotBan` / `GuestInvokerBan` - guest-mode abuse is inherently
+///   cross-group (the whole exploit is posting into groups the bot was
+///   never added to), and the target is a throwaway spam account.
+/// - `AutoBan` - only if it carries a score clearing the **global**
+///   threshold. That covers the model and maintainer-managed regex rules
+///   (which score 1.0). It deliberately excludes the module checks
+///   (NoHalal, NoLongName): those are unscored, and they're per-group
+///   *policy* opt-ins rather than spam determinations - a group choosing to
+///   ban Arabic script or long names is making a house rule, not finding
+///   something everyone else should ban too.
+/// - `SpamBan` (`/sb`) - excluded. It's one group admin's judgment about
+///   their own room; there's no project review behind it, so it must not
+///   become a project-wide ban. Send it through `/spam` if it deserves one.
+///
+/// Note the origin group's netban setting plays no part: it governs what a
+/// group *receives*, never what it can impose on everyone else.
+fn netban_eligible(action: &ActionKind, model_score: Option<f64>, global_threshold: f64) -> bool {
+    match action {
+        ActionKind::ReportApproved | ActionKind::GuestBotBan | ActionKind::GuestInvokerBan => true,
+        ActionKind::AutoBan => model_score.is_some_and(|score| score >= global_threshold),
+        _ => false,
     }
 }
 
@@ -3758,20 +3787,46 @@ fn netban_eligible(model_score: Option<f64>, global_threshold: f64, origin_netba
 /// was caught. Receiving stays opt-in: only groups with netban enabled ever
 /// get a propagated ban (here) or enforce one (`check_netban_and_act`).
 ///
-/// Eligibility, and why it's judged this way:
-/// - A scored (model) ban must clear the **global** threshold, never the
-///   origin group's own. A group running a lowered `spam_threshold_override`
-///   bans at its own bar locally, but can't push those below-bar bans onto
-///   everyone else - otherwise one group setting a near-zero threshold would
-///   turn every message it sees into a project-wide ban.
-/// - An unscored ban (regex rule, module check, manual `/sb`, guest bot)
-///   keeps the old rule: it counts only if the origin group is on the
-///   network. There's no score to test against the project bar, so group
-///   membership stays the trust signal for those.
+/// Posts a `/sb`'s evidence to the report channel for a maintainer to
+/// accept or discard as training data. The ban itself already happened and
+/// isn't in question here - this only decides whether the text is allowed
+/// to move the shared model, which used to happen automatically the moment
+/// any group admin typed `/sb`.
+///
+/// Skipped when there's nothing a human could usefully label: an empty or
+/// token-less message (a sticker, a photo with no caption) would train on
+/// nothing, so it would only be noise in the review queue.
+async fn queue_training_review(bot: &Bot, runtime: &Runtime, case: &CaseRecord) {
+    if is_empty_ml_text(&case.evidence_text) {
+        return;
+    }
+    let body = format!(
+        "<b>待審核訓練樣本</b>（來自 /sb）\n\n<b>對象</b>: {} (<code>{}</code>)\n<b>操作者</b>: {}\n<b>群組</b>: <code>{}</code>\n<b>內容</b>: <blockquote>{}</blockquote>\n<b>案例</b>: <code>{}</code>\n\n批准後才會寫入模型；拒絕則只保留封禁、不影響模型。",
+        escape_html(&case.target_name),
+        case.target_user_id,
+        escape_html(case.actor_name.as_deref().unwrap_or("unknown")),
+        case.chat_id,
+        escape_html(&case.evidence_text),
+        case.id,
+    );
+    let buttons = InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback("批准訓練", format!("train:approve:{}", case.id)),
+        InlineKeyboardButton::callback("拒絕訓練", format!("train:reject:{}", case.id)),
+    ]]);
+    let _ = bot
+        .send_message(ChatId(runtime.config.report_channel_id), body)
+        .parse_mode(ParseMode::Html)
+        .reply_markup(buttons)
+        .await;
+}
+
+/// A scored ban is judged against the **global** threshold, never the origin
+/// group's own - a group running a lowered `spam_threshold_override` bans at
+/// its own bar locally, but can't push those below-bar bans onto everyone
+/// else. See `netban_eligible` for which actions qualify at all.
 async fn propagate_network_ban(bot: &Bot, runtime: &Runtime, case: &CaseRecord) {
-    let origin = runtime.get_group_modules(case.chat_id).await.unwrap_or_default();
     let global = runtime.current_threshold().await.unwrap_or(runtime.config.spam_threshold);
-    if !netban_eligible(case.model_score, global, origin.netban) {
+    if !netban_eligible(&case.action, case.model_score, global) {
         return;
     }
     if runtime.is_global_whitelisted(case.target_user_id).await.unwrap_or(false) {
@@ -4798,7 +4853,12 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 ActionKind::SpamBan => {
                     let _ = bot.delete_message(message.chat.id, MessageId(source_id)).await;
                     ban_user(&bot, message.chat.id, target_id).await.ok();
-                    train_spam(&runtime, &evidence_text, Some(&case_id)).await.ok();
+                    // Deliberately does NOT train here. A group admin's /sb
+                    // is a decision about their own room, and taking it as
+                    // ground truth let anyone with admin rights anywhere
+                    // write directly into the shared model. The text goes to
+                    // the report channel instead and only trains once a
+                    // maintainer approves it.
                 }
                 ActionKind::Mute => {
                     mute_user(&bot, message.chat.id, target_id).await.ok();
@@ -4816,6 +4876,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             if action == ActionKind::SpamBan {
                 propagate_network_ban(&bot, &runtime, &case).await;
                 broadcast_ban_status(&bot, &runtime, case.target_user_id, true).await;
+                queue_training_review(&bot, &runtime, &case).await;
             }
 
             // Reuses the case's own case_id as the revert handle - no new ID
@@ -6093,7 +6154,7 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
     let kind = parts.next().unwrap_or("");
     let decision = parts.next().unwrap_or("");
     let case_id = parts.next().unwrap_or("");
-    if kind != "review" || case_id.is_empty() {
+    if !matches!(kind, "review" | "train") || case_id.is_empty() {
         return Ok(());
     }
 
@@ -6119,6 +6180,37 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
         bot.answer_callback_query(q.id).text("找不到原始訊息").await?;
         return Ok(());
     };
+
+    // The /sb training queue. Unlike the "review" flow below, nothing about
+    // the ban changes here either way - the ban already happened in the
+    // group. This decides only whether the text is allowed into the model.
+    if kind == "train" {
+        let (note, toast) = match decision {
+            "approve" => {
+                if let Err(err) = train_spam(&runtime, &case.evidence_text, Some(&case.id)).await {
+                    log_callback_error(&bot, &runtime, &case, "train_spam", &err.to_string()).await;
+                    bot.answer_callback_query(q.id).text("訓練失敗").await?;
+                    return Ok(());
+                }
+                ("已批准並寫入模型", "已批准訓練")
+            }
+            "reject" => ("已拒絕，未寫入模型（封禁不受影響）", "已拒絕訓練"),
+            _ => return Ok(()),
+        };
+        let body = format!(
+            "<b>待審核訓練樣本</b>（來自 /sb）\n\n<b>對象</b>: {} (<code>{}</code>)\n<b>操作者</b>: {}\n<b>群組</b>: <code>{}</code>\n<b>內容</b>: <blockquote>{}</blockquote>\n<b>案例</b>: <code>{}</code>\n<b>狀態</b>: {note}\n<b>處理者</b>: <code>{from_id}</code>",
+            escape_html(&case.target_name),
+            case.target_user_id,
+            escape_html(case.actor_name.as_deref().unwrap_or("unknown")),
+            case.chat_id,
+            escape_html(&case.evidence_text),
+            case.id,
+        );
+        let _ = bot.edit_message_text(message.chat().id, message.id(), body).parse_mode(ParseMode::Html).await;
+        let _ = bot.edit_message_reply_markup(message.chat().id, message.id()).await;
+        bot.answer_callback_query(q.id).text(toast).await?;
+        return Ok(());
+    }
 
     match decision {
         "approve" => {
@@ -7012,21 +7104,26 @@ mod tests {
             owner_id: None,
         };
 
-        // From a netban group (old rule listed it), no score.
-        let on_network = dummy_case(ActionKind::SpamBan, 100, 201, Utc::now());
-        // Non-netban group, but clears the global bar on score alone.
+        // A maintainer-approved report: project-level, stays listed.
+        let approved = dummy_case(ActionKind::ReportApproved, 100, 201, Utc::now());
+        // Clears the global bar on score alone.
         let mut high_score = dummy_case(ActionKind::AutoBan, 300, 202, Utc::now());
         high_score.model_score = Some(0.97);
-        // Non-netban group, below the bar - exactly what a lowered group
-        // threshold would have produced. Must stay off the blacklist.
+        // Below the bar - exactly what a lowered group threshold would have
+        // produced. Must stay off the blacklist.
         let mut low_score = dummy_case(ActionKind::AutoBan, 300, 203, Utc::now());
         low_score.model_score = Some(0.20);
+        // A group admin's /sb from a netban group. The old JOIN listed this;
+        // the new rule must drop it, since that's the whole point.
+        let manual_sb = dummy_case(ActionKind::SpamBan, 100, 204, Utc::now());
+        // An unscored module ban (NoHalal / NoLongName) - group policy.
+        let module_ban = dummy_case(ActionKind::AutoBan, 100, 205, Utc::now());
 
         {
             let runtime = Runtime::load(config.clone()).await.unwrap();
             runtime.set_group_module(100, "netban", true).await.unwrap();
             runtime.set_group_module(300, "netban", false).await.unwrap();
-            for case in [&on_network, &high_score, &low_score] {
+            for case in [&approved, &high_score, &low_score, &manual_sb, &module_ban] {
                 runtime.persist_case(case).await.unwrap();
             }
             // Rewind to the pre-migration shape.
@@ -7043,8 +7140,8 @@ mod tests {
         let runtime = Runtime::load(config).await.unwrap();
         assert_eq!(
             runtime.find_active_network_ban(201).await.unwrap().map(|c| c.id),
-            Some(on_network.id),
-            "a ban from a group that was on the network must stay listed"
+            Some(approved.id),
+            "a maintainer-approved report must stay listed"
         );
         assert_eq!(
             runtime.find_active_network_ban(202).await.unwrap().map(|c| c.id),
@@ -7053,7 +7150,15 @@ mod tests {
         );
         assert!(
             runtime.find_active_network_ban(203).await.unwrap().is_none(),
-            "a below-bar ban from a non-netban group must not be backfilled onto the blacklist"
+            "a below-bar ban must not be backfilled onto the blacklist"
+        );
+        assert!(
+            runtime.find_active_network_ban(204).await.unwrap().is_none(),
+            "a group admin's /sb must be dropped from the blacklist, netban group or not"
+        );
+        assert!(
+            runtime.find_active_network_ban(205).await.unwrap().is_none(),
+            "an unscored module ban is group policy and must be dropped"
         );
     }
 
@@ -7158,19 +7263,42 @@ mod tests {
         let global = 0.85;
 
         // A group with a 0.01 override would ban on this locally; it must
-        // not reach the shared blacklist, netban on or not.
-        assert!(!netban_eligible(Some(0.10), global, true));
-        assert!(!netban_eligible(Some(0.84), global, true));
+        // not reach the shared blacklist.
+        assert!(!netban_eligible(&ActionKind::AutoBan, Some(0.10), global));
+        assert!(!netban_eligible(&ActionKind::AutoBan, Some(0.84), global));
 
-        // Clears the project bar: listed regardless of whether the origin
-        // group ever opted into netban.
-        assert!(netban_eligible(Some(0.85), global, false));
-        assert!(netban_eligible(Some(0.99), global, false));
+        // Clears the project bar. Regex rule matches score 1.0, so
+        // maintainer-managed rules land here too.
+        assert!(netban_eligible(&ActionKind::AutoBan, Some(0.85), global));
+        assert!(netban_eligible(&ActionKind::AutoBan, Some(1.0), global));
+    }
 
-        // Unscored bans (regex, module check, manual /sb, guest bot) have no
-        // score to test, so origin-group membership stays the trust signal.
-        assert!(netban_eligible(None, global, true));
-        assert!(!netban_eligible(None, global, false));
+    // The project/group dividing line: one group admin, or one group's house
+    // rules, must not be able to impose a ban on every other group. Only a
+    // project-level determination does that.
+    #[test]
+    fn netban_eligibility_excludes_group_level_decisions() {
+        let global = 0.85;
+
+        // A group admin's /sb is a call about their own room. Route it
+        // through /spam if it deserves to be project-wide.
+        assert!(!netban_eligible(&ActionKind::SpamBan, None, global));
+        assert!(!netban_eligible(&ActionKind::SpamBan, Some(0.99), global));
+
+        // NoHalal / NoLongName are unscored per-group policy opt-ins, not
+        // spam findings - they arrive as AutoBan with no score.
+        assert!(!netban_eligible(&ActionKind::AutoBan, None, global));
+
+        // Not bans at all.
+        assert!(!netban_eligible(&ActionKind::Mute, None, global));
+        assert!(!netban_eligible(&ActionKind::Kick, None, global));
+        assert!(!netban_eligible(&ActionKind::FloodMute, None, global));
+
+        // Project-level determinations still qualify: a maintainer pressed
+        // approve, or it's guest-mode abuse (inherently cross-group).
+        assert!(netban_eligible(&ActionKind::ReportApproved, None, global));
+        assert!(netban_eligible(&ActionKind::GuestBotBan, None, global));
+        assert!(netban_eligible(&ActionKind::GuestInvokerBan, None, global));
     }
 
     // The flag must survive a re-persist: log_message_id backfills and status
