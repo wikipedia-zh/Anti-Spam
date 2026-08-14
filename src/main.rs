@@ -538,6 +538,9 @@ impl Runtime {
         if user_version < 8 {
             Self::migrate_v7_to_v8(conn)?;
         }
+        if user_version < 9 {
+            Self::migrate_v8_to_v9(conn)?;
+        }
         Ok(())
     }
 
@@ -681,6 +684,43 @@ impl Runtime {
         let tx = conn.transaction()?;
         tx.execute("ALTER TABLE group_module_settings ADD COLUMN guest_ban INTEGER NOT NULL DEFAULT 1", [])?;
         tx.execute("PRAGMA user_version = 8", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Makes netban membership an explicit, immutable property of the case
+    /// rather than something re-derived from the origin group's *current*
+    /// settings on every lookup. Two reasons that mattered:
+    ///
+    /// 1. A group with a lowered `spam_threshold_override` was minting
+    ///    network bans at its own bar. Set it low enough and every message
+    ///    in that group becomes a project-wide ban - so the shared
+    ///    blacklist was only ever as trustworthy as the least strict group
+    ///    on it. Eligibility is now judged against the global threshold.
+    /// 2. Deriving from live settings meant a group toggling netban off
+    ///    silently retracted every ban it had ever contributed, and
+    ///    toggling it on retroactively promoted its whole ban history.
+    ///
+    /// Backfill reproduces the old rule (origin group currently on the
+    /// network) so nothing already enforced is dropped, and additionally
+    /// admits past bans that clear the global bar on score alone - those
+    /// are exactly the ones the new rule would have accepted anyway.
+    fn migrate_v8_to_v9(conn: &mut Connection) -> Result<()> {
+        let threshold = Self::load_threshold(conn)?.unwrap_or(0.85);
+        let tx = conn.transaction()?;
+        tx.execute("ALTER TABLE cases ADD COLUMN netban_eligible INTEGER NOT NULL DEFAULT 0", [])?;
+        tx.execute(
+            r#"
+            UPDATE cases SET netban_eligible = 1
+            WHERE action IN ('auto_ban', 'spam_ban', 'report_approved')
+              AND (
+                chat_id IN (SELECT chat_id FROM group_module_settings WHERE netban = 1)
+                OR (model_score IS NOT NULL AND model_score >= ?1)
+              )
+            "#,
+            params![threshold],
+        )?;
+        tx.execute("PRAGMA user_version = 9", [])?;
         tx.commit()?;
         Ok(())
     }
@@ -908,8 +948,15 @@ impl Runtime {
         .await
     }
 
-    /// Finds the most recent active ban for `user_id` whose origin chat has
-    /// netban enabled - i.e. "is this user currently network-banned".
+    /// Finds the most recent active ban for `user_id` that made it onto the
+    /// shared blacklist - i.e. "is this user currently network-banned".
+    /// Keyed off the case's own `netban_eligible` flag (set once, at ban
+    /// time, by `propagate_network_ban`) rather than the origin group's
+    /// live settings, so a group can't retract or promote its entire ban
+    /// history just by toggling its own netban switch - and so a group
+    /// running a lowered threshold can't mint entries below the project
+    /// bar. See `migrate_v8_to_v9`.
+    ///
     /// Reuses the same "reversal mutates action in place" property as
     /// `load_latest_case_by_actions`: once reversed, a case's action becomes
     /// `Unbanned` and stops matching the `IN (...)` filter here too, so no
@@ -917,14 +964,27 @@ impl Runtime {
     async fn find_active_network_ban(&self, user_id: i64) -> Result<Option<CaseRecord>> {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
-                r#"SELECT c.id, c.action, c.chat_id, c.target_user_id, c.target_name, c.actor_user_id, c.actor_name, c.source_message_id, c.evidence_text, c.model_score, c.matched_rule_id, c.matched_rule_pattern, c.status, c.log_message_id, c.created_at
-                   FROM cases c
-                   JOIN group_module_settings g ON g.chat_id = c.chat_id
-                   WHERE c.target_user_id = ?1 AND g.netban = 1 AND c.action IN ('auto_ban', 'spam_ban', 'report_approved')
-                   ORDER BY c.created_at DESC LIMIT 1"#,
+                "SELECT id, action, chat_id, target_user_id, target_name, actor_user_id, actor_name, source_message_id, evidence_text, model_score, matched_rule_id, matched_rule_pattern, status, log_message_id, created_at
+                 FROM cases
+                 WHERE target_user_id = ?1 AND netban_eligible = 1 AND action IN ('auto_ban', 'spam_ban', 'report_approved')
+                 ORDER BY created_at DESC LIMIT 1",
             )?;
             let mut rows = stmt.query(params![user_id])?;
             rows.next()?.map(case_from_row).transpose()
+        })
+        .await
+    }
+
+    /// Adds a case to the shared blacklist. Separate from `persist_case` on
+    /// purpose: that one rewrites the whole row from a `CaseRecord`, which
+    /// carries no netban field, so leaving this column out of its INSERT and
+    /// its ON CONFLICT list means a later re-persist (a status change, a log
+    /// id backfill) can never silently clear the flag.
+    async fn mark_netban_eligible(&self, case_id: &str) -> Result<()> {
+        let case_id = case_id.to_string();
+        self.with_conn(move |conn| {
+            conn.execute("UPDATE cases SET netban_eligible = 1 WHERE id = ?1", params![case_id])?;
+            Ok(())
         })
         .await
     }
@@ -3463,20 +3523,48 @@ async fn broadcast_unban_if_fully_clear(bot: &Bot, runtime: &Runtime, user_id: i
     }
 }
 
-/// Propagates a ban case to every other group that has opted into `netban`.
-/// Called right after the 5 places in this file that create a ban-type case
-/// (AutoBan/SpamBan/ReportApproved) - purely additive, doesn't change any
-/// existing behavior at those call sites. No-ops immediately if the
-/// *origin* group hasn't opted in, since propagation is symmetric: a group
-/// only sends bans out to (and receives bans from) other opted-in groups.
+/// Whether a ban belongs on the shared project blacklist. Pulled out of
+/// `propagate_network_ban` so the rule itself is directly testable - it's
+/// the boundary that decides what one group can impose on every other, so
+/// it deserves to be pinned down rather than only exercised through a live
+/// Telegram call. See that function for the reasoning behind each arm.
+fn netban_eligible(model_score: Option<f64>, global_threshold: f64, origin_netban: bool) -> bool {
+    match model_score {
+        Some(score) => score >= global_threshold,
+        None => origin_netban,
+    }
+}
+
+/// Decides whether a ban belongs on the shared project blacklist, and if so
+/// records that on the case and pushes it to every group receiving netban.
+/// The single chokepoint every ban path already calls.
+///
+/// Contributing to the blacklist is *not* gated on the origin group having
+/// netban switched on - the blacklist is a project-level record, so a
+/// message that clears the project's own spam bar belongs on it wherever it
+/// was caught. Receiving stays opt-in: only groups with netban enabled ever
+/// get a propagated ban (here) or enforce one (`check_netban_and_act`).
+///
+/// Eligibility, and why it's judged this way:
+/// - A scored (model) ban must clear the **global** threshold, never the
+///   origin group's own. A group running a lowered `spam_threshold_override`
+///   bans at its own bar locally, but can't push those below-bar bans onto
+///   everyone else - otherwise one group setting a near-zero threshold would
+///   turn every message it sees into a project-wide ban.
+/// - An unscored ban (regex rule, module check, manual `/sb`, guest bot)
+///   keeps the old rule: it counts only if the origin group is on the
+///   network. There's no score to test against the project bar, so group
+///   membership stays the trust signal for those.
 async fn propagate_network_ban(bot: &Bot, runtime: &Runtime, case: &CaseRecord) {
     let origin = runtime.get_group_modules(case.chat_id).await.unwrap_or_default();
-    if !origin.netban {
+    let global = runtime.current_threshold().await.unwrap_or(runtime.config.spam_threshold);
+    if !netban_eligible(case.model_score, global, origin.netban) {
         return;
     }
     if runtime.is_global_whitelisted(case.target_user_id).await.unwrap_or(false) {
         return;
     }
+    let _ = runtime.mark_netban_eligible(&case.id).await;
 
     let targets = runtime.list_netban_enabled_chats().await.unwrap_or_default();
     for chat_id in targets {
@@ -6518,22 +6606,149 @@ mod tests {
         assert!(found.is_none(), "reversed case should no longer match a ban-action search");
     }
 
-    // A ban only counts as "network-banned" if its origin chat has netban
-    // enabled - a group that never opted in shouldn't leak bans to others.
+    // Netban membership is now a property the case carries, set once at ban
+    // time, not something re-derived from the origin group's live settings.
+    // A group toggling its own netban switch must not retroactively promote
+    // or retract bans it already made.
     #[tokio::test]
-    async fn find_active_network_ban_requires_netban_enabled_origin() {
+    async fn find_active_network_ban_uses_the_stored_flag_not_live_group_settings() {
         let runtime = test_runtime().await;
         let case = dummy_case(ActionKind::AutoBan, 100, 200, Utc::now());
         runtime.persist_case(&case).await.unwrap();
 
         assert!(
             runtime.find_active_network_ban(200).await.unwrap().is_none(),
-            "chat 100 hasn't opted into netban, so this ban shouldn't count as a network ban"
+            "a case that never made it onto the blacklist shouldn't count as a network ban"
         );
 
+        // Flipping the origin group's switch after the fact changes nothing.
         runtime.set_group_module(100, "netban", true).await.unwrap();
-        let found = runtime.find_active_network_ban(200).await.unwrap();
-        assert_eq!(found.map(|c| c.id), Some(case.id.clone()));
+        assert!(
+            runtime.find_active_network_ban(200).await.unwrap().is_none(),
+            "turning netban on later must not retroactively promote past bans"
+        );
+
+        runtime.mark_netban_eligible(&case.id).await.unwrap();
+        assert_eq!(runtime.find_active_network_ban(200).await.unwrap().map(|c| c.id), Some(case.id.clone()));
+
+        // ...and turning it back off must not retract what's already listed.
+        runtime.set_group_module(100, "netban", false).await.unwrap();
+        assert_eq!(runtime.find_active_network_ban(200).await.unwrap().map(|c| c.id), Some(case.id.clone()));
+    }
+
+    // Exercises the real v8→v9 upgrade against existing case history, since
+    // getting the backfill wrong on the live DB either drops everyone off
+    // the blacklist or promotes bans that never belonged on it. Builds a v9
+    // DB, seeds cases, then rewinds it to v8 (drop the column, reset
+    // user_version) and reloads so the migration actually runs.
+    #[tokio::test]
+    async fn migrate_v8_to_v9_backfills_existing_netbans() {
+        let dir = std::env::temp_dir().join(format!("spb_test_{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let db_path = dir.join("bot.db");
+        let config = Config {
+            bot_token: "test".to_string(),
+            log_channel_id: -1,
+            report_channel_id: -1,
+            test_group_id: None,
+            maintainer_ids: vec![],
+            data_dir: dir.clone(),
+            sqlite_path: db_path.clone(),
+            spam_threshold: 0.85,
+            owner_id: None,
+        };
+
+        // From a netban group (old rule listed it), no score.
+        let on_network = dummy_case(ActionKind::SpamBan, 100, 201, Utc::now());
+        // Non-netban group, but clears the global bar on score alone.
+        let mut high_score = dummy_case(ActionKind::AutoBan, 300, 202, Utc::now());
+        high_score.model_score = Some(0.97);
+        // Non-netban group, below the bar - exactly what a lowered group
+        // threshold would have produced. Must stay off the blacklist.
+        let mut low_score = dummy_case(ActionKind::AutoBan, 300, 203, Utc::now());
+        low_score.model_score = Some(0.20);
+
+        {
+            let runtime = Runtime::load(config.clone()).await.unwrap();
+            runtime.set_group_module(100, "netban", true).await.unwrap();
+            runtime.set_group_module(300, "netban", false).await.unwrap();
+            for case in [&on_network, &high_score, &low_score] {
+                runtime.persist_case(case).await.unwrap();
+            }
+            // Rewind to the pre-migration shape.
+            runtime
+                .with_conn(|conn| {
+                    conn.execute("ALTER TABLE cases DROP COLUMN netban_eligible", [])?;
+                    conn.execute("PRAGMA user_version = 8", [])?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+
+        let runtime = Runtime::load(config).await.unwrap();
+        assert_eq!(
+            runtime.find_active_network_ban(201).await.unwrap().map(|c| c.id),
+            Some(on_network.id),
+            "a ban from a group that was on the network must stay listed"
+        );
+        assert_eq!(
+            runtime.find_active_network_ban(202).await.unwrap().map(|c| c.id),
+            Some(high_score.id),
+            "a past ban clearing the global bar on score should be admitted"
+        );
+        assert!(
+            runtime.find_active_network_ban(203).await.unwrap().is_none(),
+            "a below-bar ban from a non-netban group must not be backfilled onto the blacklist"
+        );
+    }
+
+    // The whole point of the eligibility rule: a group running a lowered
+    // spam_threshold_override bans at its own bar locally, but must not be
+    // able to push those below-bar bans onto every other group. Judged
+    // against the global threshold, never the group's own - otherwise one
+    // group setting a near-zero threshold turns every message it sees into
+    // a project-wide ban.
+    #[test]
+    fn netban_eligibility_uses_the_global_bar_not_a_group_override() {
+        let global = 0.85;
+
+        // A group with a 0.01 override would ban on this locally; it must
+        // not reach the shared blacklist, netban on or not.
+        assert!(!netban_eligible(Some(0.10), global, true));
+        assert!(!netban_eligible(Some(0.84), global, true));
+
+        // Clears the project bar: listed regardless of whether the origin
+        // group ever opted into netban.
+        assert!(netban_eligible(Some(0.85), global, false));
+        assert!(netban_eligible(Some(0.99), global, false));
+
+        // Unscored bans (regex, module check, manual /sb, guest bot) have no
+        // score to test, so origin-group membership stays the trust signal.
+        assert!(netban_eligible(None, global, true));
+        assert!(!netban_eligible(None, global, false));
+    }
+
+    // The flag must survive a re-persist: log_message_id backfills and status
+    // changes rewrite the row through persist_case, which knows nothing about
+    // netban - if it cleared the column, a user would silently drop off the
+    // blacklist moments after landing on it.
+    #[tokio::test]
+    async fn netban_flag_survives_a_later_persist_case() {
+        let runtime = test_runtime().await;
+        let mut case = dummy_case(ActionKind::AutoBan, 100, 200, Utc::now());
+        runtime.persist_case(&case).await.unwrap();
+        runtime.mark_netban_eligible(&case.id).await.unwrap();
+
+        case.log_message_id = Some(4242);
+        case.status = "auto_banned".to_string();
+        runtime.persist_case(&case).await.unwrap();
+
+        assert_eq!(
+            runtime.find_active_network_ban(200).await.unwrap().map(|c| c.id),
+            Some(case.id.clone()),
+            "re-persisting the case must not clear its netban flag"
+        );
     }
 
     // Backs check_reban_and_act's same-chat ban-evasion safety net. Unlike
@@ -6649,9 +6864,9 @@ mod tests {
     #[tokio::test]
     async fn find_active_network_ban_excludes_reversed_case() {
         let runtime = test_runtime().await;
-        runtime.set_group_module(100, "netban", true).await.unwrap();
         let mut case = dummy_case(ActionKind::SpamBan, 100, 200, Utc::now());
         runtime.persist_case(&case).await.unwrap();
+        runtime.mark_netban_eligible(&case.id).await.unwrap();
         assert!(runtime.find_active_network_ban(200).await.unwrap().is_some());
 
         case.action = ActionKind::Unbanned;
