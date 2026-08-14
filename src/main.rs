@@ -2793,18 +2793,24 @@ fn public_log_link(config: &Config, message_id: i32) -> String {
 }
 
 /// The publicly-documented modules, in the order `/module` lists them, as
-/// (lookup key, display name). Deliberately excludes "warn-pol" - that one
-/// is maintainer-gated and must never surface in any user-facing list or
-/// bulk toggle (see GroupModuleSettings::pol).
-const PUBLIC_MODULES: &[(&str, &str)] = &[
-    ("nolongname", "NoLongName"),
-    ("nohalal", "NoHalal"),
-    ("nosm", "NoSM"),
-    ("flood", "Flood"),
-    ("captcha", "Captcha"),
-    ("netban", "Netban"),
-    ("cmdclean", "CmdClean"),
-    ("guestban", "GuestBan"),
+/// (lookup key, display name, is_baseline). Deliberately excludes
+/// "warn-pol" - that one is maintainer-gated and must never surface in any
+/// user-facing list or bulk toggle (see GroupModuleSettings::pol).
+///
+/// `is_baseline` marks the two that default on (see GroupModuleSettings'
+/// own defaults): they're protection every group is meant to have, not an
+/// opinionated choice, so `/module all off` leaves them alone rather than
+/// quietly stripping a group's spam defences in one keystroke. Turning
+/// either off individually still works and is unaffected.
+const PUBLIC_MODULES: &[(&str, &str, bool)] = &[
+    ("nolongname", "NoLongName", false),
+    ("nohalal", "NoHalal", false),
+    ("nosm", "NoSM", false),
+    ("flood", "Flood", true),
+    ("captcha", "Captcha", false),
+    ("netban", "Netban", false),
+    ("cmdclean", "CmdClean", false),
+    ("guestban", "GuestBan", true),
 ];
 
 /// Current value of one module flag by its `/module` key, or `None` if the
@@ -4834,24 +4840,35 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             // every public module currently stands instead of erroring out.
             if key.is_empty() || key == "status" || key == "list" {
                 let mut lines = String::from("<b>本群模組狀態</b>\n");
-                for (mod_key, display) in PUBLIC_MODULES {
+                for (mod_key, display, baseline) in PUBLIC_MODULES {
                     let on = module_flag(&old_settings, mod_key).unwrap_or(false);
-                    lines.push_str(&format!("\n{} <code>{display}</code>", if on { "✅" } else { "❌" }));
+                    lines.push_str(&format!(
+                        "\n{} <code>{display}</code>{}",
+                        if on { "✅" } else { "❌" },
+                        if *baseline { "（基礎防護）" } else { "" },
+                    ));
                 }
-                lines.push_str("\n\n<code>/module &lt;名稱&gt; on|off</code> 可單獨切換，<code>/module all on|off</code> 可一次全開或全關。");
+                lines.push_str("\n\n<code>/module &lt;名稱&gt; on|off</code> 可單獨切換，<code>/module all on|off</code> 可一次全開或全關。\n標示為基礎防護的模組不會被 <code>/module all off</code> 關閉，需要時請單獨關閉。");
                 bot.send_message(message.chat.id, lines).parse_mode(ParseMode::Html).await?;
                 return Ok(());
             }
 
             // Bulk toggle. Only ever touches PUBLIC_MODULES, so the
-            // maintainer-gated warn-pol can't be switched on this way.
+            // maintainer-gated warn-pol can't be switched on this way, and
+            // a bulk *off* additionally skips the baseline protections -
+            // see PUBLIC_MODULES.
             if key == "all" {
                 if !matches!(state.to_lowercase().as_str(), "on" | "enable" | "enabled" | "off" | "disable" | "disabled") {
                     reply_ephemeral(&bot, &message, "請指定 on 或 off，例如 /module all on。").await?;
                     return Ok(());
                 }
                 let mut old = Vec::new();
-                for (mod_key, _) in PUBLIC_MODULES {
+                let mut skipped = Vec::new();
+                for (mod_key, display, baseline) in PUBLIC_MODULES {
+                    if !enabled && *baseline {
+                        skipped.push(*display);
+                        continue;
+                    }
                     if let Some(was) = module_flag(&old_settings, mod_key) {
                         old.push((mod_key.to_string(), was));
                     }
@@ -4865,14 +4882,14 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     Some(message.chat.id.0),
                     "/module",
                     &format!("all →{enabled}（{} 個模組）", old.len()),
-                    UndoData::GroupModulesBulk { chat_id: message.chat.id.0, old },
+                    UndoData::GroupModulesBulk { chat_id: message.chat.id.0, old: old.clone() },
                 )
                 .await;
-                bot.send_message(
-                    message.chat.id,
-                    format!("已將全部 {} 個公開模組設為 {}。", PUBLIC_MODULES.len(), if enabled { "on" } else { "off" }),
-                )
-                .await?;
+                let mut reply = format!("已將 {} 個公開模組設為 {}。", old.len(), if enabled { "on" } else { "off" });
+                if !skipped.is_empty() {
+                    reply.push_str(&format!("\n基礎防護未關閉：{}（如確定要關，請單獨執行 /module <名稱> off）", skipped.join(" / ")));
+                }
+                bot.send_message(message.chat.id, reply).await?;
                 return Ok(());
             }
 
@@ -6933,24 +6950,45 @@ mod tests {
     #[tokio::test]
     async fn public_modules_table_is_settable_and_excludes_warn_pol() {
         let runtime = test_runtime().await;
-        assert!(!PUBLIC_MODULES.iter().any(|(key, _)| *key == "warn-pol"));
+        assert!(!PUBLIC_MODULES.iter().any(|(key, _, _)| *key == "warn-pol"));
 
-        for (key, _) in PUBLIC_MODULES {
+        for (key, _, _) in PUBLIC_MODULES {
             runtime.set_group_module(100, key, true).await.unwrap();
         }
         let all_on = runtime.get_group_modules(100).await.unwrap();
-        for (key, _) in PUBLIC_MODULES {
+        for (key, _, _) in PUBLIC_MODULES {
             assert_eq!(module_flag(&all_on, key), Some(true), "{key} should be on");
         }
         assert!(!all_on.pol, "a bulk enable must not touch warn-pol");
 
-        for (key, _) in PUBLIC_MODULES {
+        for (key, _, _) in PUBLIC_MODULES {
             runtime.set_group_module(100, key, false).await.unwrap();
         }
         let all_off = runtime.get_group_modules(100).await.unwrap();
-        for (key, _) in PUBLIC_MODULES {
+        for (key, _, _) in PUBLIC_MODULES {
             assert_eq!(module_flag(&all_off, key), Some(false), "{key} should be off");
         }
+    }
+
+    // `/module all off` must leave the baseline protections alone, so a
+    // group can't strip its own spam defences in one keystroke. The
+    // baseline flags must be exactly the ones GroupModuleSettings defaults
+    // to on - if a future module changes its default, this catches the
+    // table drifting out of sync with it.
+    #[test]
+    fn baseline_modules_match_the_default_on_flags() {
+        let defaults = GroupModuleSettings::default();
+        for (key, display, baseline) in PUBLIC_MODULES {
+            assert_eq!(
+                module_flag(&defaults, key),
+                Some(*baseline),
+                "{display} is marked baseline={baseline} but its default says otherwise"
+            );
+        }
+        assert!(
+            PUBLIC_MODULES.iter().any(|(_, _, baseline)| *baseline),
+            "at least one module must be baseline, or the skip logic is dead code"
+        );
     }
 
     // Backs /ml_dedupe: simulates the real dirty-data shape (a spam phrase
