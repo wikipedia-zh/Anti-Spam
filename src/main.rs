@@ -197,6 +197,12 @@ enum UndoData {
     RuleEdited { rule_id: i64, old_pattern: String },
     RuleDeleted { pattern: String, description: String },
     ProjectChat { old: Option<i64> },
+    /// `/leave` and `/forbid` - reverting either just lifts the denial,
+    /// same as `/forgive` would. Note `/leave` also made the bot leave the
+    /// group; reverting can't undo that (the bot has to be re-invited), it
+    /// only clears the blacklist so a re-invite is accepted.
+    GroupBanned { chat_id: i64 },
+    UserBanned { user_id: i64 },
     /// A synthetic case_id-like handle passed as `case_id` into
     /// `train_spam`/`train_ham` purely so `purge_training_by_case` can find
     /// and remove exactly this training sample later - not a real case.
@@ -258,6 +264,14 @@ struct Runtime {
     /// only, small fixed cap per chat (see record_recent_message) - this is
     /// short-lived correlation context, not something worth persisting.
     recent_messages: Mutex<HashMap<i64, VecDeque<RecentMessage>>>,
+    /// Project-level denial lists (see `migrate_v9_to_v10`), mirrored in
+    /// memory because they're consulted on the hot path - every message and
+    /// every command - where a SQLite round trip per check would be pure
+    /// waste for something that changes a handful of times a year. The DB
+    /// stays the source of truth; these are refilled from it at startup and
+    /// written through on every change.
+    banned_groups: RwLock<std::collections::HashSet<i64>>,
+    banned_users: RwLock<std::collections::HashSet<i64>>,
 }
 
 /// One entry in `Runtime::recent_messages`. See that field's doc comment.
@@ -386,6 +400,8 @@ impl Runtime {
         let audit_log_chat = Self::load_audit_log_chat(&conn)?;
         let exchange_channel = Self::load_exchange_channel(&conn)?;
         let spam_rules = Self::load_spam_rules(&conn)?;
+        let banned_groups = Self::load_id_set(&conn, "SELECT chat_id FROM banned_groups")?;
+        let banned_users = Self::load_id_set(&conn, "SELECT user_id FROM banned_users")?;
         Ok(Self {
             config,
             db: Arc::new(StdMutex::new(conn)),
@@ -401,7 +417,19 @@ impl Runtime {
             flood_tracker: Mutex::new(HashMap::new()),
             pending_captcha: Mutex::new(HashMap::new()),
             recent_messages: Mutex::new(HashMap::new()),
+            banned_groups: RwLock::new(banned_groups),
+            banned_users: RwLock::new(banned_users),
         })
+    }
+
+    fn load_id_set(conn: &Connection, sql: &str) -> Result<std::collections::HashSet<i64>> {
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
     }
 
     /// Runs `f` against the single shared connection on a blocking-safe thread.
@@ -540,6 +568,9 @@ impl Runtime {
         }
         if user_version < 9 {
             Self::migrate_v8_to_v9(conn)?;
+        }
+        if user_version < 10 {
+            Self::migrate_v9_to_v10(conn)?;
         }
         Ok(())
     }
@@ -721,6 +752,42 @@ impl Runtime {
             params![threshold],
         )?;
         tx.execute("PRAGMA user_version = 9", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Project-level denial lists, distinct from every other ban in this
+    /// file: those are moderation *inside* a group, these are "this group /
+    /// this person may not use the project at all". `/leave` writes to
+    /// `banned_groups`, `/forbid` to `banned_users`, and `/forgive` clears
+    /// either. Separate from `group_whitelist`/`global_whitelist` (which
+    /// exempt people from moderation) and from `cases` (per-incident
+    /// records) - this is standing access control, with no case attached.
+    fn migrate_v9_to_v10(conn: &mut Connection) -> Result<()> {
+        let tx = conn.transaction()?;
+        tx.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS banned_groups (
+                chat_id INTEGER PRIMARY KEY,
+                reason TEXT NOT NULL DEFAULT '',
+                added_by INTEGER,
+                created_at TEXT NOT NULL
+            )
+            "#,
+            [],
+        )?;
+        tx.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS banned_users (
+                user_id INTEGER PRIMARY KEY,
+                reason TEXT NOT NULL DEFAULT '',
+                added_by INTEGER,
+                created_at TEXT NOT NULL
+            )
+            "#,
+            [],
+        )?;
+        tx.execute("PRAGMA user_version = 10", [])?;
         tx.commit()?;
         Ok(())
     }
@@ -2134,6 +2201,87 @@ impl Runtime {
         }
     }
 
+    /// Project-level denial checks. In-memory (see the `banned_groups` /
+    /// `banned_users` fields), so these are cheap enough to call on every
+    /// message without a DB round trip.
+    async fn is_group_banned(&self, chat_id: i64) -> bool {
+        self.banned_groups.read().await.contains(&chat_id)
+    }
+
+    async fn is_user_banned(&self, user_id: i64) -> bool {
+        self.banned_users.read().await.contains(&user_id)
+    }
+
+    async fn set_group_banned(&self, chat_id: i64, banned: bool, reason: &str, added_by: Option<i64>) -> Result<()> {
+        let reason = reason.to_string();
+        self.with_conn(move |conn| {
+            if banned {
+                conn.execute(
+                    "INSERT INTO banned_groups (chat_id, reason, added_by, created_at) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(chat_id) DO UPDATE SET reason=excluded.reason, added_by=excluded.added_by, created_at=excluded.created_at",
+                    params![chat_id, reason, added_by, Utc::now().to_rfc3339()],
+                )?;
+            } else {
+                conn.execute("DELETE FROM banned_groups WHERE chat_id = ?1", params![chat_id])?;
+            }
+            Ok(())
+        })
+        .await?;
+        let mut cache = self.banned_groups.write().await;
+        if banned {
+            cache.insert(chat_id);
+        } else {
+            cache.remove(&chat_id);
+        }
+        Ok(())
+    }
+
+    async fn set_user_banned(&self, user_id: i64, banned: bool, reason: &str, added_by: Option<i64>) -> Result<()> {
+        let reason = reason.to_string();
+        self.with_conn(move |conn| {
+            if banned {
+                conn.execute(
+                    "INSERT INTO banned_users (user_id, reason, added_by, created_at) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(user_id) DO UPDATE SET reason=excluded.reason, added_by=excluded.added_by, created_at=excluded.created_at",
+                    params![user_id, reason, added_by, Utc::now().to_rfc3339()],
+                )?;
+            } else {
+                conn.execute("DELETE FROM banned_users WHERE user_id = ?1", params![user_id])?;
+            }
+            Ok(())
+        })
+        .await?;
+        let mut cache = self.banned_users.write().await;
+        if banned {
+            cache.insert(user_id);
+        } else {
+            cache.remove(&user_id);
+        }
+        Ok(())
+    }
+
+    /// Both denial lists for `/list_banned`, as (id, reason, created_at).
+    /// Reads from SQLite rather than the in-memory sets, since only the DB
+    /// keeps the reason and timestamp - the caches hold ids alone.
+    #[allow(clippy::type_complexity)]
+    async fn list_banned(&self) -> Result<(Vec<(i64, String, String)>, Vec<(i64, String, String)>)> {
+        self.with_conn(|conn| {
+            fn rows(conn: &Connection, sql: &str) -> rusqlite::Result<Vec<(i64, String, String)>> {
+                let mut stmt = conn.prepare(sql)?;
+                let mut out = Vec::new();
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    out.push((row.get(0)?, row.get(1)?, row.get(2)?));
+                }
+                Ok(out)
+            }
+            let groups = rows(conn, "SELECT chat_id, reason, created_at FROM banned_groups ORDER BY created_at DESC")?;
+            let users = rows(conn, "SELECT user_id, reason, created_at FROM banned_users ORDER BY created_at DESC")?;
+            Ok((groups, users))
+        })
+        .await
+    }
+
     async fn is_group_whitelisted(&self, chat_id: i64, user_id: i64) -> Result<bool> {
         self.with_conn(move |conn| {
             let count: i64 = conn.query_row(
@@ -2415,6 +2563,9 @@ enum ModerationCommand {
     EditRule(String, String),
     UpdateBL,
     RefreshBL,
+    Forbid(String),
+    Forgive(String),
+    ListBanned,
     ListRules,
     CheckRules,
     DelRule(String),
@@ -2486,6 +2637,9 @@ fn parse_command(text: &str) -> ModerationCommand {
         }
         "/updatebl" => ModerationCommand::UpdateBL,
         "/refreshbl" => ModerationCommand::RefreshBL,
+        "/forbid" => ModerationCommand::Forbid(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
+        "/forgive" => ModerationCommand::Forgive(text.split_whitespace().nth(1).unwrap_or("").to_string()),
+        "/list_banned" => ModerationCommand::ListBanned,
         "/list_rules" => ModerationCommand::ListRules,
         "/check_rules" => ModerationCommand::CheckRules,
         "/del_rule" => ModerationCommand::DelRule(text.split_whitespace().nth(1).unwrap_or("").to_string()),
@@ -2827,7 +2981,7 @@ fn help_text() -> String {
 }
 
 fn help_op_text() -> String {
-    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>（別名 <code>/mark_spam</code>）：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可。會解封並在找得到對應案例時一併移除錯誤訓練樣本並重建模型，若該案例曾透過 Netban 同步封禁到其他群組，也會一併在那些群組解封（群組管理員也能用 /unban，但僅解封本群、不影響訓練資料與其他群組）\n<code>/unmute</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可，並會撤銷對應案例（群組管理員也能用 /unmute，但僅解除本群禁言）\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat [chat_id]</code>：設定工作群組。不帶參數時直接綁定目前所在的群組；也可提供 chat_id 從其他地方設定。綁定後，若該群組串連的頻道發文時被 Telegram 自動釘選，機器人會自動取消釘選，避免洗掉手動釘選的訊息\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：讓 bot 離開指定群組或目前群組\n<code>/ping</code>：確認機器人在線，並回報目前運行的版本號與 commit hash\n<code>/set_audit_log [chat_id]</code>：設定維護操作日誌頻道。不帶參數時綁定目前所在的群組/頻道。設定後，每個會改變狀態的維護指令（門檻、白名單、模組開關、規則異動、封禁/禁言等）都會記錄在這裡，並附上 action id\n<code>/revert &lt;action_id&gt;</code>：復原指定的維護操作，回到變更前的狀態；封禁/禁言類會重用 /unban、/unmute 的邏輯。少數沒有明確「復原前狀態」的操作無法自動復原，會直接告知\n<code>/set_exchange_channel &lt;chat_id&gt;</code>：設定 PM 申訴機器人橋接用的交換頻道。設定後，機器人會回應 PM 透過該頻道發出的封禁查詢與解封請求，讓被封禁用戶能透過 PM 自助查詢並申訴\n<code>/pol show</code>：回覆一位用戶，查詢其在本群目前的警告次數\n<code>/pol clear</code>：回覆一位用戶，清除其在本群的所有警告\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明（重新發文並釘選）\n<code>/refreshBL</code>：就地編輯上一則封禁代號說明，不重新發文/釘選\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
+    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>（別名 <code>/mark_spam</code>）：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可。會解封並在找得到對應案例時一併移除錯誤訓練樣本並重建模型，若該案例曾透過 Netban 同步封禁到其他群組，也會一併在那些群組解封（群組管理員也能用 /unban，但僅解封本群、不影響訓練資料與其他群組）\n<code>/unmute</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可，並會撤銷對應案例（群組管理員也能用 /unmute，但僅解除本群禁言）\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat [chat_id]</code>：設定工作群組。不帶參數時直接綁定目前所在的群組；也可提供 chat_id 從其他地方設定。綁定後，若該群組串連的頻道發文時被 Telegram 自動釘選，機器人會自動取消釘選，避免洗掉手動釘選的訊息\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：終止對指定群組（或目前群組）的服務。會先發出服務終止通知，接著離開該群，並把該群列入封禁名單——之後任何人再把機器人加回去，它都會再次自動退出\n<code>/forbid &lt;user_id&gt; [原因]</code>（或回覆該用戶）：禁止某帳號使用本項目的任何服務。該帳號的所有指令一律不予回應，且無法再將本機器人加入任何群組\n<code>/forgive &lt;chat_id 或 user_id&gt;</code>：解除群組或用戶的項目封禁（負數為群組、正數為用戶，自動判斷）。群組解封後仍需重新邀請機器人\n<code>/list_banned</code>：列出目前所有被封禁的群組與用戶\n<code>/ping</code>：確認機器人在線，並回報目前運行的版本號與 commit hash\n<code>/set_audit_log [chat_id]</code>：設定維護操作日誌頻道。不帶參數時綁定目前所在的群組/頻道。設定後，每個會改變狀態的維護指令（門檻、白名單、模組開關、規則異動、封禁/禁言等）都會記錄在這裡，並附上 action id\n<code>/revert &lt;action_id&gt;</code>：復原指定的維護操作，回到變更前的狀態；封禁/禁言類會重用 /unban、/unmute 的邏輯。少數沒有明確「復原前狀態」的操作無法自動復原，會直接告知\n<code>/set_exchange_channel &lt;chat_id&gt;</code>：設定 PM 申訴機器人橋接用的交換頻道。設定後，機器人會回應 PM 透過該頻道發出的封禁查詢與解封請求，讓被封禁用戶能透過 PM 自助查詢並申訴\n<code>/pol show</code>：回覆一位用戶，查詢其在本群目前的警告次數\n<code>/pol clear</code>：回覆一位用戶，清除其在本群的所有警告\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明（重新發文並釘選）\n<code>/refreshBL</code>：就地編輯上一則封禁代號說明，不重新發文/釘選\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
 }
 
 fn format_score_debug(report: &ScoreDebugReport) -> String {
@@ -3189,6 +3343,31 @@ async fn notify_bot_added(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) 
     // bot account, which was wrongly firing this for third-party bots too.
     if let Ok(me) = bot.get_me().await {
         if users.iter().any(|u| u.id == me.id) {
+            // "may not participate in, use, operate or otherwise access the
+            // project's services" - enforced at the one moment it can be:
+            // whoever pulled the bot in is named on this very message, so a
+            // forbidden account can't route around their ban by inviting it
+            // somewhere new. The group's own ban is handled by the dispatcher
+            // guard, but is repeated here so the notice gets posted before
+            // leaving rather than the bot silently vanishing.
+            let inviter_banned = match message.from.as_ref() {
+                Some(user) => runtime.is_user_banned(user.id.0 as i64).await,
+                None => false,
+            };
+            if inviter_banned || runtime.is_group_banned(message.chat.id.0).await {
+                let _ = bot.send_message(message.chat.id, service_denied_text()).parse_mode(ParseMode::Html).await;
+                let _ = bot.leave_chat(message.chat.id).await;
+                let text = format!(
+                    "<b>已拒絕加入</b>\n<b>群組</b>: <code>{}</code>\n<b>標題</b>: {}\n<b>來源</b>: <code>{}</code>\n<b>原因</b>: {}",
+                    message.chat.id.0,
+                    escape_html(message.chat.title().unwrap_or("unknown")),
+                    message.from.as_ref().map(short_user).unwrap_or_else(|| "unknown".to_string()),
+                    if inviter_banned { "邀請者已被禁止使用本項目" } else { "此群組已被終止服務" },
+                );
+                let _ = bot.send_message(ChatId(runtime.config.report_channel_id), text).parse_mode(ParseMode::Html).await;
+                return true;
+            }
+
             let title = message.chat.title().unwrap_or("unknown");
             let text = format!(
                 "<b>機器人已加入</b>\n<b>群組</b>: <code>{}</code>\n<b>標題</b>: {}\n<b>來源</b>: <code>{}</code>",
@@ -3292,6 +3471,40 @@ fn parse_leave_args(args: &str) -> (Option<i64>, String) {
         return (Some(chat_id), reason);
     }
     (None, trimmed.to_string())
+}
+
+/// The notice posted to a group as `/leave` terminates service for it.
+/// Deliberately formal and self-contained: it's the only thing that group
+/// will ever receive from the bot again, so it has to state the scope, the
+/// grounds, and the one appeal route without assuming the reader can ask a
+/// follow-up. Same `❖` heading and `@SEELE_01_BOT` appeal line as the
+/// blacklist-reason notice, so it reads as the same project's voice.
+fn service_termination_text(reason: &str) -> String {
+    format!(
+        "<b>❖ 服務終止通知</b>\n\n\
+         本項目 Spam Protection Bot（SPB）已對此群組終止服務，即刻生效。\n\n\
+         <b>範圍</b>\n\
+         • 此群組不得再使用本項目的任何服務與功能。\n\
+         • 此群組的擁有者與管理團隊，亦不得以任何形式參與、使用、操作或存取本項目服務。\n\
+         • 本禁令針對管理團隊整體生效，而非僅限特定帳號，並適用於該團隊目前及日後建立的其他群組。\n\n\
+         <b>原因</b>\n\
+         經審查，此群組的使用方式違反本項目的使用規範：{}\n\
+         基於本項目資源管理與服務完整性之考量，我們採取此措施。\n\n\
+         <b>紀錄</b>\n\
+         此群組將被列入本項目的服務終止紀錄。如為維護本項目、使用者或公眾權益所必要，我們保留日後公開更多資訊的權利。\n\n\
+         <b>申訴</b>\n\
+         在有限情況下，可透過 @SEELE_01_BOT 提出上訴。此為唯一受理管道，其他方式一律不予處理。",
+        escape_html(reason)
+    )
+}
+
+/// Sent to a group the bot is pulled into while either the group itself or
+/// whoever added it is on a project denial list. Much shorter than
+/// `service_termination_text` on purpose - the full notice was already
+/// delivered when service was terminated, and this is just the bot
+/// declining to stay.
+fn service_denied_text() -> String {
+    "<b>❖ 服務終止通知</b>\n\n此群組或邀請本機器人的帳號已被本項目終止服務，機器人不會留在此群組。\n\n如有異議，請透過 @SEELE_01_BOT 提出上訴。".to_string()
 }
 
 fn project_chat_link(chat_id: i64) -> String {
@@ -4253,6 +4466,16 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
     let from_id = from.id.0 as i64;
     let is_private_maintainer = message.chat.is_private() && runtime.config.maintainer_ids.contains(&from_id);
 
+    // Project-level denial: someone on the `/forbid` list gets no response
+    // to anything, anywhere. Silent rather than an error reply - there's no
+    // appeal to conduct here (that's @SEELE_01_BOT's job) and answering
+    // would just invite argument in whatever group they tried it in.
+    // Maintainers are exempt so a mis-`/forbid` can never lock out the
+    // people who'd have to undo it.
+    if !runtime.config.maintainer_ids.contains(&from_id) && runtime.is_user_banned(from_id).await {
+        return Ok(());
+    }
+
     if is_private_maintainer && runtime.mass_train_mode(from_id).await.is_some() && message.text().map(|t| !t.trim_start().starts_with('/')).unwrap_or(false) {
         if let Some(text) = message.text() {
             runtime.push_mass_train_text(from_id, text.to_string()).await;
@@ -4404,6 +4627,20 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let (target_chat_id, reason) = parse_leave_args(&reason);
             let reason = if reason.trim().is_empty() { "違反使用規則".to_string() } else { reason };
             let target_chat_id = target_chat_id.unwrap_or(message.chat.id.0);
+            // Guard against locking the project out of its own plumbing.
+            // A blacklisted chat is refused *before* command handling, so
+            // banning one of these would leave nowhere to type /forgive
+            // except a DM - and a bare /leave in a DM would blacklist the
+            // maintainer's own chat id, which is worse still.
+            let mut protected = vec![runtime.config.log_channel_id, runtime.config.report_channel_id];
+            protected.extend(runtime.project_chat().await);
+            protected.extend(runtime.audit_log_chat().await);
+            protected.extend(runtime.exchange_channel().await);
+            protected.extend(runtime.config.test_group_id);
+            if target_chat_id >= 0 || protected.contains(&target_chat_id) {
+                bot.send_message(message.chat.id, "只能對一般群組使用 /leave，不能用於私訊或項目自身的頻道/群組。").await?;
+                return Ok(());
+            }
             let project_chat = match runtime.project_chat().await {
                 Some(id) => id,
                 None => {
@@ -4411,10 +4648,110 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     return Ok(());
                 }
             };
-            let text = format!("已停止為此群提供服務。原因：{}", escape_html(&reason));
             let button = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::url("前往項目交流群查詢", Url::parse(&project_chat_link(project_chat)).unwrap())]]);
-            let _ = bot.send_message(ChatId(target_chat_id), text).parse_mode(ParseMode::Html).reply_markup(button).await;
+            let _ = bot
+                .send_message(ChatId(target_chat_id), service_termination_text(&reason))
+                .parse_mode(ParseMode::Html)
+                .reply_markup(button)
+                .await;
+            // Blacklist before leaving, so a re-add during the gap is still
+            // refused by the guard in notify_bot_added.
+            let _ = runtime.set_group_banned(target_chat_id, true, &reason, Some(from_id)).await;
             let _ = bot.leave_chat(ChatId(target_chat_id)).await;
+            log_maintainer_action(
+                &bot,
+                &runtime,
+                from_id,
+                &short_user(from),
+                Some(target_chat_id),
+                "/leave",
+                &format!("終止服務並列入封禁：{reason}"),
+                UndoData::GroupBanned { chat_id: target_chat_id },
+            )
+            .await;
+            bot.send_message(message.chat.id, format!("已終止對 <code>{target_chat_id}</code> 的服務並列入封禁群組。解除請用 <code>/forgive {target_chat_id}</code>。")).parse_mode(ParseMode::Html).await?;
+        }
+        ModerationCommand::Forbid(args) => {
+            require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用 /forbid。");
+            // Same shape as /leave's args: an id, then a free-text reason.
+            // A reply works too, so a maintainer can act straight off a
+            // message without copying ids around.
+            let (target_id, reason) = parse_leave_args(&args);
+            let target_id = target_id.or_else(|| real_reply(&message).and_then(|r| r.from.as_ref()).map(|u| u.id.0 as i64));
+            let Some(target_id) = target_id else {
+                bot.send_message(message.chat.id, "請提供 user_id 或回覆該用戶，例如 /forbid 12345 濫用服務。").await?;
+                return Ok(());
+            };
+            if target_id <= 0 {
+                bot.send_message(message.chat.id, "/forbid 只接受 user_id。要封禁群組請用 /leave。").await?;
+                return Ok(());
+            }
+            if is_special_user(&runtime.config, target_id) || is_platform_pseudo_user(target_id) {
+                bot.send_message(message.chat.id, "不能對項目維護人員或 Telegram 系統帳號執行此指令。").await?;
+                return Ok(());
+            }
+            let reason = if reason.trim().is_empty() { "違反使用規則".to_string() } else { reason };
+            runtime.set_user_banned(target_id, true, &reason, Some(from_id)).await.ok();
+            log_maintainer_action(
+                &bot,
+                &runtime,
+                from_id,
+                &short_user(from),
+                None,
+                "/forbid",
+                &format!("禁止 user_id={target_id} 使用本項目：{reason}"),
+                UndoData::UserBanned { user_id: target_id },
+            )
+            .await;
+            bot.send_message(message.chat.id, format!("已禁止 <code>{target_id}</code> 使用本項目的任何服務，並且無法再將本機器人加入群組。解除請用 <code>/forgive {target_id}</code>。")).parse_mode(ParseMode::Html).await?;
+        }
+        ModerationCommand::Forgive(target) => {
+            require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用 /forgive。");
+            let target = target.trim();
+            let parsed = target.parse::<i64>().ok().or_else(|| real_reply(&message).and_then(|r| r.from.as_ref()).map(|u| u.id.0 as i64));
+            let Some(id) = parsed else {
+                bot.send_message(message.chat.id, "請提供 chat_id 或 user_id，例如 /forgive -1001234567890。").await?;
+                return Ok(());
+            };
+            // Telegram group ids are negative and user ids positive, so one
+            // command can lift either list without the caller having to say
+            // which - matching how /leave and /forbid each take just an id.
+            if id < 0 {
+                if !runtime.is_group_banned(id).await {
+                    bot.send_message(message.chat.id, format!("<code>{id}</code> 不在封禁群組名單中。")).parse_mode(ParseMode::Html).await?;
+                    return Ok(());
+                }
+                runtime.set_group_banned(id, false, "", Some(from_id)).await.ok();
+                log_maintainer_action(&bot, &runtime, from_id, &short_user(from), Some(id), "/forgive", &format!("解除群組封禁 {id}"), UndoData::NotRevertible).await;
+                bot.send_message(message.chat.id, format!("已解除 <code>{id}</code> 的封禁，可以重新加入本機器人。")).parse_mode(ParseMode::Html).await?;
+            } else {
+                if !runtime.is_user_banned(id).await {
+                    bot.send_message(message.chat.id, format!("<code>{id}</code> 不在封禁用戶名單中。")).parse_mode(ParseMode::Html).await?;
+                    return Ok(());
+                }
+                runtime.set_user_banned(id, false, "", Some(from_id)).await.ok();
+                log_maintainer_action(&bot, &runtime, from_id, &short_user(from), None, "/forgive", &format!("解除用戶封禁 {id}"), UndoData::NotRevertible).await;
+                bot.send_message(message.chat.id, format!("已解除 <code>{id}</code> 的封禁。")).parse_mode(ParseMode::Html).await?;
+            }
+        }
+        ModerationCommand::ListBanned => {
+            require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用此指令。");
+            let (groups, users) = runtime.list_banned().await.unwrap_or_default();
+            let mut out = String::from("<b>❖ 項目封禁名單</b>\n\n<b>群組</b>");
+            if groups.is_empty() {
+                out.push_str("\n（無）");
+            }
+            for (id, reason, created_at) in &groups {
+                out.push_str(&format!("\n<code>{id}</code> — {} <i>{}</i>", escape_html(reason), escape_html(created_at)));
+            }
+            out.push_str("\n\n<b>用戶</b>");
+            if users.is_empty() {
+                out.push_str("\n（無）");
+            }
+            for (id, reason, created_at) in &users {
+                out.push_str(&format!("\n<code>{id}</code> — {} <i>{}</i>", escape_html(reason), escape_html(created_at)));
+            }
+            bot.send_message(message.chat.id, out).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::SpamBan | ModerationCommand::Mute | ModerationCommand::Kick => {
             let Some((target_id, target_name, source_id, evidence_text)) = extract_reply_context(&message).await else {
@@ -5641,6 +5978,14 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     Ok(()) => Ok(format!("已將群組 {chat_id} 的模組 {module} 復原為 {old_enabled}。")),
                     Err(e) => Err(e.to_string()),
                 },
+                UndoData::GroupBanned { chat_id } => match runtime.set_group_banned(chat_id, false, "", None).await {
+                    Ok(()) => Ok(format!("已解除群組 {chat_id} 的項目封禁（機器人仍需重新邀請才會回到該群）。")),
+                    Err(e) => Err(e.to_string()),
+                },
+                UndoData::UserBanned { user_id } => match runtime.set_user_banned(user_id, false, "", None).await {
+                    Ok(()) => Ok(format!("已解除 user_id={user_id} 的項目封禁。")),
+                    Err(e) => Err(e.to_string()),
+                },
                 UndoData::GroupModulesBulk { chat_id, old } => {
                     let mut failed = Vec::new();
                     for (module, old_enabled) in &old {
@@ -6208,6 +6553,15 @@ async fn main() -> Result<()> {
                 // otherwise delete this same "message pinned" notification
                 // first (if NoServiceMessage is also on for this chat) - this
                 // still needs to inspect it either way.
+                // Service was terminated for this group (/leave). Nothing
+                // else runs - no moderation, no commands - and the bot
+                // removes itself again if it somehow got re-added, so the
+                // termination sticks without a maintainer re-issuing it.
+                if runtime.is_group_banned(message.chat.id.0).await {
+                    let _ = bot.leave_chat(message.chat.id).await;
+                    return Ok(());
+                }
+
                 unpin_channel_autopin(&bot, &runtime, &message).await;
 
                 // Feeds check_guest_bot_and_act's invoker correlation - has
@@ -6701,6 +7055,96 @@ mod tests {
             runtime.find_active_network_ban(203).await.unwrap().is_none(),
             "a below-bar ban from a non-netban group must not be backfilled onto the blacklist"
         );
+    }
+
+    // Backs /leave, /forbid and /forgive. The in-memory sets are what every
+    // hot-path check actually reads, so a write that lands in SQLite but not
+    // the cache (or vice versa) would leave a banned group being served
+    // until the next restart - both must move together, in both directions.
+    #[tokio::test]
+    async fn project_denial_lists_round_trip_through_cache_and_db() {
+        let runtime = test_runtime().await;
+        assert!(!runtime.is_group_banned(-100).await);
+        assert!(!runtime.is_user_banned(555).await);
+
+        runtime.set_group_banned(-100, true, "abuse", Some(1)).await.unwrap();
+        runtime.set_user_banned(555, true, "abuse", Some(1)).await.unwrap();
+        assert!(runtime.is_group_banned(-100).await);
+        assert!(runtime.is_user_banned(555).await);
+        // Scoped: banning one must not implicate anyone else.
+        assert!(!runtime.is_group_banned(-200).await);
+        assert!(!runtime.is_user_banned(666).await);
+
+        let (groups, users) = runtime.list_banned().await.unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, -100);
+        assert_eq!(groups[0].1, "abuse");
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].0, 555);
+
+        runtime.set_group_banned(-100, false, "", Some(1)).await.unwrap();
+        runtime.set_user_banned(555, false, "", Some(1)).await.unwrap();
+        assert!(!runtime.is_group_banned(-100).await);
+        assert!(!runtime.is_user_banned(555).await);
+        let (groups, users) = runtime.list_banned().await.unwrap();
+        assert!(groups.is_empty() && users.is_empty());
+    }
+
+    // /leave refuses non-group and project-owned chats. This matters more
+    // than a normal input check: a blacklisted chat is refused before
+    // command handling, so banning the project chat or log channel would
+    // leave nowhere to type /forgive - and a bare /leave in a DM would
+    // blacklist the maintainer's own chat id. Mirrors the handler's guard.
+    #[tokio::test]
+    async fn leave_target_guard_rejects_dms_and_project_infrastructure() {
+        let runtime = test_runtime().await;
+        runtime.set_project_chat(-1000).await;
+
+        let protected = |target: i64, project: Option<i64>| {
+            let mut list = vec![runtime.config.log_channel_id, runtime.config.report_channel_id];
+            list.extend(project);
+            target >= 0 || list.contains(&target)
+        };
+        let project = runtime.project_chat().await;
+        assert_eq!(project, Some(-1000));
+
+        // A DM's chat id is the user's own id - positive, and exactly what a
+        // bare /leave in a DM would target.
+        assert!(protected(555, project), "a private chat must never be blacklistable");
+        assert!(protected(0, project));
+        assert!(protected(-1000, project), "the project chat must be protected");
+        assert!(protected(runtime.config.log_channel_id, project), "the log channel must be protected");
+        assert!(protected(runtime.config.report_channel_id, project), "the report channel must be protected");
+        // An ordinary group is still fair game.
+        assert!(!protected(-1002222222222, project));
+    }
+
+    // The caches are populated at startup, so a ban written by a previous
+    // process has to survive a restart - otherwise every restart quietly
+    // re-admits everyone who was ever banned.
+    #[tokio::test]
+    async fn project_denial_lists_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("spb_test_{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let config = Config {
+            bot_token: "test".to_string(),
+            log_channel_id: -1,
+            report_channel_id: -1,
+            test_group_id: None,
+            maintainer_ids: vec![],
+            data_dir: dir.clone(),
+            sqlite_path: dir.join("bot.db"),
+            spam_threshold: 0.85,
+            owner_id: None,
+        };
+        {
+            let runtime = Runtime::load(config.clone()).await.unwrap();
+            runtime.set_group_banned(-100, true, "abuse", Some(1)).await.unwrap();
+            runtime.set_user_banned(555, true, "abuse", Some(1)).await.unwrap();
+        }
+        let restarted = Runtime::load(config).await.unwrap();
+        assert!(restarted.is_group_banned(-100).await, "a group ban must be reloaded from disk at startup");
+        assert!(restarted.is_user_banned(555).await, "a user ban must be reloaded from disk at startup");
     }
 
     // The whole point of the eligibility rule: a group running a lowered
