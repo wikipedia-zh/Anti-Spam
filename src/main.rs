@@ -187,6 +187,10 @@ enum UndoData {
     GroupThreshold { chat_id: i64, old: Option<f64> },
     TokenProbability { token: String, old_spam: u64, old_ham: u64 },
     GroupModule { chat_id: i64, module: String, old_enabled: bool },
+    /// `/module all on|off` - one audit entry covering every module it
+    /// touched, so a single `/revert` puts all of them back rather than
+    /// needing one per module.
+    GroupModulesBulk { chat_id: i64, old: Vec<(String, bool)> },
     GroupWhitelist { chat_id: i64, user_id: i64, old_enabled: bool },
     GlobalWhitelist { user_id: i64, old_enabled: bool },
     RuleAdded { rule_id: i64 },
@@ -2028,12 +2032,16 @@ impl Runtime {
     /// Scans this chat's recent human messages (most recent first) for one
     /// that bare-mentions `bot_username` - the literal way guest mode is
     /// invoked - within the last `WINDOW` of real time. "Bare" means what's
-    /// left after stripping the `@mention` is short: real conversation that
-    /// happens to reference a bot by name reads nothing like a guest-mode
-    /// summon, which per Telegram's own docs is just the @-mention on its
-    /// own. This is a heuristic, not a certainty - Bot API has no field
-    /// linking a guest reply back to whoever triggered it - so callers
-    /// should treat a match as strong evidence, not proof.
+    /// left after stripping *every* @mention is short: real conversation
+    /// that happens to reference a bot by name reads nothing like a
+    /// guest-mode summon, which per Telegram's own docs is just the
+    /// @-mention. Stripping all mentions rather than only this bot's is
+    /// deliberate - a reported evasion summons several guest bots in one
+    /// message (plus an emoji), which left the *other* bots' handles in the
+    /// remainder and made every one of them look like ordinary chatter.
+    /// This is a heuristic, not a certainty - Bot API has no field linking
+    /// a guest reply back to whoever triggered it - so callers should treat
+    /// a match as strong evidence, not proof.
     async fn find_recent_guest_invoker(&self, chat_id: i64, bot_username: &str) -> Option<(i64, MessageId, String, String)> {
         const WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
         const BARE_MAX_REMAINDER: usize = 8;
@@ -2046,13 +2054,24 @@ impl Runtime {
                 return None;
             }
             let lower = entry.text.to_lowercase();
-            let remainder = lower.replace(&mention, "");
-            if lower.contains(&mention) && remainder.trim().chars().count() <= BARE_MAX_REMAINDER {
-                Some((entry.user_id, entry.message_id, entry.display_name.clone(), entry.text.clone()))
-            } else {
-                None
+            if !lower.contains(&mention) {
+                return None;
             }
+            if strip_mentions(&lower).trim().chars().count() > BARE_MAX_REMAINDER {
+                return None;
+            }
+            Some((entry.user_id, entry.message_id, entry.display_name.clone(), entry.text.clone()))
         })
+    }
+
+    /// Drops a specific recorded message, so a summon that pulled in several
+    /// guest bots at once only ever bans its sender for the first reply to
+    /// land - the rest find nothing and skip straight past.
+    async fn forget_recent_message(&self, chat_id: i64, message_id: MessageId) {
+        let mut buffers = self.recent_messages.lock().await;
+        if let Some(entries) = buffers.get_mut(&chat_id) {
+            entries.retain(|entry| entry.message_id != message_id);
+        }
     }
 
     async fn is_group_whitelisted(&self, chat_id: i64, user_id: i64) -> Result<bool> {
@@ -2744,7 +2763,7 @@ fn version_info_text() -> String {
 }
 
 fn help_text() -> String {
-    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n<code>/white</code>：加入本群白名單；若該用戶目前在本群被封禁，會一併解除封禁\n<code>/white -global</code>：加入全域白名單\n<code>/unwhite</code>：移出本群白名單\n<code>/unwhite -global</code>：移出全域白名單\n\n<b>群組管理員可用</b>\n<code>/module &lt;名稱&gt; &lt;on/off&gt;</code>：切換群組模組，名稱支援 NoLongName（英名檢查）/ NoHalal（清真檢查）/ NoSM（服務訊息刪除）/ Flood（洗版偵測，預設開啟）/ Captcha（新成員驗證，預設關閉）/ Netban（跨群組黑名單同步，預設關閉，需自行開啟；開啟後本群的封禁會同步到其他同樣開啟的群組，反之亦然）/ CmdClean（指令權限濫用防護，預設關閉；開啟後，沒有權限的人嘗試使用管理指令會被刪除訊息並警告一次，24 小時內再犯將被禁言 5 分鐘並記錄到日誌頻道。無論是否開啟，此類指令的錯誤提示訊息都會在 10 秒後自動刪除，減少洗版）/ GuestBan（防範 Telegram 訪客模式機器人濫用，預設開啟；任何人都能透過 @ 一個機器人使其在未加入本群的情況下直接發文，此模組會偵測並非本群成員卻發文的機器人帳號，直接刪除訊息並封禁）\n<code>/unban</code>：回覆要解封的用戶、或提供 user_id，解封本群該用戶（僅本群，不影響訓練資料，如需連同撤銷誤判樣本請找維護組）\n<code>/unmute</code>：回覆要解除禁言的用戶、或提供 user_id\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n".to_string()
+    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，封禁並加入黑名單訓練\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n<code>/white</code>：加入本群白名單；若該用戶目前在本群被封禁，會一併解除封禁\n<code>/white -global</code>：加入全域白名單\n<code>/unwhite</code>：移出本群白名單\n<code>/unwhite -global</code>：移出全域白名單\n\n<b>群組管理員可用</b>\n<code>/module &lt;名稱&gt; &lt;on/off&gt;</code>：切換群組模組，名稱支援 NoLongName（英名檢查）/ NoHalal（清真檢查）/ NoSM（服務訊息刪除）/ Flood（洗版偵測，預設開啟）/ Captcha（新成員驗證，預設關閉）/ Netban（跨群組黑名單同步，預設關閉，需自行開啟；開啟後本群的封禁會同步到其他同樣開啟的群組，反之亦然）/ CmdClean（指令權限濫用防護，預設關閉；開啟後，沒有權限的人嘗試使用管理指令會被刪除訊息並警告一次，24 小時內再犯將被禁言 5 分鐘並記錄到日誌頻道。無論是否開啟，此類指令的錯誤提示訊息都會在 10 秒後自動刪除，減少洗版）/ GuestBan（防範 Telegram 訪客模式機器人濫用，預設開啟；任何人都能透過 @ 一個機器人使其在未加入本群的情況下直接發文，此模組會偵測並非本群成員卻發文的機器人帳號，直接刪除訊息並封禁）\n<code>/module</code>（不帶參數）：查看本群所有模組目前的開關狀態\n<code>/module all on/off</code>：一次開啟或關閉全部公開模組\n<code>/unban</code>：回覆要解封的用戶、或提供 user_id，解封本群該用戶（僅本群，不影響訓練資料，如需連同撤銷誤判樣本請找維護組）\n<code>/unmute</code>：回覆要解除禁言的用戶、或提供 user_id\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n".to_string()
 }
 
 fn help_op_text() -> String {
@@ -2771,6 +2790,60 @@ fn format_score_debug(report: &ScoreDebugReport) -> String {
 fn public_log_link(config: &Config, message_id: i32) -> String {
     let id = config.log_channel_id.abs().to_string().trim_start_matches("100").to_string();
     format!("https://t.me/c/{id}/{message_id}")
+}
+
+/// The publicly-documented modules, in the order `/module` lists them, as
+/// (lookup key, display name). Deliberately excludes "warn-pol" - that one
+/// is maintainer-gated and must never surface in any user-facing list or
+/// bulk toggle (see GroupModuleSettings::pol).
+const PUBLIC_MODULES: &[(&str, &str)] = &[
+    ("nolongname", "NoLongName"),
+    ("nohalal", "NoHalal"),
+    ("nosm", "NoSM"),
+    ("flood", "Flood"),
+    ("captcha", "Captcha"),
+    ("netban", "Netban"),
+    ("cmdclean", "CmdClean"),
+    ("guestban", "GuestBan"),
+];
+
+/// Current value of one module flag by its `/module` key, or `None` if the
+/// key isn't a real module - which is also how the command arm tells a typo
+/// from a valid name.
+fn module_flag(settings: &GroupModuleSettings, key: &str) -> Option<bool> {
+    Some(match key {
+        "nolongname" => settings.no_long_name,
+        "nohalal" => settings.no_halal,
+        "nosm" => settings.no_service_messages,
+        "flood" => settings.flood_control,
+        "captcha" => settings.captcha,
+        "netban" => settings.netban,
+        "cmdclean" => settings.cmd_clean,
+        "guestban" => settings.guest_ban,
+        "warn-pol" => settings.pol,
+        _ => return None,
+    })
+}
+
+/// Removes every `@username` token, leaving whatever else was typed. Backs
+/// `find_recent_guest_invoker`'s "is this message nothing but mentions?"
+/// test. Telegram usernames are ASCII alphanumeric plus underscore, so the
+/// run after an `@` ends at the first character outside that set - which
+/// leaves CJK text, emoji, and punctuation in the remainder, exactly the
+/// content that should disqualify a message from looking like a bare summon.
+fn strip_mentions(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '@' {
+            out.push(c);
+            continue;
+        }
+        while chars.peek().is_some_and(|n| n.is_ascii_alphanumeric() || *n == '_') {
+            chars.next();
+        }
+    }
+    out
 }
 
 fn escape_html(input: &str) -> String {
@@ -4033,10 +4106,16 @@ async fn check_guest_bot_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Me
     // find_recent_guest_invoker for exactly what counts as a match.
     if let Some(bot_username) = user.username.as_deref() {
         if let Some((invoker_id, invoker_msg_id, invoker_name, invoker_text)) = runtime.find_recent_guest_invoker(chat_id, bot_username).await {
+            // One summon can pull in several guest bots, so this runs once
+            // per guest reply for the same invoking message. Forget it
+            // immediately and skip anyone already banned here, so the
+            // follow-up replies don't each open a duplicate case.
+            runtime.forget_recent_message(chat_id, invoker_msg_id).await;
             let invoker_exempt = is_special_user(&runtime.config, invoker_id)
                 || is_platform_pseudo_user(invoker_id)
                 || runtime.is_global_whitelisted(invoker_id).await.unwrap_or(false)
                 || runtime.is_group_whitelisted(chat_id, invoker_id).await.unwrap_or(false)
+                || runtime.find_active_ban_in_chat(chat_id, invoker_id).await.ok().flatten().is_some()
                 || is_group_admin(bot, message.chat.id, invoker_id).await;
             if !invoker_exempt {
                 let _ = bot.delete_message(message.chat.id, invoker_msg_id).await;
@@ -4750,18 +4829,54 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let enabled = matches!(state.to_lowercase().as_str(), "on" | "enable" | "enabled");
             let key = module.trim().to_lowercase();
             let old_settings = runtime.get_group_modules(message.chat.id.0).await.unwrap_or_default();
-            let old_enabled = match key.as_str() {
-                "nolongname" => Some(old_settings.no_long_name),
-                "nohalal" => Some(old_settings.no_halal),
-                "nosm" => Some(old_settings.no_service_messages),
-                "flood" => Some(old_settings.flood_control),
-                "captcha" => Some(old_settings.captcha),
-                "netban" => Some(old_settings.netban),
-                "cmdclean" => Some(old_settings.cmd_clean),
-                "warn-pol" => Some(old_settings.pol),
-                "guestban" => Some(old_settings.guest_ban),
-                _ => None,
-            };
+
+            // No module name (or an explicit "status"/"list"): report where
+            // every public module currently stands instead of erroring out.
+            if key.is_empty() || key == "status" || key == "list" {
+                let mut lines = String::from("<b>本群模組狀態</b>\n");
+                for (mod_key, display) in PUBLIC_MODULES {
+                    let on = module_flag(&old_settings, mod_key).unwrap_or(false);
+                    lines.push_str(&format!("\n{} <code>{display}</code>", if on { "✅" } else { "❌" }));
+                }
+                lines.push_str("\n\n<code>/module &lt;名稱&gt; on|off</code> 可單獨切換，<code>/module all on|off</code> 可一次全開或全關。");
+                bot.send_message(message.chat.id, lines).parse_mode(ParseMode::Html).await?;
+                return Ok(());
+            }
+
+            // Bulk toggle. Only ever touches PUBLIC_MODULES, so the
+            // maintainer-gated warn-pol can't be switched on this way.
+            if key == "all" {
+                if !matches!(state.to_lowercase().as_str(), "on" | "enable" | "enabled" | "off" | "disable" | "disabled") {
+                    reply_ephemeral(&bot, &message, "請指定 on 或 off，例如 /module all on。").await?;
+                    return Ok(());
+                }
+                let mut old = Vec::new();
+                for (mod_key, _) in PUBLIC_MODULES {
+                    if let Some(was) = module_flag(&old_settings, mod_key) {
+                        old.push((mod_key.to_string(), was));
+                    }
+                    runtime.set_group_module(message.chat.id.0, mod_key, enabled).await.ok();
+                }
+                log_maintainer_action(
+                    &bot,
+                    &runtime,
+                    from_id,
+                    &short_user(from),
+                    Some(message.chat.id.0),
+                    "/module",
+                    &format!("all →{enabled}（{} 個模組）", old.len()),
+                    UndoData::GroupModulesBulk { chat_id: message.chat.id.0, old },
+                )
+                .await;
+                bot.send_message(
+                    message.chat.id,
+                    format!("已將全部 {} 個公開模組設為 {}。", PUBLIC_MODULES.len(), if enabled { "on" } else { "off" }),
+                )
+                .await?;
+                return Ok(());
+            }
+
+            let old_enabled = module_flag(&old_settings, &key);
             // "warn-pol" is a customized module - not open for public use.
             // Enabling it (never disabling) requires the chat to already be
             // on the maintainer-only allowlist (set via /magic). If it
@@ -4772,21 +4887,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 reply_ephemeral(&bot, &message, "模組名稱僅支援 NoLongName / NoHalal / NoSM / Flood / Captcha / Netban / CmdClean / GuestBan。").await?;
                 return Ok(());
             }
-            match key.as_str() {
-                "nolongname" => { runtime.set_group_module(message.chat.id.0, "nolongname", enabled).await.ok(); }
-                "nohalal" => { runtime.set_group_module(message.chat.id.0, "nohalal", enabled).await.ok(); }
-                "nosm" => { runtime.set_group_module(message.chat.id.0, "nosm", enabled).await.ok(); }
-                "flood" => { runtime.set_group_module(message.chat.id.0, "flood", enabled).await.ok(); }
-                "captcha" => { runtime.set_group_module(message.chat.id.0, "captcha", enabled).await.ok(); }
-                "netban" => { runtime.set_group_module(message.chat.id.0, "netban", enabled).await.ok(); }
-                "cmdclean" => { runtime.set_group_module(message.chat.id.0, "cmdclean", enabled).await.ok(); }
-                "warn-pol" => { runtime.set_group_module(message.chat.id.0, "warn-pol", enabled).await.ok(); }
-                "guestban" => { runtime.set_group_module(message.chat.id.0, "guestban", enabled).await.ok(); }
-                _ => {
-                    reply_ephemeral(&bot, &message, "模組名稱僅支援 NoLongName / NoHalal / NoSM / Flood / Captcha / Netban / CmdClean / GuestBan。").await?;
-                    return Ok(());
-                }
+            if old_enabled.is_none() {
+                reply_ephemeral(&bot, &message, "模組名稱僅支援 NoLongName / NoHalal / NoSM / Flood / Captcha / Netban / CmdClean / GuestBan。").await?;
+                return Ok(());
             }
+            runtime.set_group_module(message.chat.id.0, &key, enabled).await.ok();
             if let Some(old_enabled) = old_enabled {
                 log_maintainer_action(
                     &bot,
@@ -5431,6 +5536,19 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     Ok(()) => Ok(format!("已將群組 {chat_id} 的模組 {module} 復原為 {old_enabled}。")),
                     Err(e) => Err(e.to_string()),
                 },
+                UndoData::GroupModulesBulk { chat_id, old } => {
+                    let mut failed = Vec::new();
+                    for (module, old_enabled) in &old {
+                        if let Err(e) = runtime.set_group_module(chat_id, module, *old_enabled).await {
+                            failed.push(format!("{module}: {e}"));
+                        }
+                    }
+                    if failed.is_empty() {
+                        Ok(format!("已將群組 {chat_id} 的 {} 個模組全部復原。", old.len()))
+                    } else {
+                        Err(failed.join("; "))
+                    }
+                }
                 UndoData::GroupWhitelist { chat_id, user_id, old_enabled } => match runtime.set_group_whitelist(chat_id, user_id, old_enabled, None).await {
                     Ok(()) => Ok(format!("已將群組 {chat_id} 對 user_id={user_id} 的白名單狀態復原為 {old_enabled}。")),
                     Err(e) => Err(e.to_string()),
@@ -6449,6 +6567,52 @@ mod tests {
         );
     }
 
+    // Regression check for a reported evasion: spammers summon several guest
+    // bots in one message and tack an emoji on the end. Stripping only the
+    // bot being checked left the other handles in the remainder, so every one
+    // of the three looked like ordinary chatter and nobody got banned. Each
+    // summoned bot must independently resolve back to the same invoker.
+    #[tokio::test]
+    async fn find_recent_guest_invoker_catches_multi_bot_summon_with_emoji() {
+        let runtime = test_runtime().await;
+        runtime.record_recent_message(100, 444, MessageId(9), "Spammer", "@botone @bottwo @botthree 🎉").await;
+
+        for username in ["botone", "bottwo", "botthree"] {
+            assert_eq!(
+                runtime.find_recent_guest_invoker(100, username).await.map(|(id, _, _, _)| id),
+                Some(444),
+                "{username} was summoned in that message, so it must resolve back to the invoker"
+            );
+        }
+    }
+
+    // forget_recent_message backs the "one summon, one ban" guarantee: with
+    // three guest bots replying to a single summon, only the first reply may
+    // find the invoker - otherwise each opens a duplicate case.
+    #[tokio::test]
+    async fn forget_recent_message_stops_repeat_matches_for_one_summon() {
+        let runtime = test_runtime().await;
+        runtime.record_recent_message(100, 444, MessageId(9), "Spammer", "@botone @bottwo 🎉").await;
+
+        assert!(runtime.find_recent_guest_invoker(100, "botone").await.is_some());
+        runtime.forget_recent_message(100, MessageId(9)).await;
+        assert!(
+            runtime.find_recent_guest_invoker(100, "bottwo").await.is_none(),
+            "the second guest reply must find nothing once the summon has been acted on"
+        );
+    }
+
+    // strip_mentions has to end each handle at the first non-username
+    // character, so CJK text and emoji survive into the remainder - that
+    // remainder is exactly what disqualifies a message from being a summon.
+    #[test]
+    fn strip_mentions_removes_handles_and_keeps_everything_else() {
+        assert_eq!(strip_mentions("@botone @bottwo 🎉").trim(), "🎉");
+        assert_eq!(strip_mentions("@bot_one_2").trim(), "");
+        assert_eq!(strip_mentions("看看 @somebot 這個").trim(), "看看  這個".trim());
+        assert_eq!(strip_mentions("no mentions here"), "no mentions here");
+    }
+
     // Regression check for the 777000 ("Telegram") incident: the reban
     // safety net kept deleting/re-banning routine linked-channel-forward
     // announcements because it didn't know 777000 isn't a real, bannable
@@ -6759,6 +6923,34 @@ mod tests {
         assert!(!runtime.get_group_modules(100).await.unwrap().guest_ban);
         runtime.set_group_module(100, "guestban", true).await.unwrap();
         assert!(runtime.get_group_modules(100).await.unwrap().guest_ban);
+    }
+
+    // PUBLIC_MODULES drives both the status listing and `/module all`, so
+    // every key in it must be a real module that set_group_module actually
+    // writes - a typo would silently list/toggle nothing. warn-pol must stay
+    // out of it: it's maintainer-gated and must never appear in a public
+    // list or get flipped on by a bulk toggle.
+    #[tokio::test]
+    async fn public_modules_table_is_settable_and_excludes_warn_pol() {
+        let runtime = test_runtime().await;
+        assert!(!PUBLIC_MODULES.iter().any(|(key, _)| *key == "warn-pol"));
+
+        for (key, _) in PUBLIC_MODULES {
+            runtime.set_group_module(100, key, true).await.unwrap();
+        }
+        let all_on = runtime.get_group_modules(100).await.unwrap();
+        for (key, _) in PUBLIC_MODULES {
+            assert_eq!(module_flag(&all_on, key), Some(true), "{key} should be on");
+        }
+        assert!(!all_on.pol, "a bulk enable must not touch warn-pol");
+
+        for (key, _) in PUBLIC_MODULES {
+            runtime.set_group_module(100, key, false).await.unwrap();
+        }
+        let all_off = runtime.get_group_modules(100).await.unwrap();
+        for (key, _) in PUBLIC_MODULES {
+            assert_eq!(module_flag(&all_off, key), Some(false), "{key} should be off");
+        }
     }
 
     // Backs /ml_dedupe: simulates the real dirty-data shape (a spam phrase
