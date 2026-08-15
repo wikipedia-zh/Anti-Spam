@@ -3707,9 +3707,15 @@ async fn notify_group(bot: &Bot, runtime: &Runtime, case: &CaseRecord, log_messa
     Ok(())
 }
 
+/// Announces a netban catching someone *in this group* - they posted here,
+/// or just joined. Deliberately not sent when the ban is first propagated
+/// (see `propagate_network_ban`): a group only hears about a network ban
+/// once the person it concerns actually turns up, rather than every time
+/// someone is banned somewhere else.
+///
 /// Same self-delete window as `notify_group` - this is routine ambient
-/// noise for group admins (a netban sync landing), not something that
-/// needs to stick around in the chat permanently.
+/// noise for group admins, not something that needs to stick around in the
+/// chat permanently.
 async fn notify_netban_sync(bot: &Bot, chat_id: ChatId, target_user_id: i64, case_id: &str) {
     let text = format!("<b>跨群組黑名單同步封禁</b>\n用戶 <code>{target_user_id}</code> 已因跨群組黑名單同步封禁。\n原始案例: <code>{case_id}</code>");
     let Ok(sent) = bot.send_message(chat_id, text).parse_mode(ParseMode::Html).await else { return };
@@ -3965,8 +3971,14 @@ async fn propagate_network_ban(bot: &Bot, runtime: &Runtime, case: &CaseRecord) 
             continue;
         }
         if bot.ban_chat_member(ChatId(chat_id), UserId(case.target_user_id as u64)).await.is_ok() {
+            // Silent on purpose. Propagation hits every receiving group at
+            // once, almost always about someone who has never posted there -
+            // announcing it just fills unrelated groups with notices about
+            // strangers. The record is still written, and the groups that
+            // actually meet this user get told at that point instead, by
+            // check_netban_and_act / the join-time catch-up in
+            // notify_bot_added.
             let _ = runtime.record_network_ban_target(&case.id, chat_id).await;
-            notify_netban_sync(bot, ChatId(chat_id), case.target_user_id, &case.id).await;
         }
     }
 }
