@@ -4678,7 +4678,12 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
 
     match cmd {
         ModerationCommand::Start | ModerationCommand::Help => {
-            bot.send_message(message.chat.id, help_text()).parse_mode(ParseMode::Html).await?;
+            // Both, not just /start: they send the same text, so the button
+            // appearing on one and not the other would just look like a bug.
+            bot.send_message(message.chat.id, help_text())
+                .parse_mode(ParseMode::Html)
+                .reply_markup(terms_button("閱讀使用規範 / Terms of Use"))
+                .await?;
         }
         ModerationCommand::HelpOp => {
             require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
