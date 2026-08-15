@@ -1,0 +1,12 @@
+# GitHub Pages config for the public Terms of Use page.
+# Primer is GitHub's own markdown styling - neutral and readable, with no
+# banner or sidebar, which suits a plain policy document better than the
+# themes that wrap everything in project-page chrome.
+theme: jekyll-theme-primer
+title: "Spam Protection Bot"
+description: "使用規範 / Terms of Use"
+
+# Only the terms are published. Nothing else in the repository is part of
+# the site, so source files can never be served from here by accident.
+include:
+  - index.md
