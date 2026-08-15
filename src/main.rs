@@ -3463,6 +3463,16 @@ async fn notify_bot_added(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) 
     }
 
     for user in users {
+        // Never name-guard a bot account - including this one. The name
+        // guard is written for human display names, and "Spam Protection"
+        // itself trips NL13 (two segments, >=13 chars) and NLTAIL, so
+        // joining a group with NoLongName on made the bot ban *itself* -
+        // which Telegram enforces by removing it from the group, so it
+        // looked like the bot spontaneously left. Every other moderation
+        // path here already skips `is_bot`; this loop was the exception.
+        if user.is_bot {
+            continue;
+        }
         if is_special_user(&runtime.config, user.id.0 as i64) || is_platform_pseudo_user(user.id.0 as i64) {
             continue;
         }
@@ -4480,6 +4490,17 @@ async fn check_guest_bot_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Me
     }
     let chat_id = message.chat.id.0;
     let user_id = user.id.0 as i64;
+
+    // Telegram's own pseudo-accounts look *exactly* like a guest-mode bot:
+    // GroupAnonymousBot (an admin posting anonymously) and the channel
+    // sender are flagged `is_bot` and are genuinely not in the member list,
+    // so the membership test below says "Left" for both. Banning them hits
+    // whichever real admin was hiding behind them and deletes their message.
+    // Every other check skips these by never touching bots at all; this
+    // function only ever runs on bots, so it needs the guard explicitly.
+    if is_platform_pseudo_user(user_id) {
+        return false;
+    }
 
     let settings = runtime.get_group_modules(chat_id).await.unwrap_or_default();
     if !settings.guest_ban {
@@ -7330,6 +7351,35 @@ mod tests {
         assert!(!runtime.is_user_banned(555).await);
         let (groups, users) = runtime.list_banned().await.unwrap();
         assert!(groups.is_empty() && users.is_empty());
+    }
+
+    // The bot banned itself out of a group: joining one with NoLongName on
+    // ran the name guard over every new member including itself, and its own
+    // display name trips two rules. Telegram enforces a ban by removing the
+    // member, so the bot vanished from the group and it read as it quitting.
+    // This pins the underlying fact - the name really does match - so the
+    // `is_bot` skip in notify_bot_added's loop can't be dropped without a
+    // failure here explaining why it exists.
+    #[test]
+    fn the_bots_own_display_name_trips_the_name_guard() {
+        let reasons = evaluate_name_guard("Spam Protection");
+        assert!(
+            reasons.contains(&"NL13".to_string()) && reasons.contains(&"NLTAIL".to_string()),
+            "expected NL13 + NLTAIL for the bot's own name, got {reasons:?} - notify_bot_added must skip bot accounts"
+        );
+    }
+
+    // GroupAnonymousBot and the channel-post sender are flagged is_bot and
+    // are genuinely absent from the member list, which is exactly the
+    // signature check_guest_bot_and_act uses - so without an explicit guard
+    // it bans whichever real admin was posting anonymously. Global
+    // whitelisting them works but shouldn't be required.
+    #[test]
+    fn anonymous_admin_pseudo_accounts_are_not_guest_bots() {
+        assert!(is_platform_pseudo_user(1087968824), "GroupAnonymousBot - anonymous admin posts");
+        assert!(is_platform_pseudo_user(136817688), "Channel - posts sent as a channel");
+        // A real guest-mode spam bot has an ordinary id and must still be caught.
+        assert!(!is_platform_pseudo_user(8631161519));
     }
 
     // Backs /reviewer add|del|list and the report-channel button guard.
