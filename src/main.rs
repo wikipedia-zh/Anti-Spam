@@ -3459,6 +3459,15 @@ async fn notify_bot_added(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) 
                 message.from.as_ref().map(short_user).unwrap_or_else(|| "unknown".to_string())
             );
             let _ = bot.send_message(ChatId(runtime.config.report_channel_id), text).parse_mode(ParseMode::Html).await;
+
+            // Not self-deleting, unlike the transient group notices: this is
+            // the group's one prompt to read what it just agreed to, and it
+            // should still be there for anyone scrolling back.
+            let _ = bot
+                .send_message(message.chat.id, welcome_text())
+                .parse_mode(ParseMode::Html)
+                .reply_markup(terms_button("閱讀使用規範 / Terms of Use"))
+                .await;
         }
     }
 
@@ -3566,13 +3575,41 @@ fn parse_leave_args(args: &str) -> (Option<i64>, String) {
     (None, trimmed.to_string())
 }
 
+/// Public Terms of Use. Points at the GitHub Pages site rather than the
+/// repository: users being told the rules have no reason to be handed the
+/// source tree, and the published page is the authoritative wording.
+const TERMS_URL: &str = "https://wikipedia-zh.github.io/Anti-Spam/";
+
+fn terms_button(label: &str) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::url(
+        label.to_string(),
+        Url::parse(TERMS_URL).expect("TERMS_URL is a valid literal URL"),
+    )]])
+}
+
+/// Posted to a group the moment the bot is added. The terms bind the whole
+/// group once it starts using the service, so this is the one point where
+/// everyone present can reasonably be expected to see them - a link buried
+/// in `/help` would not be.
+fn welcome_text() -> String {
+    "<b>Spam Protection Bot（SPB）已加入本群</b>\n\n本機器人會自動偵測並處理垃圾訊息。請群組管理員給予「刪除訊息」與「封禁使用者」權限，否則無法正常運作。\n\n使用本機器人即表示同意本項目的使用規範，請點擊下方按鈕閱讀。管理員可用 <code>/module</code> 查看與調整各項功能，<code>/help</code> 查看指令說明。".to_string()
+}
+
 /// The notice posted to a group as `/leave` terminates service for it.
 /// Deliberately formal and self-contained: it's the only thing that group
 /// will ever receive from the bot again, so it has to state the scope, the
 /// grounds, and the one appeal route without assuming the reader can ask a
 /// follow-up. Same `❖` heading and `@SEELE_01_BOT` appeal line as the
 /// blacklist-reason notice, so it reads as the same project's voice.
-fn service_termination_text(reason: &str) -> String {
+fn service_termination_text(reason: Option<&str>) -> String {
+    // `使用規範` is the link, and the specific reason is only appended when a
+    // maintainer actually typed one. `/leave` defaults its stored reason to
+    // "違反使用規則", which rendered here as "violated the rules: violated
+    // the rules" - the placeholder said nothing the sentence hadn't already.
+    let detail = match reason {
+        Some(reason) if !reason.trim().is_empty() => format!("\n<b>具體事由</b>：{}", escape_html(reason.trim())),
+        _ => String::new(),
+    };
     format!(
         "<b>❖ 服務終止通知</b>\n\n\
          本項目 Spam Protection Bot（SPB）已對此群組終止服務，即刻生效。\n\n\
@@ -3581,13 +3618,12 @@ fn service_termination_text(reason: &str) -> String {
          • 此群組的擁有者與管理團隊，亦不得以任何形式參與、使用、操作或存取本項目服務。\n\
          • 本禁令針對管理團隊整體生效，而非僅限特定帳號，並適用於該團隊目前及日後建立的其他群組。\n\n\
          <b>原因</b>\n\
-         經審查，此群組的使用方式違反本項目的使用規範：{}\n\
-         基於本項目資源管理與服務完整性之考量，我們採取此措施。\n\n\
+         經審查，此群組的使用方式違反本項目的<a href=\"{TERMS_URL}\">使用規範</a>。\
+         基於本項目資源管理與服務完整性之考量，我們採取此措施。{detail}\n\n\
          <b>紀錄</b>\n\
          此群組將被列入本項目的服務終止紀錄。如為維護本項目、使用者或公眾權益所必要，我們保留日後公開更多資訊的權利。\n\n\
          <b>申訴</b>\n\
-         在有限情況下，可透過 @SEELE_01_BOT 提出上訴。此為唯一受理管道，其他方式一律不予處理。",
-        escape_html(reason)
+         在有限情況下，可透過 @SEELE_01_BOT 提出上訴。此為唯一受理管道，其他方式一律不予處理。"
     )
 }
 
@@ -4777,7 +4813,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         ModerationCommand::Leave(reason) => {
             require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用 /leave。");
             let (target_chat_id, reason) = parse_leave_args(&reason);
-            let reason = if reason.trim().is_empty() { "違反使用規則".to_string() } else { reason };
+            // Kept as an Option: the notice reads better with no clause at
+            // all than with a placeholder, but the blacklist row and audit
+            // entry still want something written down.
+            let reason = reason.trim().to_string();
+            let stored_reason = if reason.is_empty() { "違反使用規則".to_string() } else { reason.clone() };
             let target_chat_id = target_chat_id.unwrap_or(message.chat.id.0);
             // Guard against locking the project out of its own plumbing.
             // A blacklisted chat is refused *before* command handling, so
@@ -4802,13 +4842,13 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             };
             let button = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::url("前往項目交流群查詢", Url::parse(&project_chat_link(project_chat)).unwrap())]]);
             let _ = bot
-                .send_message(ChatId(target_chat_id), service_termination_text(&reason))
+                .send_message(ChatId(target_chat_id), service_termination_text(Some(reason.as_str()).filter(|r| !r.is_empty())))
                 .parse_mode(ParseMode::Html)
                 .reply_markup(button)
                 .await;
             // Blacklist before leaving, so a re-add during the gap is still
             // refused by the guard in notify_bot_added.
-            let _ = runtime.set_group_banned(target_chat_id, true, &reason, Some(from_id)).await;
+            let _ = runtime.set_group_banned(target_chat_id, true, &stored_reason, Some(from_id)).await;
             let _ = bot.leave_chat(ChatId(target_chat_id)).await;
             log_maintainer_action(
                 &bot,
@@ -4817,7 +4857,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 &short_user(from),
                 Some(target_chat_id),
                 "/leave",
-                &format!("終止服務並列入封禁：{reason}"),
+                &format!("終止服務並列入封禁：{stored_reason}"),
                 UndoData::GroupBanned { chat_id: target_chat_id },
             )
             .await;
@@ -7380,6 +7420,33 @@ mod tests {
         assert!(is_platform_pseudo_user(136817688), "Channel - posts sent as a channel");
         // A real guest-mode spam bot has an ordinary id and must still be caught.
         assert!(!is_platform_pseudo_user(8631161519));
+    }
+
+    // The termination notice used to render "違反本項目的使用規範：違反使用規則"
+    // - the placeholder reason restating the sentence it was attached to.
+    // The rules reference is now a link to the published terms, and a
+    // specific reason only appears when one was actually given.
+    #[test]
+    fn termination_notice_links_the_terms_and_drops_the_placeholder_reason() {
+        let bare = service_termination_text(None);
+        assert!(bare.contains(&format!("<a href=\"{TERMS_URL}\">使用規範</a>")), "the rules reference must link to the published terms");
+        assert!(!bare.contains("具體事由"), "no reason given - the notice must not invent a detail line");
+
+        let detailed = service_termination_text(Some("大量濫用檢舉指令"));
+        assert!(detailed.contains("<b>具體事由</b>：大量濫用檢舉指令"));
+
+        // Whitespace-only is the same as nothing.
+        assert!(!service_termination_text(Some("   ")).contains("具體事由"));
+        // A reason is user-supplied text going into an HTML message.
+        assert!(service_termination_text(Some("<b>x</b>")).contains("&lt;b&gt;x&lt;/b&gt;"));
+    }
+
+    // The invite prompt and the terms link both build a URL button, which
+    // panics on a malformed URL - a typo would take down every invite.
+    #[test]
+    fn terms_url_is_parseable_and_is_not_the_repository() {
+        assert!(Url::parse(TERMS_URL).is_ok());
+        assert!(!TERMS_URL.contains("github.com"), "link to the published page, not the source repository");
     }
 
     // Backs /reviewer add|del|list and the report-channel button guard.
