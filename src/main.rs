@@ -203,6 +203,7 @@ enum UndoData {
     /// only clears the blacklist so a re-invite is accepted.
     GroupBanned { chat_id: i64 },
     UserBanned { user_id: i64 },
+    Reviewer { user_id: i64, old_enabled: bool },
     /// A synthetic case_id-like handle passed as `case_id` into
     /// `train_spam`/`train_ham` purely so `purge_training_by_case` can find
     /// and remove exactly this training sample later - not a real case.
@@ -572,6 +573,9 @@ impl Runtime {
         if user_version < 10 {
             Self::migrate_v9_to_v10(conn)?;
         }
+        if user_version < 11 {
+            Self::migrate_v10_to_v11(conn)?;
+        }
         Ok(())
     }
 
@@ -788,6 +792,32 @@ impl Runtime {
             [],
         )?;
         tx.execute("PRAGMA user_version = 10", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The reviewer role: may act on the approve/reject buttons in the
+    /// report channel, and nothing else. Until now those buttons were
+    /// guarded only by the message being *in* the report channel, so
+    /// anyone who could see the channel could approve a ban or push text
+    /// into the shared model. This makes that an explicit grant.
+    ///
+    /// Deliberately not a `maintainer_ids`-style env var: reviewers are
+    /// expected to change far more often than maintainers, and rotating one
+    /// shouldn't need a redeploy.
+    fn migrate_v10_to_v11(conn: &mut Connection) -> Result<()> {
+        let tx = conn.transaction()?;
+        tx.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS reviewers (
+                user_id INTEGER PRIMARY KEY,
+                added_by INTEGER,
+                created_at TEXT NOT NULL
+            )
+            "#,
+            [],
+        )?;
+        tx.execute("PRAGMA user_version = 11", [])?;
         tx.commit()?;
         Ok(())
     }
@@ -2267,6 +2297,47 @@ impl Runtime {
         Ok(())
     }
 
+    /// Reviewer-role checks. Read straight from SQLite rather than cached
+    /// like the denial lists: these are only consulted when someone presses
+    /// a button in the report channel, not on every message, so there's no
+    /// hot path to protect and no cache to keep in sync.
+    async fn is_reviewer(&self, user_id: i64) -> bool {
+        self.with_conn(move |conn| {
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM reviewers WHERE user_id = ?1", params![user_id], |row| row.get(0))?;
+            Ok(count > 0)
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    async fn set_reviewer(&self, user_id: i64, enabled: bool, added_by: Option<i64>) -> Result<()> {
+        self.with_conn(move |conn| {
+            if enabled {
+                conn.execute(
+                    "INSERT OR IGNORE INTO reviewers (user_id, added_by, created_at) VALUES (?1, ?2, ?3)",
+                    params![user_id, added_by, Utc::now().to_rfc3339()],
+                )?;
+            } else {
+                conn.execute("DELETE FROM reviewers WHERE user_id = ?1", params![user_id])?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn list_reviewers(&self) -> Result<Vec<(i64, String)>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT user_id, created_at FROM reviewers ORDER BY created_at ASC")?;
+            let mut rows = stmt.query([])?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next()? {
+                out.push((row.get(0)?, row.get(1)?));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// Both denial lists for `/list_banned`, as (id, reason, created_at).
     /// Reads from SQLite rather than the in-memory sets, since only the DB
     /// keeps the reason and timestamp - the caches hold ids alone.
@@ -2573,6 +2644,7 @@ enum ModerationCommand {
     Forbid(String),
     Forgive(String),
     ListBanned,
+    Reviewer(String, String),
     ListRules,
     CheckRules,
     DelRule(String),
@@ -2647,6 +2719,10 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/forbid" => ModerationCommand::Forbid(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
         "/forgive" => ModerationCommand::Forgive(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/list_banned" => ModerationCommand::ListBanned,
+        "/reviewer" => ModerationCommand::Reviewer(
+            text.split_whitespace().nth(1).unwrap_or("").to_string(),
+            text.split_whitespace().nth(2).unwrap_or("").to_string(),
+        ),
         "/list_rules" => ModerationCommand::ListRules,
         "/check_rules" => ModerationCommand::CheckRules,
         "/del_rule" => ModerationCommand::DelRule(text.split_whitespace().nth(1).unwrap_or("").to_string()),
@@ -2988,7 +3064,7 @@ fn help_text() -> String {
 }
 
 fn help_op_text() -> String {
-    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>（別名 <code>/mark_spam</code>）：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可。會解封並在找得到對應案例時一併移除錯誤訓練樣本並重建模型，若該案例曾透過 Netban 同步封禁到其他群組，也會一併在那些群組解封（群組管理員也能用 /unban，但僅解封本群、不影響訓練資料與其他群組）\n<code>/unmute</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可，並會撤銷對應案例（群組管理員也能用 /unmute，但僅解除本群禁言）\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat [chat_id]</code>：設定工作群組。不帶參數時直接綁定目前所在的群組；也可提供 chat_id 從其他地方設定。綁定後，若該群組串連的頻道發文時被 Telegram 自動釘選，機器人會自動取消釘選，避免洗掉手動釘選的訊息\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：終止對指定群組（或目前群組）的服務。會先發出服務終止通知，接著離開該群，並把該群列入封禁名單——之後任何人再把機器人加回去，它都會再次自動退出\n<code>/forbid &lt;user_id&gt; [原因]</code>（或回覆該用戶）：禁止某帳號使用本項目的任何服務。該帳號的所有指令一律不予回應，且無法再將本機器人加入任何群組\n<code>/forgive &lt;chat_id 或 user_id&gt;</code>：解除群組或用戶的項目封禁（負數為群組、正數為用戶，自動判斷）。群組解封後仍需重新邀請機器人\n<code>/list_banned</code>：列出目前所有被封禁的群組與用戶\n<code>/ping</code>：確認機器人在線，並回報目前運行的版本號與 commit hash\n<code>/set_audit_log [chat_id]</code>：設定維護操作日誌頻道。不帶參數時綁定目前所在的群組/頻道。設定後，每個會改變狀態的維護指令（門檻、白名單、模組開關、規則異動、封禁/禁言等）都會記錄在這裡，並附上 action id\n<code>/revert &lt;action_id&gt;</code>：復原指定的維護操作，回到變更前的狀態；封禁/禁言類會重用 /unban、/unmute 的邏輯。少數沒有明確「復原前狀態」的操作無法自動復原，會直接告知\n<code>/set_exchange_channel &lt;chat_id&gt;</code>：設定 PM 申訴機器人橋接用的交換頻道。設定後，機器人會回應 PM 透過該頻道發出的封禁查詢與解封請求，讓被封禁用戶能透過 PM 自助查詢並申訴\n<code>/pol show</code>：回覆一位用戶，查詢其在本群目前的警告次數\n<code>/pol clear</code>：回覆一位用戶，清除其在本群的所有警告\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明（重新發文並釘選）\n<code>/refreshBL</code>：就地編輯上一則封禁代號說明，不重新發文/釘選\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
+    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>（別名 <code>/mark_spam</code>）：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可。會解封並在找得到對應案例時一併移除錯誤訓練樣本並重建模型，若該案例曾透過 Netban 同步封禁到其他群組，也會一併在那些群組解封（群組管理員也能用 /unban，但僅解封本群、不影響訓練資料與其他群組）\n<code>/unmute</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可，並會撤銷對應案例（群組管理員也能用 /unmute，但僅解除本群禁言）\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat [chat_id]</code>：設定工作群組。不帶參數時直接綁定目前所在的群組；也可提供 chat_id 從其他地方設定。綁定後，若該群組串連的頻道發文時被 Telegram 自動釘選，機器人會自動取消釘選，避免洗掉手動釘選的訊息\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：終止對指定群組（或目前群組）的服務。會先發出服務終止通知，接著離開該群，並把該群列入封禁名單——之後任何人再把機器人加回去，它都會再次自動退出\n<code>/forbid &lt;user_id&gt; [原因]</code>（或回覆該用戶）：禁止某帳號使用本項目的任何服務。該帳號的所有指令一律不予回應，且無法再將本機器人加入任何群組\n<code>/forgive &lt;chat_id 或 user_id&gt;</code>：解除群組或用戶的項目封禁（負數為群組、正數為用戶，自動判斷）。群組解封後仍需重新邀請機器人\n<code>/list_banned</code>：列出目前所有被封禁的群組與用戶\n<code>/reviewer add|del &lt;user_id&gt;</code>（或回覆該用戶）：授予或撤銷審核員權限；<code>/reviewer list</code> 列出目前審核員。審核員可以處理舉報頻道的受理/拒絕與訓練批准按鈕，但沒有其他維護權限。維護組本身不需要另外授予\n<code>/ping</code>：確認機器人在線，並回報目前運行的版本號與 commit hash\n<code>/set_audit_log [chat_id]</code>：設定維護操作日誌頻道。不帶參數時綁定目前所在的群組/頻道。設定後，每個會改變狀態的維護指令（門檻、白名單、模組開關、規則異動、封禁/禁言等）都會記錄在這裡，並附上 action id\n<code>/revert &lt;action_id&gt;</code>：復原指定的維護操作，回到變更前的狀態；封禁/禁言類會重用 /unban、/unmute 的邏輯。少數沒有明確「復原前狀態」的操作無法自動復原，會直接告知\n<code>/set_exchange_channel &lt;chat_id&gt;</code>：設定 PM 申訴機器人橋接用的交換頻道。設定後，機器人會回應 PM 透過該頻道發出的封禁查詢與解封請求，讓被封禁用戶能透過 PM 自助查詢並申訴\n<code>/pol show</code>：回覆一位用戶，查詢其在本群目前的警告次數\n<code>/pol clear</code>：回覆一位用戶，清除其在本群的所有警告\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明（重新發文並釘選）\n<code>/refreshBL</code>：就地編輯上一則封禁代號說明，不重新發文/釘選\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
 }
 
 fn format_score_debug(report: &ScoreDebugReport) -> String {
@@ -4808,6 +4884,53 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             }
             bot.send_message(message.chat.id, out).parse_mode(ParseMode::Html).await?;
         }
+        ModerationCommand::Reviewer(sub, target) => {
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以管理審核員。");
+            let usage = "用法：/reviewer add|del <user_id>（或回覆該用戶）、/reviewer list";
+            match sub.trim().to_lowercase().as_str() {
+                "list" | "" => {
+                    let reviewers = runtime.list_reviewers().await.unwrap_or_default();
+                    let mut out = String::from("<b>❖ 審核員名單</b>\n");
+                    if reviewers.is_empty() {
+                        out.push_str("\n（無）");
+                    }
+                    for (id, created_at) in &reviewers {
+                        out.push_str(&format!("\n<code>{id}</code> <i>{}</i>", escape_html(created_at)));
+                    }
+                    out.push_str("\n\n審核員可以處理舉報頻道的受理/拒絕與訓練批准，其餘維護指令不受影響。");
+                    bot.send_message(message.chat.id, out).parse_mode(ParseMode::Html).await?;
+                }
+                verb @ ("add" | "del" | "remove") => {
+                    let target_id = target
+                        .trim()
+                        .parse::<i64>()
+                        .ok()
+                        .or_else(|| real_reply(&message).and_then(|r| r.from.as_ref()).map(|u| u.id.0 as i64));
+                    let Some(target_id) = target_id else {
+                        bot.send_message(message.chat.id, usage).await?;
+                        return Ok(());
+                    };
+                    let enabled = verb == "add";
+                    runtime.set_reviewer(target_id, enabled, Some(from_id)).await.ok();
+                    log_maintainer_action(
+                        &bot,
+                        &runtime,
+                        from_id,
+                        &short_user(from),
+                        None,
+                        "/reviewer",
+                        &format!("{} 審核員 user_id={target_id}", if enabled { "新增" } else { "移除" }),
+                        UndoData::Reviewer { user_id: target_id, old_enabled: !enabled },
+                    )
+                    .await;
+                    let verb_text = if enabled { "已授予" } else { "已撤銷" };
+                    bot.send_message(message.chat.id, format!("{verb_text} <code>{target_id}</code> 的審核員權限。")).parse_mode(ParseMode::Html).await?;
+                }
+                _ => {
+                    bot.send_message(message.chat.id, usage).await?;
+                }
+            }
+        }
         ModerationCommand::SpamBan | ModerationCommand::Mute | ModerationCommand::Kick => {
             let Some((target_id, target_name, source_id, evidence_text)) = extract_reply_context(&message).await else {
                 reply_ephemeral(&bot, &message, "請回覆一條訊息後再使用此指令。").await?;
@@ -6047,6 +6170,10 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     Ok(()) => Ok(format!("已解除 user_id={user_id} 的項目封禁。")),
                     Err(e) => Err(e.to_string()),
                 },
+                UndoData::Reviewer { user_id, old_enabled } => match runtime.set_reviewer(user_id, old_enabled, None).await {
+                    Ok(()) => Ok(format!("已將 user_id={user_id} 的審核員權限復原為 {old_enabled}。")),
+                    Err(e) => Err(e.to_string()),
+                },
                 UndoData::GroupModulesBulk { chat_id, old } => {
                     let mut failed = Vec::new();
                     for (module, old_enabled) in &old {
@@ -6160,6 +6287,16 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
 
     if q.message.as_ref().map(|m| m.chat().id.0 != runtime.config.report_channel_id).unwrap_or(true) {
         bot.answer_callback_query(q.id).text("此按鈕只能在舉報處理頻道使用").await?;
+        return Ok(());
+    }
+
+    // Being able to see the report channel is not authority to act in it.
+    // Every button here either bans someone across the network or writes
+    // into the shared model, so it takes an explicit reviewer grant (or
+    // maintainer). Checked once, before any decision branch, so no button
+    // added later can miss it.
+    if !is_maintainer(&bot, &runtime.config, from_id).await && !runtime.is_reviewer(from_id).await {
+        bot.answer_callback_query(q.id).text("只有審核員或維護組可以處理此項目").await?;
         return Ok(());
     }
 
@@ -7193,6 +7330,28 @@ mod tests {
         assert!(!runtime.is_user_banned(555).await);
         let (groups, users) = runtime.list_banned().await.unwrap();
         assert!(groups.is_empty() && users.is_empty());
+    }
+
+    // Backs /reviewer add|del|list and the report-channel button guard.
+    // Granting must be scoped to the one account named, and revoking must
+    // actually revoke - a stale grant here means someone keeps the ability
+    // to approve network bans and write to the shared model.
+    #[tokio::test]
+    async fn reviewer_grants_round_trip_and_are_scoped_per_user() {
+        let runtime = test_runtime().await;
+        assert!(!runtime.is_reviewer(555).await);
+
+        runtime.set_reviewer(555, true, Some(1)).await.unwrap();
+        assert!(runtime.is_reviewer(555).await);
+        assert!(!runtime.is_reviewer(666).await, "granting one user must not grant anyone else");
+
+        // Re-granting is idempotent, not a duplicate row.
+        runtime.set_reviewer(555, true, Some(1)).await.unwrap();
+        assert_eq!(runtime.list_reviewers().await.unwrap().len(), 1);
+
+        runtime.set_reviewer(555, false, Some(1)).await.unwrap();
+        assert!(!runtime.is_reviewer(555).await);
+        assert!(runtime.list_reviewers().await.unwrap().is_empty());
     }
 
     // /leave refuses non-group and project-owned chats. This matters more
