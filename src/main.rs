@@ -1469,6 +1469,62 @@ impl Runtime {
         .await
     }
 
+    /// Rebuilds `word_frequencies` from scratch by replaying every
+    /// `training_samples` row through the *current* tokenizer.
+    ///
+    /// `rebuild_model` only re-reads the counts that are already stored, so
+    /// it cannot repair them. Anything that changes how text becomes tokens
+    /// (such as `collapse_origin_markers`) leaves the old counts in place,
+    /// still carrying whatever the previous tokenizer produced. This is the
+    /// only way to make such a change retroactive.
+    ///
+    /// Note this discards manual `/set` biases, which live in
+    /// `word_frequencies` and have no backing sample to replay.
+    async fn retrain_from_samples(&self) -> Result<(usize, usize)> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction()?;
+            let samples: Vec<(String, String)> = {
+                let mut stmt = tx.prepare("SELECT label, text FROM training_samples WHERE trim(text) != ''")?;
+                let mut rows = stmt.query([])?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next()? {
+                    out.push((row.get(0)?, row.get(1)?));
+                }
+                out
+            };
+
+            tx.execute("DELETE FROM word_frequencies", [])?;
+            let (mut spam_docs, mut ham_docs) = (0usize, 0usize);
+            for (label, text) in &samples {
+                let (spam_delta, ham_delta) = match label.as_str() {
+                    "spam" => (1, 0),
+                    "ham" => (0, 1),
+                    _ => continue,
+                };
+                for token in tokenize(text) {
+                    tx.execute(
+                        "INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(word) DO UPDATE SET spam_count = spam_count + ?2, ham_count = ham_count + ?3",
+                        params![token, spam_delta, ham_delta],
+                    )?;
+                }
+                if spam_delta == 1 { spam_docs += 1 } else { ham_docs += 1 }
+            }
+
+            tx.execute(
+                "INSERT INTO model_meta (key, value) VALUES ('spam_docs', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![spam_docs.to_string()],
+            )?;
+            tx.execute(
+                "INSERT INTO model_meta (key, value) VALUES ('ham_docs', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![ham_docs.to_string()],
+            )?;
+            tx.commit()?;
+            Ok((spam_docs, ham_docs))
+        })
+        .await
+    }
+
     /// Refreshes the in-memory model from disk. This only reads — the DB is
     /// always the source of truth and callers that changed the DB (train_spam,
     /// purge, undo, set_token_probability, ...) have already persisted their
@@ -2629,6 +2685,7 @@ enum ModerationCommand {
     MlPurge(String),
     MlPurgeText(String),
     MlRebuild,
+    MlRetrain,
     MlDedupe,
     MlFinishMassTrain,
     MlStartMassHam,
@@ -2696,6 +2753,7 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/ml_purge" => ModerationCommand::MlPurge(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/ml_purge_text" => ModerationCommand::MlPurgeText(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
         "/ml_rebuild" => ModerationCommand::MlRebuild,
+        "/ml_retrain" => ModerationCommand::MlRetrain,
         "/ml_dedupe" => ModerationCommand::MlDedupe,
         "/ml_start_mass_train" => ModerationCommand::MlStartMassTrainWithMode("smart".to_string()),
         "/ml_finish_mass_train" => ModerationCommand::MlFinishMassTrain,
@@ -2774,8 +2832,46 @@ fn parse_command(text: &str) -> ModerationCommand {
     }
 }
 
+/// The provenance markers `extract_full_text` appends, as a single token
+/// each, instead of as prose.
+///
+/// Those markers are written for humans reading a `/case` - `[fwd_id: -100…]`,
+/// `[external_origin_username: SOMECHANNEL]` - but they were being fed to the
+/// tokenizer verbatim, and `_` counts as punctuation, so a key like
+/// `external_reply_origin_channel_id` shattered into `external`, `reply`,
+/// `origin`, `channel`, `id`. Training one forwarded advert therefore taught
+/// the model that those words are spam. Two ways that misfires:
+///
+/// - They are attached to *every* forward and external reply regardless of
+///   content, so all forwarded messages drift toward spam together.
+/// - `reply`, `chat`, `id`, `username`, `channel` are ordinary English. A
+///   member writing "please reply in the chat, what's your username" tokenizes
+///   to three of the exact tokens the advert trained.
+///
+/// The identity itself is real signal - a forward from a known spam channel
+/// says something - so it is kept, as one opaque `tgsrc…` token that cannot
+/// collide with prose. The key names are dropped entirely.
+fn collapse_origin_markers(text: &str) -> String {
+    static MARKER_RE: OnceLock<StdRegex> = OnceLock::new();
+    let re = MARKER_RE.get_or_init(|| {
+        StdRegex::new(
+            r"\[(?:fwd_id|fwd_user|external_origin_chat_id|external_origin_username|external_reply_origin_channel_id|external_reply_origin_channel_username|external_reply_origin_chat_id|external_reply_origin_chat_username):\s*([^\]]*)\]",
+        )
+        .expect("valid origin marker regex")
+    });
+    re.replace_all(text, |caps: &regex::Captures| {
+        let value: String = caps[1].chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        if value.is_empty() {
+            " ".to_string()
+        } else {
+            format!(" tgsrc{} ", value.to_lowercase())
+        }
+    })
+    .into_owned()
+}
+
 fn tokenize(text: &str) -> Vec<String> {
-    normalize_tokens(text, jieba())
+    normalize_tokens(&collapse_origin_markers(text), jieba())
 }
 
 fn contains_arabic_script(text: &str) -> bool {
@@ -5345,6 +5441,17 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let rebuilt = runtime.rebuild_model().await.unwrap_or_default();
             bot.send_message(message.chat.id, format!("已重建模型，spam_docs={} ham_docs={}", rebuilt.spam_docs, rebuilt.ham_docs)).await?;
         }
+        ModerationCommand::MlRetrain => {
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
+            let (spam_docs, ham_docs) = runtime.retrain_from_samples().await.unwrap_or((0, 0));
+            let rebuilt = runtime.rebuild_model().await.unwrap_or_default();
+            let summary = format!(
+                "已依目前的分詞規則重新計算全部詞頻：spam={spam_docs} ham={ham_docs}，詞彙量 {}",
+                rebuilt.spam_tokens.len() + rebuilt.ham_tokens.len()
+            );
+            log_maintainer_action(&bot, &runtime, from_id, &short_user(from), None, "/ml_retrain", &summary, UndoData::NotRevertible).await;
+            bot.send_message(message.chat.id, format!("{summary}\n\n注意：先前用 /set 手動調整的偏置已被清除，因為那些沒有對應的訓練樣本可以重播。")).await?;
+        }
         ModerationCommand::MlDedupe => {
             require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
 
@@ -7466,6 +7573,75 @@ mod tests {
         assert!(!TERMS_URL.contains("github.com"), "link to the published page, not the source repository");
     }
 
+    // Training one forwarded advert taught the model that "external",
+    // "origin", "chat", "id", "username", "reply" and "channel" are spam,
+    // because extract_full_text's `[external_reply_origin_channel_id: …]`
+    // markers were tokenized as prose (`_` is punctuation, so the key
+    // shattered into words). Those words then appeared on every forward, and
+    // several are ordinary English.
+    #[test]
+    fn origin_markers_never_tokenize_into_prose_words() {
+        let meta = "[external_origin_chat_id: -1001825797691]\n[external_origin_username: NGHYGFPD]\n[external_reply_origin_channel_id: -1001825797691]\n[fwd_id: -1001825797691]\n[fwd_user: NGHYGFPD]";
+        let tokens = tokenize(meta);
+        for leaked in ["external", "origin", "chat", "id", "username", "reply", "channel", "fwd"] {
+            assert!(!tokens.contains(&leaked.to_string()), "marker key leaked as the prose token {leaked:?}: {tokens:?}");
+        }
+        // The identity is real signal and must survive, as one opaque token.
+        assert!(tokens.contains(&"tgsrc1001825797691".to_string()), "channel id should survive: {tokens:?}");
+        assert!(tokens.contains(&"tgsrcnghygfpd".to_string()), "channel username should survive: {tokens:?}");
+    }
+
+    // The other half of the misfire: ordinary English must not share tokens
+    // with the marker keys, or a member asking a normal question inherits
+    // whatever weight the adverts trained.
+    #[test]
+    fn ordinary_prose_does_not_collide_with_origin_markers() {
+        let prose = tokenize("please reply in the chat, whats your username");
+        let marker = tokenize("[external_origin_username: NGHYGFPD]");
+        for token in &prose {
+            assert!(!marker.contains(token), "prose token {token:?} also produced by a marker: {marker:?}");
+        }
+    }
+
+    // The real message body still has to be scored - collapsing the markers
+    // must not swallow the advert text they were appended to.
+    #[test]
+    fn collapsing_markers_keeps_the_message_body() {
+        let tokens = tokenize("免费代理频道 大水必红\n[fwd_user: NGHYGFPD]");
+        assert!(tokens.iter().any(|t| t.contains('免') || t.contains('代')), "body tokens missing: {tokens:?}");
+        assert!(tokens.contains(&"tgsrcnghygfpd".to_string()));
+    }
+
+    // /ml_retrain exists because changing the tokenizer can't fix counts that
+    // are already stored - rebuild_model only re-reads them. Replaying the
+    // samples has to actually clear the old tokens out.
+    #[tokio::test]
+    async fn retrain_from_samples_reruns_the_current_tokenizer() {
+        let runtime = test_runtime().await;
+        train_spam(&runtime, "免费代理 大水必红", Some("case-1")).await.unwrap();
+        train_ham(&runtime, "大家好 請問有人可以幫忙嗎", Some("case-2")).await.unwrap();
+
+        // Simulate a count left behind by an older tokenizer: a word with no
+        // backing sample at all.
+        runtime
+            .with_conn(|conn| {
+                conn.execute("INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES ('external', 99, 0)", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let (spam_docs, ham_docs) = runtime.retrain_from_samples().await.unwrap();
+        assert_eq!((spam_docs, ham_docs), (1, 1));
+
+        let rebuilt = runtime.rebuild_model().await.unwrap();
+        assert!(!rebuilt.spam_tokens.contains_key("external"), "a token with no backing sample must not survive a retrain");
+        assert_eq!(rebuilt.spam_docs, 1);
+        assert_eq!(rebuilt.ham_docs, 1);
+        // Real samples are still represented.
+        assert!(!rebuilt.spam_tokens.is_empty() && !rebuilt.ham_tokens.is_empty());
+    }
+
     // Backs /reviewer add|del|list and the report-channel button guard.
     // Granting must be scoped to the one account named, and revoking must
     // actually revoke - a stale grant here means someone keeps the ability
@@ -8133,3 +8309,4 @@ mod tests {
         assert_eq!(reply.from.as_ref().unwrap().id.0, 999);
     }
 }
+
