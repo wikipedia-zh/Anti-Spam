@@ -185,7 +185,6 @@ enum CaseKind {
 enum UndoData {
     Threshold { old: f64 },
     GroupThreshold { chat_id: i64, old: Option<f64> },
-    TokenProbability { token: String, old_spam: u64, old_ham: u64 },
     GroupModule { chat_id: i64, module: String, old_enabled: bool },
     /// `/module all on|off` - one audit entry covering every module it
     /// touched, so a single `/revert` puts all of them back rather than
@@ -832,7 +831,7 @@ impl Runtime {
 
     /// A `/set` call with a target very close to 0 or 1 used to compute an
     /// astronomically large raw count for a single token (see
-    /// `set_token_probability`) — that count then dominated the shared
+    /// the removed `/set` command) — that count then dominated the shared
     /// spam_total/ham_total used to score every other word, silently
     /// breaking spam detection for the whole model. This runs once on
     /// startup (gated by `PRAGMA user_version`, same as `migrate_v0_to_v1`)
@@ -1535,7 +1534,7 @@ impl Runtime {
 
     /// Refreshes the in-memory model from disk. This only reads — the DB is
     /// always the source of truth and callers that changed the DB (train_spam,
-    /// purge, undo, set_token_probability, ...) have already persisted their
+    /// purge, undo, retrain, ...) have already persisted their
     /// specific changes, so there is nothing to write back here.
     async fn rebuild_model(&self) -> Result<ModelState> {
         let rebuilt = self
@@ -1602,83 +1601,9 @@ impl Runtime {
         .await
     }
 
-    /// Returns `(new_spam_count, new_ham_count, old_spam_count, old_ham_count)`.
-    /// The old counts are returned too, rather than requiring a separate
-    /// query, so `/revert` can restore them via `UndoData::TokenProbability`.
-    async fn set_token_probability(&self, token: &str, target_spam_prob: f64) -> Result<(u64, u64, u64, u64)> {
-        let token = token.trim().to_string();
-        // Clamped well away from 0/1: the formula below solves for the raw count
-        // needed to hit `target`, and that count blows up as target approaches
-        // either extreme (at 0.9999 against a modest few-thousand-word corpus it's
-        // already tens of millions). Since spam_count/ham_count feed into the
-        // shared spam_total/ham_total used to score every OTHER token, an
-        // extreme target here silently poisons the whole model's scoring, not
-        // just this one word's.
-        let target = target_spam_prob.clamp(0.05, 0.95);
-        let updated = self
-            .with_conn(move |conn| {
-                let (spam_total, ham_total, vocab): (u64, u64, u64) = conn.query_row(
-                    "SELECT COALESCE(SUM(spam_count), 0), COALESCE(SUM(ham_count), 0), COUNT(*) FROM word_frequencies",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )?;
-
-                let (current_spam, current_ham): (u64, u64) = conn.query_row(
-                    "SELECT COALESCE(spam_count, 0), COALESCE(ham_count, 0) FROM word_frequencies WHERE word = ?1",
-                    params![&token],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                ).unwrap_or((0, 0));
-
-                let spam_other = spam_total.saturating_sub(current_spam) as f64;
-                let ham_other = ham_total.saturating_sub(current_ham) as f64;
-                let vocab = vocab.max(1) as f64;
-
-                let spam_count = (((target * (spam_other + vocab)) - 1.0) / (1.0 - target)).ceil().max(0.0) as u64;
-                let ham_target = 1.0 - target;
-                let ham_count = (((ham_target * (ham_other + vocab)) - 1.0) / (1.0 - ham_target)).ceil().max(0.0) as u64;
-
-                // Defense in depth: even with `target` clamped above, never let a
-                // single token's count outweigh the rest of the corpus by more
-                // than 20x, and never past an absolute ceiling. Either bound being
-                // hit means the requested probability wasn't fully reached.
-                let spam_count = spam_count.min((spam_other as u64).saturating_mul(20).max(1_000)).min(1_000_000);
-                let ham_count = ham_count.min((ham_other as u64).saturating_mul(20).max(1_000)).min(1_000_000);
-
-                conn.execute(
-                    "INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES (?1, ?2, ?3) ON CONFLICT(word) DO UPDATE SET spam_count = excluded.spam_count, ham_count = excluded.ham_count",
-                    params![&token, spam_count, ham_count],
-                )?;
-
-                Ok((spam_count, ham_count, current_spam, current_ham))
-            })
-            .await?;
-
-        let _ = self.rebuild_model().await?;
-        Ok(updated)
-    }
-
     async fn current_threshold(&self) -> Result<f64> {
         let value = self.with_conn(|conn| Self::load_threshold(conn)).await?;
         Ok(value.unwrap_or(self.config.spam_threshold))
-    }
-
-    /// Sets a token's spam/ham counts directly, unlike `set_token_probability`
-    /// which solves for counts from a target probability. Used by `/revert`
-    /// to restore exact prior counts, where the clamping/defense-in-depth
-    /// `set_token_probability` applies would be wrong (those old counts were
-    /// already valid before, so they don't need re-validating).
-    async fn set_token_counts_raw(&self, token: &str, spam_count: u64, ham_count: u64) -> Result<()> {
-        let token = token.to_string();
-        self.with_conn(move |conn| {
-            conn.execute(
-                "INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES (?1, ?2, ?3) ON CONFLICT(word) DO UPDATE SET spam_count = excluded.spam_count, ham_count = excluded.ham_count",
-                params![&token, spam_count, ham_count],
-            )?;
-            Ok(())
-        })
-        .await?;
-        let _ = self.rebuild_model().await?;
-        Ok(())
     }
 
     async fn start_mass_train(&self, user_id: i64) {
@@ -2706,7 +2631,6 @@ enum ModerationCommand {
     MarkHam,
     MlStats,
     MlThreshold(String),
-    MlSetToken(String, String),
     MlExport,
     MlPurge(String),
     MlPurgeText(String),
@@ -2771,10 +2695,6 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/mark_ham" => ModerationCommand::MarkHam,
         "/ml_stats" => ModerationCommand::MlStats,
         "/ml_threshold" => ModerationCommand::MlThreshold(text.split_whitespace().nth(1).unwrap_or("").to_string()),
-        "/set" => ModerationCommand::MlSetToken(
-            text.split_whitespace().nth(1).unwrap_or("").to_string(),
-            text.split_whitespace().nth(2).unwrap_or("").to_string(),
-        ),
         "/ml_export" => ModerationCommand::MlExport,
         "/ml_purge" => ModerationCommand::MlPurge(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/ml_purge_text" => ModerationCommand::MlPurgeText(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
@@ -3186,7 +3106,7 @@ fn help_text() -> String {
 }
 
 fn help_op_text() -> String {
-    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/set 0x&lt;token&gt; &lt;0.05~0.95&gt;</code>：直接調整 token 的 spam/ham 機率偏置\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>（別名 <code>/mark_spam</code>）：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可。會解封並在找得到對應案例時一併移除錯誤訓練樣本並重建模型，若該案例曾透過 Netban 同步封禁到其他群組，也會一併在那些群組解封（群組管理員也能用 /unban，但僅解封本群、不影響訓練資料與其他群組）\n<code>/unmute</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可，並會撤銷對應案例（群組管理員也能用 /unmute，但僅解除本群禁言）\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat [chat_id]</code>：設定工作群組。不帶參數時直接綁定目前所在的群組；也可提供 chat_id 從其他地方設定。綁定後，若該群組串連的頻道發文時被 Telegram 自動釘選，機器人會自動取消釘選，避免洗掉手動釘選的訊息\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：終止對指定群組（或目前群組）的服務。會先發出服務終止通知，接著離開該群，並把該群列入封禁名單——之後任何人再把機器人加回去，它都會再次自動退出\n<code>/forbid &lt;user_id&gt; [原因]</code>（或回覆該用戶）：禁止某帳號使用本項目的任何服務。該帳號的所有指令一律不予回應，且無法再將本機器人加入任何群組\n<code>/forgive &lt;chat_id 或 user_id&gt;</code>：解除群組或用戶的項目封禁（負數為群組、正數為用戶，自動判斷）。群組解封後仍需重新邀請機器人\n<code>/list_banned</code>：列出目前所有被封禁的群組與用戶\n<code>/reviewer add|del &lt;user_id&gt;</code>（或回覆該用戶）：授予或撤銷審核員權限；<code>/reviewer list</code> 列出目前審核員。審核員可以處理舉報頻道的受理/拒絕與訓練批准按鈕，但沒有其他維護權限。維護組本身不需要另外授予\n<code>/ping</code>：確認機器人在線，並回報目前運行的版本號與 commit hash\n<code>/set_audit_log [chat_id]</code>：設定維護操作日誌頻道。不帶參數時綁定目前所在的群組/頻道。設定後，每個會改變狀態的維護指令（門檻、白名單、模組開關、規則異動、封禁/禁言等）都會記錄在這裡，並附上 action id\n<code>/revert &lt;action_id&gt;</code>：復原指定的維護操作，回到變更前的狀態；封禁/禁言類會重用 /unban、/unmute 的邏輯。少數沒有明確「復原前狀態」的操作無法自動復原，會直接告知\n<code>/set_exchange_channel &lt;chat_id&gt;</code>：設定 PM 申訴機器人橋接用的交換頻道。設定後，機器人會回應 PM 透過該頻道發出的封禁查詢與解封請求，讓被封禁用戶能透過 PM 自助查詢並申訴\n<code>/pol show</code>：回覆一位用戶，查詢其在本群目前的警告次數\n<code>/pol clear</code>：回覆一位用戶，清除其在本群的所有警告\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明（重新發文並釘選）\n<code>/refreshBL</code>：就地編輯上一則封禁代號說明，不重新發文/釘選\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
+    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>（別名 <code>/mark_spam</code>）：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可。會解封並在找得到對應案例時一併移除錯誤訓練樣本並重建模型，若該案例曾透過 Netban 同步封禁到其他群組，也會一併在那些群組解封（群組管理員也能用 /unban，但僅解封本群、不影響訓練資料與其他群組）\n<code>/unmute</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可，並會撤銷對應案例（群組管理員也能用 /unmute，但僅解除本群禁言）\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat [chat_id]</code>：設定工作群組。不帶參數時直接綁定目前所在的群組；也可提供 chat_id 從其他地方設定。綁定後，若該群組串連的頻道發文時被 Telegram 自動釘選，機器人會自動取消釘選，避免洗掉手動釘選的訊息\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：終止對指定群組（或目前群組）的服務。會先發出服務終止通知，接著離開該群，並把該群列入封禁名單——之後任何人再把機器人加回去，它都會再次自動退出\n<code>/forbid &lt;user_id&gt; [原因]</code>（或回覆該用戶）：禁止某帳號使用本項目的任何服務。該帳號的所有指令一律不予回應，且無法再將本機器人加入任何群組\n<code>/forgive &lt;chat_id 或 user_id&gt;</code>：解除群組或用戶的項目封禁（負數為群組、正數為用戶，自動判斷）。群組解封後仍需重新邀請機器人\n<code>/list_banned</code>：列出目前所有被封禁的群組與用戶\n<code>/reviewer add|del &lt;user_id&gt;</code>（或回覆該用戶）：授予或撤銷審核員權限；<code>/reviewer list</code> 列出目前審核員。審核員可以處理舉報頻道的受理/拒絕與訓練批准按鈕，但沒有其他維護權限。維護組本身不需要另外授予\n<code>/ping</code>：確認機器人在線，並回報目前運行的版本號與 commit hash\n<code>/set_audit_log [chat_id]</code>：設定維護操作日誌頻道。不帶參數時綁定目前所在的群組/頻道。設定後，每個會改變狀態的維護指令（門檻、白名單、模組開關、規則異動、封禁/禁言等）都會記錄在這裡，並附上 action id\n<code>/revert &lt;action_id&gt;</code>：復原指定的維護操作，回到變更前的狀態；封禁/禁言類會重用 /unban、/unmute 的邏輯。少數沒有明確「復原前狀態」的操作無法自動復原，會直接告知\n<code>/set_exchange_channel &lt;chat_id&gt;</code>：設定 PM 申訴機器人橋接用的交換頻道。設定後，機器人會回應 PM 透過該頻道發出的封禁查詢與解封請求，讓被封禁用戶能透過 PM 自助查詢並申訴\n<code>/pol show</code>：回覆一位用戶，查詢其在本群目前的警告次數\n<code>/pol clear</code>：回覆一位用戶，清除其在本群的所有警告\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明（重新發文並釘選）\n<code>/refreshBL</code>：就地編輯上一則封禁代號說明，不重新發文/釘選\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
 }
 
 fn format_score_debug(report: &ScoreDebugReport) -> String {
@@ -5481,7 +5401,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 rebuilt.spam_tokens.len() + rebuilt.ham_tokens.len()
             );
             log_maintainer_action(&bot, &runtime, from_id, &short_user(from), None, "/ml_retrain", &summary, UndoData::NotRevertible).await;
-            bot.send_message(message.chat.id, format!("{summary}\n\n注意：先前用 /set 手動調整的偏置已被清除，因為那些沒有對應的訓練樣本可以重播。")).await?;
+            bot.send_message(message.chat.id, format!("{summary}\n\n所有詞頻皆重新由訓練樣本計算，不含任何人工偏置。")).await?;
         }
         ModerationCommand::MlDedupe => {
             require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
@@ -5527,13 +5447,13 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 if let Some((word, count)) = top_spam {
                     text.push_str(&format!("\n\n最大 spam token: <code>{}</code> = {count}", escape_html(&word)));
                     if spam > 0 && (count as f64) / (spam as f64) > 0.2 {
-                        text.push_str("\n⚠️ 此 token 佔整體 spam 計數超過 20%，可能是 /set 造成的異常值，會拖累其他詞的判斷，建議檢查並用 /set 重新調整或用 /ml_purge_text 清除。");
+                        text.push_str("\n⚠️ 此 token 佔整體 spam 計數超過 20%，會拖累其他詞的判斷。通常是同一段文字被重複訓練所致，建議用 /ml_dedupe 去重，或用 /ml_purge_text 清除該樣本後再 /ml_retrain。");
                     }
                 }
                 if let Some((word, count)) = top_ham {
                     text.push_str(&format!("\n最大 ham token: <code>{}</code> = {count}", escape_html(&word)));
                     if ham > 0 && (count as f64) / (ham as f64) > 0.2 {
-                        text.push_str("\n⚠️ 此 token 佔整體 ham 計數超過 20%，可能是 /set 造成的異常值。");
+                        text.push_str("\n⚠️ 此 token 佔整體 ham 計數超過 20%，通常是同一段文字被重複訓練所致，建議用 /ml_dedupe 去重後再 /ml_retrain。");
                     }
                 }
             }
@@ -5946,51 +5866,6 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, format!("已為本群設定門檻: {clamped:.2}（僅適用於本群，其他群組不受影響）")).await?;
             }
         }
-        ModerationCommand::MlSetToken(token_arg, value) => {
-            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
-
-            let token = token_arg.strip_prefix("0x").unwrap_or(&token_arg).trim();
-            if token.is_empty() {
-                bot.send_message(message.chat.id, "請提供 token，例如 /set 0x80sun 0.9。").await?;
-                return Ok(());
-            }
-
-            let Ok(target) = value.parse::<f64>() else {
-                bot.send_message(message.chat.id, "請提供 0.05 到 0.95 之間的數值（過於極端的值會影響整個模型的計分基準，因此會被限制）。").await?;
-                return Ok(());
-            };
-
-            let target = target.clamp(0.000001, 0.999999);
-            let token_owned = token.to_string();
-            let (spam_count, ham_count, old_spam, old_ham) = runtime
-                .set_token_probability(token, target)
-                .await
-                .map_err(|err| teloxide::RequestError::Io(std::io::Error::other(err.to_string()).into()))?;
-            log_maintainer_action(
-                &bot,
-                &runtime,
-                from_id,
-                &short_user(from),
-                None,
-                "/set",
-                &format!("token `{token_owned}` spam_count {old_spam}→{spam_count}, ham_count {old_ham}→{ham_count}"),
-                UndoData::TokenProbability { token: token_owned, old_spam, old_ham },
-            )
-            .await;
-
-            bot.send_message(
-                message.chat.id,
-                format!(
-                    "已調整 token <code>{}</code>：目標 spam_prob={:.4}，spam_count={}，ham_count={}",
-                    escape_html(token),
-                    target,
-                    spam_count,
-                    ham_count,
-                ),
-            )
-            .parse_mode(ParseMode::Html)
-            .await?;
-        }
         ModerationCommand::MlExport => {
             require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
             let export = runtime.export_training_data().await.unwrap_or_default();
@@ -6368,10 +6243,6 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 },
                 UndoData::GroupThreshold { chat_id, old } => match runtime.set_group_threshold(chat_id, old).await {
                     Ok(()) => Ok(format!("已將群組 {chat_id} 的門檻復原為 {old:?}。")),
-                    Err(e) => Err(e.to_string()),
-                },
-                UndoData::TokenProbability { token, old_spam, old_ham } => match runtime.set_token_counts_raw(&token, old_spam, old_ham).await {
-                    Ok(()) => Ok(format!("已將 token <code>{}</code> 的計數復原為 spam={old_spam}, ham={old_ham}。", escape_html(&token))),
                     Err(e) => Err(e.to_string()),
                 },
                 UndoData::GroupModule { chat_id, module, old_enabled } => match runtime.set_group_module(chat_id, &module, old_enabled).await {
@@ -7234,7 +7105,8 @@ mod tests {
         assert_eq!(rebuilt.ham_docs, 1);
     }
 
-    // Regression check for the /set corruption incident: seeds a v1-shaped DB
+    // Regression check for the token-count corruption incident (caused by
+    // the since-removed /set command): seeds a v1-shaped DB
     // (pre-migrate_v2_to_v3) with a dead token_counts table and a poisoned
     // word_frequencies row, then loads a Runtime against it and confirms
     // migrate_v1_to_v2/migrate_v2_to_v3 both actually ran on startup.
@@ -8177,22 +8049,6 @@ mod tests {
         // Simulates what /revert does for UndoData::Threshold { old: 0.7 }
         runtime.set_threshold(0.7).await.unwrap();
         assert_eq!(runtime.current_threshold().await.unwrap(), 0.7);
-    }
-
-    #[tokio::test]
-    async fn set_token_counts_raw_restores_exact_counts() {
-        let runtime = test_runtime().await;
-        // Push the counts to some large, formula-derived values first...
-        runtime.set_token_probability("spamword", 0.9).await.unwrap();
-
-        // ...then simulate /revert for UndoData::TokenProbability { old_spam: 3, old_ham: 7 },
-        // which must land on exactly those values, not another formula-derived pair.
-        runtime.set_token_counts_raw("spamword", 3, 7).await.unwrap();
-        let (spam_after, ham_after): (i64, i64) = runtime
-            .with_conn(|conn| Ok(conn.query_row("SELECT spam_count, ham_count FROM word_frequencies WHERE word = 'spamword'", [], |row| Ok((row.get(0)?, row.get(1)?)))?))
-            .await
-            .unwrap();
-        assert_eq!((spam_after, ham_after), (3, 7));
     }
 
     // Backs /magic: a chat starts un-allowed for any module, allowing it
