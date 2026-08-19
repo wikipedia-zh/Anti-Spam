@@ -273,6 +273,13 @@ struct Runtime {
     /// written through on every change.
     banned_groups: RwLock<std::collections::HashSet<i64>>,
     banned_users: RwLock<std::collections::HashSet<i64>>,
+    /// This bot's own account id, resolved once. `get_me()` was being called
+    /// per message via `ensure_bot_can_moderate` (and again per bot-authored
+    /// message via the guest-mode check) purely to learn an id that cannot
+    /// change while the process runs. Every one of those was a network round
+    /// trip against Telegram's rate limit before the message could even be
+    /// looked at.
+    me_id: OnceLock<UserId>,
 }
 
 /// One entry in `Runtime::recent_messages`. See that field's doc comment.
@@ -420,6 +427,7 @@ impl Runtime {
             recent_messages: Mutex::new(HashMap::new()),
             banned_groups: RwLock::new(banned_groups),
             banned_users: RwLock::new(banned_users),
+            me_id: OnceLock::new(),
         })
     }
 
@@ -2225,7 +2233,14 @@ impl Runtime {
                 break;
             }
         }
-        timestamps.len() >= LIMIT
+        let tripped = timestamps.len() >= LIMIT;
+        if timestamps.is_empty() {
+            // The deque was trimmed to nothing, so this pair is idle. Drop the
+            // key too - otherwise the map keeps one entry per (chat, user)
+            // ever seen, for the life of the process.
+            tracker.remove(&(chat_id, user_id));
+        }
+        tripped
     }
 
     /// Records a human message for check_guest_bot_and_act's invoker
@@ -2292,6 +2307,17 @@ impl Runtime {
         if let Some(entries) = buffers.get_mut(&chat_id) {
             entries.retain(|entry| entry.message_id != message_id);
         }
+    }
+
+    /// The bot's own id, fetched from Telegram once and then reused. Falls
+    /// back to a live call only if the first attempt failed.
+    async fn me_id(&self, bot: &Bot) -> Option<UserId> {
+        if let Some(id) = self.me_id.get() {
+            return Some(*id);
+        }
+        let id = bot.get_me().await.ok()?.id;
+        let _ = self.me_id.set(id);
+        Some(id)
     }
 
     /// Project-level denial checks. In-memory (see the `banned_groups` /
@@ -3352,12 +3378,19 @@ macro_rules! require_maintainer {
     };
 }
 
+/// Whether `user_id` is an owner or administrator of `chat_id`.
+///
+/// Uses teloxide's own `is_privileged()` rather than matching text. This
+/// used to be `format!("{:?}", member).contains("Administrator")`, which
+/// formatted the *whole* `ChatMember` - including the user's profile - and
+/// searched that. Anyone could therefore become an administrator here by
+/// setting their first name to "Owner": the debug string contained the
+/// word, so the check passed while `kind` was plainly `Member`. That
+/// granted the full group-admin command set (`/sb`, `/mute`, `/kick`,
+/// `/module`, `/white`, ...) to any member who renamed themselves.
 async fn is_group_admin(bot: &Bot, chat_id: ChatId, user_id: i64) -> bool {
     match bot.get_chat_member(chat_id, UserId(user_id as u64)).await {
-        Ok(member) => {
-            let status = format!("{:?}", member);
-            status.contains("Administrator") || status.contains("Owner")
-        }
+        Ok(member) => member.kind.is_privileged(),
         Err(_) => false,
     }
 }
@@ -3520,8 +3553,8 @@ async fn notify_bot_added(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) 
     // Only notify when this bot itself is the one joining - not any other
     // bot a group happens to add alongside it. `is_bot` alone matches any
     // bot account, which was wrongly firing this for third-party bots too.
-    if let Ok(me) = bot.get_me().await {
-        if users.iter().any(|u| u.id == me.id) {
+    if let Some(me_id) = runtime.me_id(bot).await {
+        if users.iter().any(|u| u.id == me_id) {
             // "may not participate in, use, operate or otherwise access the
             // project's services" - enforced at the one moment it can be:
             // whoever pulled the bot in is named on this very message, so a
@@ -4660,10 +4693,8 @@ async fn check_guest_bot_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Me
     if runtime.is_group_whitelisted(chat_id, user_id).await.unwrap_or(false) {
         return false;
     }
-    if let Ok(me) = bot.get_me().await {
-        if user.id == me.id {
-            return false;
-        }
+    if runtime.me_id(bot).await == Some(user.id) {
+        return false;
     }
 
     let Ok(member) = bot.get_chat_member(message.chat.id, user.id).await else { return false; };
@@ -6728,9 +6759,9 @@ async fn score_only(bot: &Bot, runtime: &Runtime, message: &Message) -> Response
     Ok(())
         }
 
-async fn ensure_bot_can_moderate(bot: &Bot, _runtime: &Runtime, chat_id: ChatId) -> ResponseResult<bool> {
-    let me = bot.get_me().await?;
-    let member = match bot.get_chat_member(chat_id, me.id).await {
+async fn ensure_bot_can_moderate(bot: &Bot, runtime: &Runtime, chat_id: ChatId) -> ResponseResult<bool> {
+    let Some(me_id) = runtime.me_id(bot).await else { return Ok(false) };
+    let member = match bot.get_chat_member(chat_id, me_id).await {
         Ok(m) => m,
         Err(_) => {
             let _ = bot.send_message(chat_id, "機器人無法檢查權限，將退出此群。請確認管理員權限後再邀請。" ).await;
@@ -6738,8 +6769,13 @@ async fn ensure_bot_can_moderate(bot: &Bot, _runtime: &Runtime, chat_id: ChatId)
             return Ok(false);
         }
     };
-    let status = format!("{:?}", member);
-    let allowed = status.contains("Administrator") || status.contains("Owner");
+    // Same reasoning as is_group_admin: ask the type, not the debug text.
+    // This one also checks the two permissions the bot actually needs, so a
+    // promotion that withheld them is caught here rather than surfacing
+    // later as silently-failing deletes and bans.
+    let allowed = member.kind.is_privileged()
+        && member.kind.can_delete_messages()
+        && member.kind.can_restrict_members();
     if !allowed {
         let _ = bot.send_message(chat_id, "機器人缺乏足夠的管理員權限，將退出此群。請確認至少具備刪訊息、封禁、解除封禁、禁言、踢出權限。" ).await;
         let _ = bot.leave_chat(chat_id).await;
@@ -7099,9 +7135,6 @@ async fn main() -> Result<()> {
     });
 
     let handler = dptree::entry()
-        .inspect(|u: teloxide::types::Update| {
-            println!("=> [DISPATCHER RECEIVED UPDATE]: ID {:?}", u.id);
-        })
         .branch(message_handler)
         .branch(callback_handler)
         .branch(exchange_handler);
@@ -7640,6 +7673,39 @@ mod tests {
         assert_eq!(rebuilt.ham_docs, 1);
         // Real samples are still represented.
         assert!(!rebuilt.spam_tokens.is_empty() && !rebuilt.ham_tokens.is_empty());
+    }
+
+    // A member could become a group admin by renaming themselves. The old
+    // check formatted the whole ChatMember - profile included - and searched
+    // that text for "Administrator"/"Owner", so a first name of "Owner"
+    // passed while `kind` was `Member`. That handed the full admin command
+    // set to anyone who edited their display name.
+    #[test]
+    fn membership_is_read_from_the_type_not_the_display_name() {
+        let spoof: teloxide::types::ChatMember =
+            serde_json::from_str(r#"{"user":{"id":123,"is_bot":false,"first_name":"Owner"},"status":"member"}"#).unwrap();
+        assert!(!spoof.kind.is_privileged(), "a member named Owner is still just a member");
+        assert!(
+            format!("{spoof:?}").contains("Owner"),
+            "the debug text really does contain the word - which is exactly why matching on it was unsafe"
+        );
+
+        let admin_spoof: teloxide::types::ChatMember =
+            serde_json::from_str(r#"{"user":{"id":123,"is_bot":false,"first_name":"Administrator"},"status":"member"}"#).unwrap();
+        assert!(!admin_spoof.kind.is_privileged());
+
+        // A real administrator must still pass.
+        let real: teloxide::types::ChatMember = serde_json::from_str(
+            r#"{"user":{"id":9,"is_bot":false,"first_name":"Real"},"status":"administrator","can_be_edited":false,"is_anonymous":false,"can_manage_chat":true,"can_delete_messages":true,"can_manage_video_chats":true,"can_restrict_members":true,"can_promote_members":false,"can_change_info":true,"can_invite_users":true,"can_post_stories":false,"can_edit_stories":false,"can_delete_stories":false}"#,
+        )
+        .unwrap();
+        assert!(real.kind.is_privileged());
+        assert!(real.kind.can_delete_messages() && real.kind.can_restrict_members());
+
+        // An owner always passes, and always has the permissions.
+        let owner: teloxide::types::ChatMember =
+            serde_json::from_str(r#"{"user":{"id":8,"is_bot":false,"first_name":"O"},"status":"creator","is_anonymous":false}"#).unwrap();
+        assert!(owner.kind.is_privileged() && owner.kind.can_delete_messages());
     }
 
     // Backs /reviewer add|del|list and the report-channel button guard.
@@ -8309,4 +8375,5 @@ mod tests {
         assert_eq!(reply.from.as_ref().unwrap().id.0, 999);
     }
 }
+
 

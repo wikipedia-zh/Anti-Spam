@@ -2265,9 +2265,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "fancy-regex",
- "futures",
  "jieba-rs",
- "log",
  "regex",
  "reqwest",
  "rusqlite",
@@ -2275,7 +2273,6 @@ dependencies = [
  "serde_json",
  "teloxide",
  "tokio",
- "tokio-stream",
  "url",
  "uuid",
 ]

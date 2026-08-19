@@ -34,5 +34,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # The test suite covers the parts that are painful to verify by hand:
+      # netban eligibility, the tokenizer, migrations against seeded data,
+      # and the permission checks. CI was building without running any of it.
+      - name: Test
+        run: cargo test --all-targets
+
       - name: Build release binary
         run: cargo build --release
