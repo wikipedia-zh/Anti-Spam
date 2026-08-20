@@ -4049,9 +4049,47 @@ async fn log_maintainer_action(bot: &Bot, runtime: &Runtime, actor_id: i64, acto
 /// maintainer path and the `/revert` dispatcher, so ban reversal only
 /// exists in one place. Returns a ready-to-send HTML summary on success, or
 /// a ready-to-send error message on failure.
+/// Why an `unbanChatMember` failure still leaves the user un-banned, if it
+/// does.
+///
+/// The point of an unban is the *state* "this user is not banned here", not
+/// the API call returning ok. Telegram rejects the call in several
+/// situations where that state already holds, and treating those as failures
+/// was actively harmful: an accepted appeal for a user who had since been
+/// made an administrator reported back to PM as "appeal failed". Worse,
+/// `reverse_ban_case` bailed on the first error, so the case was never
+/// marked `Unbanned` — it stayed active, kept the user on the shared netban
+/// list, and left the mistaken training sample in the model.
+///
+/// Returns `None` for errors that are genuine failures (missing rights, for
+/// instance), which still have to be reported.
+fn unban_noop_reason(err: &teloxide::RequestError) -> Option<&'static str> {
+    // Telegram has no dedicated error variant for most of these, so they
+    // arrive as `Unknown` with the raw description; match on that text.
+    let text = err.to_string().to_lowercase();
+    if text.contains("user is an administrator") {
+        return Some("對象目前是該群管理員，本來就未被封禁");
+    }
+    if text.contains("chat not found") || text.contains("bot was kicked") || text.contains("bot is not a member") {
+        return Some("機器人已不在該群組");
+    }
+    if text.contains("user not found") || text.contains("participant_id_invalid") || text.contains("user_not_participant") {
+        return Some("對象不在該群組");
+    }
+    None
+}
+
 async fn reverse_ban_case(bot: &Bot, runtime: &Runtime, mut case: CaseRecord, actor_id: i64, actor_name: &str) -> Result<String, String> {
+    let mut noop_note = String::new();
     if let Err(err) = bot.unban_chat_member(ChatId(case.chat_id), UserId(case.target_user_id as u64)).await {
-        return Err(format!("解封失敗：{err}"));
+        match unban_noop_reason(&err) {
+            // Already not banned. Carry on with the rest of the reversal -
+            // the case still has to be closed, the training sample removed,
+            // and the netban entry cleared, none of which happens if we
+            // return here.
+            Some(reason) => noop_note = format!("（{reason}）"),
+            None => return Err(format!("解封失敗：{err}")),
+        }
     }
 
     let removed = runtime.purge_training_by_case(&case.id).await.unwrap_or(0);
@@ -4086,7 +4124,7 @@ async fn reverse_ban_case(bot: &Bot, runtime: &Runtime, mut case: CaseRecord, ac
     } else {
         format!("，並在 {} 個跨群組黑名單同步的群組中解封", network_targets.len())
     };
-    Ok(format!("已解封用戶，並撤銷 case <code>{}</code>、移除 {removed} 筆對應訓練樣本{network_note}。", case.id))
+    Ok(format!("已解封用戶{noop_note}，並撤銷 case <code>{}</code>、移除 {removed} 筆對應訓練樣本{network_note}。", case.id))
 }
 
 /// Reverses a mute case: restores full permissions in the case's chat and
@@ -6496,7 +6534,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     return Ok(());
                 };
                 if let Err(err) = bot.unban_chat_member(message.chat.id, UserId(target_user_id as u64)).await {
-                    bot.send_message(message.chat.id, format!("解封失敗：{err}")).await?;
+                    let Some(reason) = unban_noop_reason(&err) else {
+                        bot.send_message(message.chat.id, format!("解封失敗：{err}")).await?;
+                        return Ok(());
+                    };
+                    reply_ephemeral(&bot, &message, format!("該用戶目前並未被封禁（{reason}）。")).await?;
                     return Ok(());
                 }
                 broadcast_unban_if_fully_clear(&bot, &runtime, target_user_id).await;
@@ -6555,7 +6597,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
 
             let Some(case) = case else {
                 if let Err(err) = bot.unban_chat_member(ChatId(chat_id), UserId(target_user_id as u64)).await {
-                    bot.send_message(message.chat.id, format!("解封失敗：{err}")).await?;
+                    let Some(reason) = unban_noop_reason(&err) else {
+                        bot.send_message(message.chat.id, format!("解封失敗：{err}")).await?;
+                        return Ok(());
+                    };
+                    bot.send_message(message.chat.id, format!("該用戶目前並未被封禁（{reason}），無需解封。")).await?;
                     return Ok(());
                 }
                 bot.send_message(
@@ -8131,6 +8177,32 @@ mod tests {
         let after = runtime.rebuild_model().await.unwrap();
         assert_eq!(before.spam_docs, after.spam_docs, "evaluation must not change the model");
         assert_eq!(before.spam_tokens.len(), after.spam_tokens.len());
+    }
+
+    // An accepted appeal reported back to PM as "failed" because Telegram
+    // refused the unban with "user is an administrator of the chat" - which
+    // means the user is not banned, i.e. the thing being asked for already
+    // holds. reverse_ban_case then bailed before closing the case, so the
+    // user stayed on the netban list with the bad training sample intact.
+    #[test]
+    fn unban_errors_that_mean_already_not_banned_are_not_failures() {
+        let noop = |msg: &str| {
+            let err = teloxide::RequestError::Api(teloxide::ApiError::Unknown(msg.to_string()));
+            unban_noop_reason(&err)
+        };
+
+        // The exact string from the incident.
+        assert!(noop("Bad Request: user is an administrator of the chat").is_some());
+        assert!(noop("Bad Request: chat not found").is_some());
+        assert!(noop("Forbidden: bot was kicked from the supergroup chat").is_some());
+        assert!(noop("Bad Request: user not found").is_some());
+        assert!(noop("Bad Request: PARTICIPANT_ID_INVALID").is_some());
+
+        // Genuine failures must still be reported, not silently swallowed -
+        // here the ban really is still in place.
+        assert!(noop("Bad Request: not enough rights to restrict/unrestrict chat member").is_none());
+        assert!(noop("Too Many Requests: retry after 30").is_none());
+        assert!(noop("Bad Request: something entirely new").is_none());
     }
 
     // Backs /reviewer add|del|list and the report-channel button guard.
