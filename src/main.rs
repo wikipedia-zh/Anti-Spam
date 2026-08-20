@@ -331,6 +331,12 @@ struct GroupModuleSettings {
     // not an opinionated per-group choice, and it only ever fires on
     // messages from bots that were never legitimately added anyway.
     guest_ban: bool,
+    // Attachment-policy modules (see migrate_v11_to_v12). Each bans on the
+    // message carrying a particular kind of attachment, independent of any
+    // text it has. All opt-in.
+    no_contact: bool,
+    no_voice: bool,
+    no_exec: bool,
 }
 
 impl Default for GroupModuleSettings {
@@ -346,6 +352,9 @@ impl Default for GroupModuleSettings {
             cmd_clean: false,
             pol: false,
             guest_ban: true,
+            no_contact: false,
+            no_voice: false,
+            no_exec: false,
         }
     }
 }
@@ -583,6 +592,26 @@ impl Runtime {
         if user_version < 11 {
             Self::migrate_v10_to_v11(conn)?;
         }
+        if user_version < 12 {
+            Self::migrate_v11_to_v12(conn)?;
+        }
+        Ok(())
+    }
+
+    /// `ALTER TABLE ... ADD COLUMN`, skipped when the column is already
+    /// there. SQLite has no `IF NOT EXISTS` for this, so a migration that
+    /// ran against a schema already carrying the column would abort the
+    /// whole transaction. Checking first makes each migration safe to
+    /// re-run, which matters when one partially applied.
+    fn add_column_if_missing(tx: &rusqlite::Transaction, table: &str, column: &str, decl: &str) -> Result<()> {
+        let existing: i64 = tx.query_row(
+            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+            params![column],
+            |row| row.get(0),
+        )?;
+        if existing == 0 {
+            tx.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])?;
+        }
         Ok(())
     }
 
@@ -598,9 +627,9 @@ impl Runtime {
     fn migrate_v2_to_v3(conn: &mut Connection) -> Result<()> {
         let tx = conn.transaction()?;
         tx.execute("DROP TABLE IF EXISTS token_counts", [])?;
-        tx.execute("ALTER TABLE group_module_settings ADD COLUMN flood_control INTEGER NOT NULL DEFAULT 1", [])?;
-        tx.execute("ALTER TABLE group_module_settings ADD COLUMN captcha INTEGER NOT NULL DEFAULT 0", [])?;
-        tx.execute("ALTER TABLE group_module_settings ADD COLUMN spam_threshold_override REAL", [])?;
+        Self::add_column_if_missing(&tx, "group_module_settings", "flood_control", "INTEGER NOT NULL DEFAULT 1")?;
+        Self::add_column_if_missing(&tx, "group_module_settings", "captcha", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::add_column_if_missing(&tx, "group_module_settings", "spam_threshold_override", "REAL")?;
         tx.execute("PRAGMA user_version = 3", [])?;
         tx.commit()?;
         Ok(())
@@ -613,7 +642,7 @@ impl Runtime {
     /// settings - it has to know which chats were actually hit).
     fn migrate_v3_to_v4(conn: &mut Connection) -> Result<()> {
         let tx = conn.transaction()?;
-        tx.execute("ALTER TABLE group_module_settings ADD COLUMN netban INTEGER NOT NULL DEFAULT 0", [])?;
+        Self::add_column_if_missing(&tx, "group_module_settings", "netban", "INTEGER NOT NULL DEFAULT 0")?;
         tx.execute(
             r#"
             CREATE TABLE IF NOT EXISTS network_ban_targets (
@@ -636,7 +665,7 @@ impl Runtime {
     /// within 24h and escalate to a temporary mute.
     fn migrate_v4_to_v5(conn: &mut Connection) -> Result<()> {
         let tx = conn.transaction()?;
-        tx.execute("ALTER TABLE group_module_settings ADD COLUMN cmd_clean INTEGER NOT NULL DEFAULT 0", [])?;
+        Self::add_column_if_missing(&tx, "group_module_settings", "cmd_clean", "INTEGER NOT NULL DEFAULT 0")?;
         tx.execute(
             r#"
             CREATE TABLE IF NOT EXISTS permission_offenses (
@@ -689,7 +718,7 @@ impl Runtime {
     /// ban, no matter how long ago the first one was.
     fn migrate_v6_to_v7(conn: &mut Connection) -> Result<()> {
         let tx = conn.transaction()?;
-        tx.execute("ALTER TABLE group_module_settings ADD COLUMN pol INTEGER NOT NULL DEFAULT 0", [])?;
+        Self::add_column_if_missing(&tx, "group_module_settings", "pol", "INTEGER NOT NULL DEFAULT 0")?;
         tx.execute(
             r#"
             CREATE TABLE IF NOT EXISTS module_allowlist (
@@ -724,7 +753,7 @@ impl Runtime {
     /// auto-ban check.
     fn migrate_v7_to_v8(conn: &mut Connection) -> Result<()> {
         let tx = conn.transaction()?;
-        tx.execute("ALTER TABLE group_module_settings ADD COLUMN guest_ban INTEGER NOT NULL DEFAULT 1", [])?;
+        Self::add_column_if_missing(&tx, "group_module_settings", "guest_ban", "INTEGER NOT NULL DEFAULT 1")?;
         tx.execute("PRAGMA user_version = 8", [])?;
         tx.commit()?;
         Ok(())
@@ -753,7 +782,7 @@ impl Runtime {
     fn migrate_v8_to_v9(conn: &mut Connection) -> Result<()> {
         let threshold = Self::load_threshold(conn)?.unwrap_or(0.85);
         let tx = conn.transaction()?;
-        tx.execute("ALTER TABLE cases ADD COLUMN netban_eligible INTEGER NOT NULL DEFAULT 0", [])?;
+        Self::add_column_if_missing(&tx, "cases", "netban_eligible", "INTEGER NOT NULL DEFAULT 0")?;
         tx.execute(
             r#"
             UPDATE cases SET netban_eligible = 1
@@ -825,6 +854,39 @@ impl Runtime {
             [],
         )?;
         tx.execute("PRAGMA user_version = 11", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Three attachment-policy modules, and the counter behind `/spam`'s
+    /// three-strike rule.
+    ///
+    /// The modules ban on message *type* rather than content: a shared
+    /// contact card, a voice recording, or an executable attachment. All
+    /// default off, like every other opinionated policy module - a group
+    /// that legitimately shares recordings or installers should not have
+    /// its members banned because the bot was upgraded.
+    ///
+    /// `report_offenses` counts rejected `/spam` reports per reporter.
+    /// It can't be derived from `cases`: rejecting a report overwrites the
+    /// case's `actor_user_id` with the reviewer's id, so the reporter is no
+    /// longer recorded there by the time the rejection is final.
+    fn migrate_v11_to_v12(conn: &mut Connection) -> Result<()> {
+        let tx = conn.transaction()?;
+        Self::add_column_if_missing(&tx, "group_module_settings", "no_contact", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::add_column_if_missing(&tx, "group_module_settings", "no_voice", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::add_column_if_missing(&tx, "group_module_settings", "no_exec", "INTEGER NOT NULL DEFAULT 0")?;
+        tx.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS report_offenses (
+                user_id INTEGER PRIMARY KEY,
+                rejected_count INTEGER NOT NULL DEFAULT 0,
+                last_rejected_at TEXT NOT NULL
+            )
+            "#,
+            [],
+        )?;
+        tx.execute("PRAGMA user_version = 12", [])?;
         tx.commit()?;
         Ok(())
     }
@@ -1476,6 +1538,90 @@ impl Runtime {
         .await
     }
 
+    /// Hold-out evaluation: trains a throwaway model on part of the samples
+    /// and scores the rest, which the model has never seen.
+    ///
+    /// Exists because the spam threshold was being chosen by feel. Scoring
+    /// the live model against its own training data would just report how
+    /// well it memorised them, so this splits the samples deterministically
+    /// (every Nth row by rowid, no RNG - the same data gives the same answer
+    /// twice) and builds the counts in memory. Nothing here touches
+    /// `word_frequencies`, so it is safe to run on a live bot.
+    ///
+    /// Reports precision/recall at several thresholds, since the useful
+    /// question is not "is 0.85 good" but "what does moving it cost".
+    async fn evaluate_model(&self, holdout_fraction: f64) -> Result<String> {
+        let samples: Vec<(i64, String, String)> = self
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare("SELECT rowid, label, text FROM training_samples WHERE trim(text) != '' AND label IN ('spam','ham') ORDER BY rowid")?;
+                let mut rows = stmt.query([])?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next()? {
+                    out.push((row.get(0)?, row.get(1)?, row.get(2)?));
+                }
+                Ok(out)
+            })
+            .await?;
+
+        if samples.len() < 20 {
+            return Ok(format!("樣本太少（{}），至少需要 20 筆才能評估。", samples.len()));
+        }
+
+        let step = (1.0 / holdout_fraction).round().max(2.0) as usize;
+        let mut train = ModelState::default();
+        let mut test: Vec<(bool, String)> = Vec::new();
+        for (i, (_, label, text)) in samples.iter().enumerate() {
+            let is_spam = label == "spam";
+            if i % step == 0 {
+                test.push((is_spam, text.clone()));
+                continue;
+            }
+            let tokens = tokenize(text);
+            if is_spam {
+                train.spam_docs += 1;
+                for t in tokens { *train.spam_tokens.entry(t).or_default() += 1; }
+            } else {
+                train.ham_docs += 1;
+                for t in tokens { *train.ham_tokens.entry(t).or_default() += 1; }
+            }
+        }
+        if test.is_empty() || train.spam_docs == 0 || train.ham_docs == 0 {
+            return Ok("切分後其中一側沒有樣本，無法評估。".to_string());
+        }
+
+        let scored: Vec<(bool, f64)> = test.iter().map(|(is_spam, text)| (*is_spam, score_spam_from_text(&train, text))).collect();
+        let live = self.current_threshold().await.unwrap_or(self.config.spam_threshold);
+
+        let mut out = format!(
+            "<b>❖ 模型評估</b>\n訓練 {} 筆 / 測試 {} 筆（保留 1/{step}）\n目前門檻 {live:.2}\n\n<code>門檻  精確率  召回率   F1   漏放  誤封</code>",
+            train.spam_docs + train.ham_docs,
+            scored.len(),
+        );
+        let mut thresholds = vec![0.50, 0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95];
+        if !thresholds.iter().any(|t| (*t - live).abs() < 1e-9) {
+            thresholds.push(live);
+            thresholds.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        }
+        for t in thresholds {
+            let (mut tp, mut fp, mut fnn) = (0usize, 0usize, 0usize);
+            for (is_spam, score) in &scored {
+                match (*is_spam, *score >= t) {
+                    (true, true) => tp += 1,
+                    (false, true) => fp += 1,
+                    (true, false) => fnn += 1,
+                    (false, false) => {}
+                }
+            }
+            let precision = if tp + fp == 0 { 0.0 } else { tp as f64 / (tp + fp) as f64 };
+            let recall = if tp + fnn == 0 { 0.0 } else { tp as f64 / (tp + fnn) as f64 };
+            let f1 = if precision + recall == 0.0 { 0.0 } else { 2.0 * precision * recall / (precision + recall) };
+            let marker = if (t - live).abs() < 1e-9 { " ←" } else { "" };
+            out.push_str(&format!("\n<code>{t:.2}   {:.3}   {:.3}  {:.3}   {fnn:>3}   {fp:>3}</code>{marker}", precision, recall, f1));
+        }
+        out.push_str("\n\n漏放 = 是垃圾但沒攔到；誤封 = 正常訊息被判垃圾。\n此評估只用訓練樣本，未動到實際模型。");
+        Ok(out)
+    }
+
     /// Rebuilds `word_frequencies` from scratch by replaying every
     /// `training_samples` row through the *current* tokenizer.
     ///
@@ -2028,7 +2174,7 @@ impl Runtime {
                     "INSERT OR IGNORE INTO group_module_settings (chat_id) VALUES (?1)",
                     params![chat_id],
                 )?;
-                let mut stmt = conn.prepare("SELECT no_long_name, no_halal, no_service_messages, flood_control, captcha, spam_threshold_override, netban, cmd_clean, pol, guest_ban FROM group_module_settings WHERE chat_id = ?1")?;
+                let mut stmt = conn.prepare("SELECT no_long_name, no_halal, no_service_messages, flood_control, captcha, spam_threshold_override, netban, cmd_clean, pol, guest_ban, no_contact, no_voice, no_exec FROM group_module_settings WHERE chat_id = ?1")?;
                 let mut rows = stmt.query(params![chat_id])?;
                 if let Some(row) = rows.next()? {
                     Ok(GroupModuleSettings {
@@ -2042,6 +2188,9 @@ impl Runtime {
                         cmd_clean: row.get::<_, i64>(7)? != 0,
                         pol: row.get::<_, i64>(8)? != 0,
                         guest_ban: row.get::<_, i64>(9)? != 0,
+                        no_contact: row.get::<_, i64>(10)? != 0,
+                        no_voice: row.get::<_, i64>(11)? != 0,
+                        no_exec: row.get::<_, i64>(12)? != 0,
                     })
                 } else {
                     Ok(GroupModuleSettings::default())
@@ -2111,6 +2260,24 @@ impl Runtime {
             "guestban" => {
                 conn.execute(
                     "UPDATE group_module_settings SET guest_ban = ?2 WHERE chat_id = ?1",
+                    params![chat_id, if enabled { 1 } else { 0 }],
+                )?;
+            }
+            "nocontact" => {
+                conn.execute(
+                    "UPDATE group_module_settings SET no_contact = ?2 WHERE chat_id = ?1",
+                    params![chat_id, if enabled { 1 } else { 0 }],
+                )?;
+            }
+            "novoice" => {
+                conn.execute(
+                    "UPDATE group_module_settings SET no_voice = ?2 WHERE chat_id = ?1",
+                    params![chat_id, if enabled { 1 } else { 0 }],
+                )?;
+            }
+            "noexec" => {
+                conn.execute(
+                    "UPDATE group_module_settings SET no_exec = ?2 WHERE chat_id = ?1",
                     params![chat_id, if enabled { 1 } else { 0 }],
                 )?;
             }
@@ -2302,6 +2469,44 @@ impl Runtime {
             cache.remove(&user_id);
         }
         Ok(())
+    }
+
+    /// `/spam` three-strike rule. A third of reports were being rejected,
+    /// and Telegram won't let the bot DM a reporter who has never messaged
+    /// it, so there's no way to tell someone their report was wrong. Losing
+    /// the command after three rejections is the feedback instead.
+    ///
+    /// Counted here rather than derived from `cases` because rejecting a
+    /// report overwrites that case's `actor_user_id` with the *reviewer*,
+    /// so the reporter is no longer recorded on it afterwards.
+    async fn report_strikes(&self, user_id: i64) -> i64 {
+        self.with_conn(move |conn| {
+            Ok(conn
+                .query_row("SELECT rejected_count FROM report_offenses WHERE user_id = ?1", params![user_id], |row| row.get(0))
+                .unwrap_or(0))
+        })
+        .await
+        .unwrap_or(0)
+    }
+
+    async fn add_report_strike(&self, user_id: i64) -> Result<i64> {
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO report_offenses (user_id, rejected_count, last_rejected_at) VALUES (?1, 1, ?2)
+                 ON CONFLICT(user_id) DO UPDATE SET rejected_count = rejected_count + 1, last_rejected_at = excluded.last_rejected_at",
+                params![user_id, Utc::now().to_rfc3339()],
+            )?;
+            Ok(conn.query_row("SELECT rejected_count FROM report_offenses WHERE user_id = ?1", params![user_id], |row| row.get(0))?)
+        })
+        .await
+    }
+
+    async fn clear_report_strikes(&self, user_id: i64) -> Result<()> {
+        self.with_conn(move |conn| {
+            conn.execute("DELETE FROM report_offenses WHERE user_id = ?1", params![user_id])?;
+            Ok(())
+        })
+        .await
     }
 
     /// Reviewer-role checks. Read straight from SQLite rather than cached
@@ -2652,6 +2857,9 @@ enum ModerationCommand {
     Forgive(String),
     ListBanned,
     Reviewer(String, String),
+    Whois(String),
+    ReportReset(String),
+    MlEval(String),
     ListRules,
     CheckRules,
     DelRule(String),
@@ -2723,6 +2931,9 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/forbid" => ModerationCommand::Forbid(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
         "/forgive" => ModerationCommand::Forgive(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/list_banned" => ModerationCommand::ListBanned,
+        "/whois" => ModerationCommand::Whois(text.split_whitespace().nth(1).unwrap_or("").to_string()),
+        "/report_reset" => ModerationCommand::ReportReset(text.split_whitespace().nth(1).unwrap_or("").to_string()),
+        "/ml_eval" => ModerationCommand::MlEval(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/reviewer" => ModerationCommand::Reviewer(
             text.split_whitespace().nth(1).unwrap_or("").to_string(),
             text.split_whitespace().nth(2).unwrap_or("").to_string(),
@@ -3102,11 +3313,11 @@ fn version_info_text() -> String {
 }
 
 fn help_text() -> String {
-    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，刪除該訊息並封禁該用戶（僅限本群；訊息內容會送交項目組審核，經批准後才會用於訓練模型）\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n<code>/white</code>：加入本群白名單；若該用戶目前在本群被封禁，會一併解除封禁\n<code>/white -global</code>：加入全域白名單\n<code>/unwhite</code>：移出本群白名單\n<code>/unwhite -global</code>：移出全域白名單\n\n<b>群組管理員可用</b>\n<code>/module &lt;名稱&gt; &lt;on/off&gt;</code>：切換群組模組，名稱支援 NoLongName（英名檢查）/ NoHalal（清真檢查）/ NoSM（服務訊息刪除）/ Flood（洗版偵測，預設開啟）/ Captcha（新成員驗證，預設關閉）/ Netban（跨群組黑名單同步，預設關閉，需自行開啟；開啟後本群的封禁會同步到其他同樣開啟的群組，反之亦然）/ CmdClean（指令權限濫用防護，預設關閉；開啟後，沒有權限的人嘗試使用管理指令會被刪除訊息並警告一次，24 小時內再犯將被禁言 5 分鐘並記錄到日誌頻道。無論是否開啟，此類指令的錯誤提示訊息都會在 10 秒後自動刪除，減少洗版）/ GuestBan（防範 Telegram 訪客模式機器人濫用，預設開啟；任何人都能透過 @ 一個機器人使其在未加入本群的情況下直接發文，此模組會偵測並非本群成員卻發文的機器人帳號，直接刪除訊息並封禁）\n<code>/module</code>（不帶參數）：查看本群所有模組目前的開關狀態\n<code>/module all on/off</code>：一次開啟或關閉全部公開模組\n<code>/unban</code>：回覆要解封的用戶、或提供 user_id，解封本群該用戶（僅本群，不影響訓練資料，如需連同撤銷誤判樣本請找維護組）\n<code>/unmute</code>：回覆要解除禁言的用戶、或提供 user_id\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n".to_string()
+    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，刪除該訊息並封禁該用戶（僅限本群；訊息內容會送交項目組審核，經批准後才會用於訓練模型）\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n<code>/white</code>：加入本群白名單；若該用戶目前在本群被封禁，會一併解除封禁\n<code>/white -global</code>：加入全域白名單\n<code>/unwhite</code>：移出本群白名單\n<code>/unwhite -global</code>：移出全域白名單\n\n<b>群組管理員可用</b>\n<code>/module &lt;名稱&gt; &lt;on/off&gt;</code>：切換群組模組，名稱支援 NoLongName（英名檢查）/ NoHalal（清真檢查）/ NoSM（服務訊息刪除）/ Flood（洗版偵測，預設開啟）/ Captcha（新成員驗證，預設關閉）/ Netban（跨群組黑名單同步，預設關閉，需自行開啟；開啟後本群的封禁會同步到其他同樣開啟的群組，反之亦然）/ CmdClean（指令權限濫用防護，預設關閉；開啟後，沒有權限的人嘗試使用管理指令會被刪除訊息並警告一次，24 小時內再犯將被禁言 5 分鐘並記錄到日誌頻道。無論是否開啟，此類指令的錯誤提示訊息都會在 10 秒後自動刪除，減少洗版）/ GuestBan（防範 Telegram 訪客模式機器人濫用，預設開啟；任何人都能透過 @ 一個機器人使其在未加入本群的情況下直接發文，此模組會偵測並非本群成員卻發文的機器人帳號，直接刪除訊息並封禁）/ NoContact（禁止分享聯絡人，預設關閉）/ NoVoice（禁止語音訊息，預設關閉）/ NoExec（禁止可執行檔案，如 .exe/.apk/.msi 等，預設關閉）\n<code>/module</code>（不帶參數）：查看本群所有模組目前的開關狀態\n<code>/module all on/off</code>：一次開啟或關閉全部公開模組\n<code>/unban</code>：回覆要解封的用戶、或提供 user_id，解封本群該用戶（僅本群，不影響訓練資料，如需連同撤銷誤判樣本請找維護組）\n<code>/unmute</code>：回覆要解除禁言的用戶、或提供 user_id\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核（累計 3 次舉報被拒後，將暫停使用此指令）\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n".to_string()
 }
 
 fn help_op_text() -> String {
-    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>（別名 <code>/mark_spam</code>）：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可。會解封並在找得到對應案例時一併移除錯誤訓練樣本並重建模型，若該案例曾透過 Netban 同步封禁到其他群組，也會一併在那些群組解封（群組管理員也能用 /unban，但僅解封本群、不影響訓練資料與其他群組）\n<code>/unmute</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可，並會撤銷對應案例（群組管理員也能用 /unmute，但僅解除本群禁言）\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat [chat_id]</code>：設定工作群組。不帶參數時直接綁定目前所在的群組；也可提供 chat_id 從其他地方設定。綁定後，若該群組串連的頻道發文時被 Telegram 自動釘選，機器人會自動取消釘選，避免洗掉手動釘選的訊息\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：終止對指定群組（或目前群組）的服務。會先發出服務終止通知，接著離開該群，並把該群列入封禁名單——之後任何人再把機器人加回去，它都會再次自動退出\n<code>/forbid &lt;user_id&gt; [原因]</code>（或回覆該用戶）：禁止某帳號使用本項目的任何服務。該帳號的所有指令一律不予回應，且無法再將本機器人加入任何群組\n<code>/forgive &lt;chat_id 或 user_id&gt;</code>：解除群組或用戶的項目封禁（負數為群組、正數為用戶，自動判斷）。群組解封後仍需重新邀請機器人\n<code>/list_banned</code>：列出目前所有被封禁的群組與用戶\n<code>/reviewer add|del &lt;user_id&gt;</code>（或回覆該用戶）：授予或撤銷審核員權限；<code>/reviewer list</code> 列出目前審核員。審核員可以處理舉報頻道的受理/拒絕與訓練批准按鈕，但沒有其他維護權限。維護組本身不需要另外授予\n<code>/ping</code>：確認機器人在線，並回報目前運行的版本號與 commit hash\n<code>/set_audit_log [chat_id]</code>：設定維護操作日誌頻道。不帶參數時綁定目前所在的群組/頻道。設定後，每個會改變狀態的維護指令（門檻、白名單、模組開關、規則異動、封禁/禁言等）都會記錄在這裡，並附上 action id\n<code>/revert &lt;action_id&gt;</code>：復原指定的維護操作，回到變更前的狀態；封禁/禁言類會重用 /unban、/unmute 的邏輯。少數沒有明確「復原前狀態」的操作無法自動復原，會直接告知\n<code>/set_exchange_channel &lt;chat_id&gt;</code>：設定 PM 申訴機器人橋接用的交換頻道。設定後，機器人會回應 PM 透過該頻道發出的封禁查詢與解封請求，讓被封禁用戶能透過 PM 自助查詢並申訴\n<code>/pol show</code>：回覆一位用戶，查詢其在本群目前的警告次數\n<code>/pol clear</code>：回覆一位用戶，清除其在本群的所有警告\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明（重新發文並釘選）\n<code>/refreshBL</code>：就地編輯上一則封禁代號說明，不重新發文/釘選\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
+    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>（別名 <code>/mark_spam</code>）：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n<code>/ml_retrain</code>：清空詞頻並依目前分詞規則重播全部訓練樣本，用於分詞規則變更後修正舊資料\n<code>/ml_eval [保留比例]</code>：留出法評估。以部分樣本訓練、其餘測試，列出各門檻下的精確率/召回率/F1 與漏放、誤封數，用來決定門檻該設多少。不會改動實際模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可。會解封並在找得到對應案例時一併移除錯誤訓練樣本並重建模型，若該案例曾透過 Netban 同步封禁到其他群組，也會一併在那些群組解封（群組管理員也能用 /unban，但僅解封本群、不影響訓練資料與其他群組）\n<code>/unmute</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可，並會撤銷對應案例（群組管理員也能用 /unmute，但僅解除本群禁言）\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat [chat_id]</code>：設定工作群組。不帶參數時直接綁定目前所在的群組；也可提供 chat_id 從其他地方設定。綁定後，若該群組串連的頻道發文時被 Telegram 自動釘選，機器人會自動取消釘選，避免洗掉手動釘選的訊息\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：終止對指定群組（或目前群組）的服務。會先發出服務終止通知，接著離開該群，並把該群列入封禁名單——之後任何人再把機器人加回去，它都會再次自動退出\n<code>/forbid &lt;user_id&gt; [原因]</code>（或回覆該用戶）：禁止某帳號使用本項目的任何服務。該帳號的所有指令一律不予回應，且無法再將本機器人加入任何群組\n<code>/forgive &lt;chat_id 或 user_id&gt;</code>：解除群組或用戶的項目封禁（負數為群組、正數為用戶，自動判斷）。群組解封後仍需重新邀請機器人\n<code>/list_banned</code>：列出目前所有被封禁的群組與用戶\n<code>/whois &lt;user_id&gt;</code>（或回覆該用戶）：查詢該用戶的完整紀錄——身分、歷史封禁次數、目前生效中的封禁（跨所有群組）、是否在跨群組黑名單、舉報被拒次數\n<code>/report_reset &lt;user_id&gt;</code>（或回覆該用戶）：清除該用戶的舉報被拒計數，恢復其 /spam 權限\n<code>/reviewer add|del &lt;user_id&gt;</code>（或回覆該用戶）：授予或撤銷審核員權限；<code>/reviewer list</code> 列出目前審核員。審核員可以處理舉報頻道的受理/拒絕與訓練批准按鈕，但沒有其他維護權限。維護組本身不需要另外授予\n<code>/ping</code>：確認機器人在線，並回報目前運行的版本號與 commit hash\n<code>/set_audit_log [chat_id]</code>：設定維護操作日誌頻道。不帶參數時綁定目前所在的群組/頻道。設定後，每個會改變狀態的維護指令（門檻、白名單、模組開關、規則異動、封禁/禁言等）都會記錄在這裡，並附上 action id\n<code>/revert &lt;action_id&gt;</code>：復原指定的維護操作，回到變更前的狀態；封禁/禁言類會重用 /unban、/unmute 的邏輯。少數沒有明確「復原前狀態」的操作無法自動復原，會直接告知\n<code>/set_exchange_channel &lt;chat_id&gt;</code>：設定 PM 申訴機器人橋接用的交換頻道。設定後，機器人會回應 PM 透過該頻道發出的封禁查詢與解封請求，讓被封禁用戶能透過 PM 自助查詢並申訴\n<code>/pol show</code>：回覆一位用戶，查詢其在本群目前的警告次數\n<code>/pol clear</code>：回覆一位用戶，清除其在本群的所有警告\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明（重新發文並釘選）\n<code>/refreshBL</code>：就地編輯上一則封禁代號說明，不重新發文/釘選\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
 }
 
 fn format_score_debug(report: &ScoreDebugReport) -> String {
@@ -3150,6 +3361,9 @@ const PUBLIC_MODULES: &[(&str, &str, bool)] = &[
     ("netban", "Netban", false),
     ("cmdclean", "CmdClean", false),
     ("guestban", "GuestBan", true),
+    ("nocontact", "NoContact", false),
+    ("novoice", "NoVoice", false),
+    ("noexec", "NoExec", false),
 ];
 
 /// Current value of one module flag by its `/module` key, or `None` if the
@@ -3165,6 +3379,9 @@ fn module_flag(settings: &GroupModuleSettings, key: &str) -> Option<bool> {
         "netban" => settings.netban,
         "cmdclean" => settings.cmd_clean,
         "guestban" => settings.guest_ban,
+        "nocontact" => settings.no_contact,
+        "novoice" => settings.no_voice,
+        "noexec" => settings.no_exec,
         "warn-pol" => settings.pol,
         _ => return None,
     })
@@ -3261,7 +3478,7 @@ fn global_whitelist_check_text() -> String {
 }
 
 fn build_blacklist_reason_text(_runtime: &Runtime) -> String {
-    "<b>❖ 封禁代號說明</b>\n\n- <code>NLDIGIT</code>: 英名含數字\n- <code>NL13</code>: 英名多段且總長度 >= 13\n- <code>NLTAIL</code>: 英名多段且尾段過長\n- <code>NLSINGLE</code>: 英名單段且長度 >= 11\n- <code>ARABIC</code>: 偵測到清真\n- <code>REGEX</code>: 觸發正則規則\n- <code>FLOOD</code>: 洗版偵測（5 秒內傳送 5 條以上訊息）\n- <code>PERM_REPEAT</code>: 24 小時內重複嘗試使用無權限的指令\n- <code>GUEST_MODE</code>: 訪客模式機器人（未加入本群卻發文）\n- <code>GUEST_MODE_INVOKER</code>: 召喚訪客模式機器人的人\n\n申訴找 @SEELE_01_BOT".to_string()
+    "<b>❖ 封禁代號說明</b>\n\n- <code>NLDIGIT</code>: 英名含數字\n- <code>NL13</code>: 英名多段且總長度 >= 13\n- <code>NLTAIL</code>: 英名多段且尾段過長\n- <code>NLSINGLE</code>: 英名單段且長度 >= 11\n- <code>ARABIC</code>: 偵測到清真\n- <code>REGEX</code>: 觸發正則規則\n- <code>FLOOD</code>: 洗版偵測（5 秒內傳送 5 條以上訊息）\n- <code>PERM_REPEAT</code>: 24 小時內重複嘗試使用無權限的指令\n- <code>GUEST_MODE</code>: 訪客模式機器人（未加入本群卻發文）\n- <code>GUEST_MODE_INVOKER</code>: 召喚訪客模式機器人的人\n- <code>CONTACT</code>: 在群組分享聯絡人\n- <code>VOICE</code>: 傳送語音訊息\n- <code>EXEC_FILE</code>: 傳送可執行檔案\n\n申訴找 @SEELE_01_BOT".to_string()
 }
 
 fn format_case_lookup(case: &CaseRecord, link: &str, reason_link: &str) -> String {
@@ -4562,6 +4779,135 @@ async fn check_reban_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Messag
     true
 }
 
+/// Rejected `/spam` reports a user may accumulate before losing the
+/// command. Cleared by a maintainer with `/report_reset`.
+const REPORT_STRIKE_LIMIT: i64 = 3;
+
+/// Filename extensions that execute code, or install something that does,
+/// on at least one common platform. Archives are deliberately absent: a
+/// .zip is ordinary enough that banning on it would cost more than it saves,
+/// even though one can carry any of these inside.
+const EXECUTABLE_EXTENSIONS: &[&str] = &[
+    "exe", "scr", "com", "pif", "bat", "cmd", "vbs", "vbe", "js", "jse", "wsf", "wsh", "hta",
+    "msi", "msp", "cpl", "reg", "lnk", "ps1", "psm1", "jar", "apk", "app", "dmg", "pkg", "deb",
+    "rpm", "sh", "bash", "run", "bin", "elf", "dll", "sys", "iso", "img",
+];
+
+/// The extension of `name`, lowercased, ignoring any Telegram-style trailing
+/// dot tricks. Returns `None` when there is nothing after the final dot.
+fn file_extension(name: &str) -> Option<String> {
+    let trimmed = name.trim().trim_end_matches('.');
+    let (_, ext) = trimmed.rsplit_once('.')?;
+    if ext.is_empty() || ext.chars().any(|c| !c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(ext.to_lowercase())
+}
+
+/// Which attachment-policy module, if any, this message trips. Split out
+/// from the handler so the classification is testable without a live
+/// Telegram message round trip.
+fn attachment_violation(message: &Message, settings: &GroupModuleSettings) -> Option<&'static str> {
+    if settings.no_contact && message.contact().is_some() {
+        return Some("CONTACT");
+    }
+    if settings.no_voice && message.voice().is_some() {
+        return Some("VOICE");
+    }
+    if settings.no_exec {
+        if let Some(doc) = message.document() {
+            // Filename first: Telegram's mime_type is client-supplied and a
+            // sender controls it, so it is corroboration rather than proof.
+            let by_name = doc
+                .file_name
+                .as_deref()
+                .and_then(file_extension)
+                .is_some_and(|ext| EXECUTABLE_EXTENSIONS.contains(&ext.as_str()));
+            let by_mime = doc.mime_type.as_ref().is_some_and(|m| {
+                let m = m.essence_str();
+                m == "application/x-msdownload"
+                    || m == "application/x-msdos-program"
+                    || m == "application/vnd.microsoft.portable-executable"
+                    || m == "application/x-executable"
+                    || m == "application/vnd.android.package-archive"
+            });
+            if by_name || by_mime {
+                return Some("EXEC_FILE");
+            }
+        }
+    }
+    None
+}
+
+/// Bans on what a message *carries* rather than what it says: a shared
+/// contact card, a voice recording, or an executable attachment. Each is
+/// its own opt-in module, all default off.
+///
+/// These run as their own check rather than inside `auto_moderate` because
+/// that one only sees text and captions - a contact card or a bare .exe has
+/// neither, so it scores as empty and is skipped entirely. They are also the
+/// only checks here that fire with no text to judge, which is exactly why
+/// they are opt-in: the group is asserting a policy, not reporting spam.
+async fn check_attachment_policy_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) -> bool {
+    if !message.chat.is_group() && !message.chat.is_supergroup() {
+        return false;
+    }
+    let Some(user) = message.from.as_ref() else { return false; };
+    if user.is_bot {
+        return false;
+    }
+    let chat_id = message.chat.id.0;
+    let user_id = user.id.0 as i64;
+
+    if is_special_user(&runtime.config, user_id) || is_platform_pseudo_user(user_id) {
+        return false;
+    }
+
+    let settings = runtime.get_group_modules(chat_id).await.unwrap_or_default();
+    let Some(reason) = attachment_violation(message, &settings) else { return false; };
+
+    if runtime.is_global_whitelisted(user_id).await.unwrap_or(false) {
+        return false;
+    }
+    if runtime.is_group_whitelisted(chat_id, user_id).await.unwrap_or(false) {
+        return false;
+    }
+    if is_group_admin(bot, message.chat.id, user_id).await {
+        return false;
+    }
+
+    let _ = bot.delete_message(message.chat.id, message.id).await;
+    let _ = ban_user(bot, message.chat.id, user_id).await;
+
+    let case = CaseRecord {
+        id: Uuid::new_v4().to_string(),
+        action: ActionKind::AutoBan,
+        chat_id,
+        target_user_id: user_id,
+        target_name: short_user(user),
+        actor_user_id: None,
+        actor_name: None,
+        source_message_id: Some(message.id.0),
+        evidence_text: extract_full_text(message),
+        model_score: None,
+        matched_rule_id: None,
+        matched_rule_pattern: Some(reason.to_string()),
+        status: "auto_banned".to_string(),
+        log_message_id: None,
+        created_at: Utc::now(),
+    };
+    let log_message_id = log_action(bot, runtime, &case).await.unwrap_or_default();
+    let mut updated = case.clone();
+    updated.log_message_id = Some(log_message_id);
+    let _ = store_case(runtime, &updated).await;
+    let _ = notify_group(bot, runtime, &updated, log_message_id, "<b>附件政策封禁</b>").await;
+    // Unscored AutoBan, so netban_eligible() rejects it - a group's own
+    // attachment policy is not a project-wide spam finding.
+    propagate_network_ban(bot, runtime, &updated).await;
+    broadcast_ban_status(bot, runtime, updated.target_user_id, true).await;
+    true
+}
+
 /// Telegram's "guest mode" (https://core.telegram.org/api/bots/guest-mode)
 /// lets any user @-mention a bot into posting directly into a group that bot
 /// was never added to. Bot API delivers the resulting message like any
@@ -4990,6 +5336,92 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, format!("已解除 <code>{id}</code> 的封禁。")).parse_mode(ParseMode::Html).await?;
             }
         }
+        ModerationCommand::Whois(target) => {
+            require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用 /whois。");
+            let target_id = target
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .or_else(|| real_reply(&message).and_then(|r| r.from.as_ref()).map(|u| u.id.0 as i64));
+            let Some(target_id) = target_id else {
+                bot.send_message(message.chat.id, "請提供 user_id 或回覆該用戶，例如 /whois 12345。").await?;
+                return Ok(());
+            };
+
+            let bans = runtime.find_active_bans_for_user(target_id).await.unwrap_or_default();
+            let strikes = runtime.count_ban_strikes_for_user(target_id).await.unwrap_or(0);
+            let netban = runtime.find_active_network_ban(target_id).await.ok().flatten();
+            let global_wl = runtime.is_global_whitelisted(target_id).await.unwrap_or(false);
+            let forbidden = runtime.is_user_banned(target_id).await;
+            let reviewer = runtime.is_reviewer(target_id).await;
+            let report_strikes = runtime.report_strikes(target_id).await;
+            let maintainer = is_special_user(&runtime.config, target_id);
+
+            let mut out = format!("<b>❖ 用戶查詢</b>\n<b>User ID</b>: <code>{target_id}</code>\n");
+            let mut tags = Vec::new();
+            if maintainer { tags.push("維護組"); }
+            if reviewer { tags.push("審核員"); }
+            if global_wl { tags.push("全域白名單"); }
+            if forbidden { tags.push("已禁止使用本項目"); }
+            if is_platform_pseudo_user(target_id) { tags.push("Telegram 系統帳號"); }
+            out.push_str(&format!("<b>身分</b>: {}\n", if tags.is_empty() { "一般用戶".to_string() } else { tags.join(" / ") }));
+            out.push_str(&format!("<b>歷史封禁次數</b>: {strikes}（含已撤銷）\n"));
+            out.push_str(&format!(
+                "<b>跨群組黑名單</b>: {}\n",
+                match &netban {
+                    Some(c) => format!("是（案例 <code>{}</code>）", c.id),
+                    None => "否".to_string(),
+                }
+            ));
+            out.push_str(&format!("<b>舉報被拒次數</b>: {report_strikes}/{REPORT_STRIKE_LIMIT}{}\n", if report_strikes >= REPORT_STRIKE_LIMIT { "（已暫停 /spam）" } else { "" }));
+
+            if bans.is_empty() {
+                out.push_str("\n<b>目前生效中的封禁</b>: 無");
+            } else {
+                out.push_str(&format!("\n<b>目前生效中的封禁</b>（{}）:", bans.len()));
+                for case in bans.iter().take(10) {
+                    out.push_str(&format!(
+                        "\n• 群組 <code>{}</code> — {} <code>{}</code> <i>{}</i>",
+                        case.chat_id,
+                        chinese_case_action(case),
+                        case.id,
+                        utc8_display(case.created_at),
+                    ));
+                }
+                if bans.len() > 10 {
+                    out.push_str(&format!("\n…另有 {} 筆未顯示", bans.len() - 10));
+                }
+            }
+            bot.send_message(message.chat.id, out).parse_mode(ParseMode::Html).await?;
+        }
+        ModerationCommand::ReportReset(target) => {
+            require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用 /report_reset。");
+            let target_id = target
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .or_else(|| real_reply(&message).and_then(|r| r.from.as_ref()).map(|u| u.id.0 as i64));
+            let Some(target_id) = target_id else {
+                bot.send_message(message.chat.id, "請提供 user_id 或回覆該用戶。").await?;
+                return Ok(());
+            };
+            let before = runtime.report_strikes(target_id).await;
+            runtime.clear_report_strikes(target_id).await.ok();
+            log_maintainer_action(&bot, &runtime, from_id, &short_user(from), None, "/report_reset", &format!("清除 user_id={target_id} 的舉報拒絕計數（原 {before}）"), UndoData::NotRevertible).await;
+            bot.send_message(message.chat.id, format!("已清除 <code>{target_id}</code> 的舉報拒絕計數（原本 {before} 次），可以重新使用 /spam。")).parse_mode(ParseMode::Html).await?;
+        }
+        ModerationCommand::MlEval(arg) => {
+            require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
+            let holdout = arg.trim().parse::<f64>().ok().filter(|v| (0.05..=0.5).contains(v)).unwrap_or(0.2);
+            match runtime.evaluate_model(holdout).await {
+                Ok(report) => {
+                    bot.send_message(message.chat.id, report).parse_mode(ParseMode::Html).await?;
+                }
+                Err(err) => {
+                    bot.send_message(message.chat.id, format!("評估失敗：{err}")).await?;
+                }
+            }
+        }
         ModerationCommand::ListBanned => {
             require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用此指令。");
             let (groups, users) = runtime.list_banned().await.unwrap_or_default();
@@ -5233,6 +5665,20 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             }
         }
         ModerationCommand::SpamReport => {
+            // Three rejected reports and the command is gone. Maintainers are
+            // exempt so a bad streak can't lock out the people who clear it.
+            let strikes = runtime.report_strikes(from_id).await;
+            if strikes >= REPORT_STRIKE_LIMIT && !is_maintainer(&bot, &runtime.config, from_id).await {
+                reply_ephemeral(
+                    &bot,
+                    &message,
+                    format!("你已有 {strikes} 次舉報被拒絕，已暫停使用 /spam。如有疑問請透過 @SEELE_01_BOT 聯絡項目組。"),
+                )
+                .await?;
+                let _ = bot.delete_message(message.chat.id, message.id).await;
+                return Ok(());
+            }
+
             let Some((target_id, target_name, source_id, evidence_text)) = extract_reply_context(&message).await else {
                 reply_ephemeral(&bot, &message, "請回覆一條疑似 spam 的訊息。").await?;
                 return Ok(());
@@ -5646,11 +6092,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             // name" error as any typo - anyone not already allowlisted
             // can't tell "warn-pol" is a real module from that message.
             if key == "warn-pol" && enabled && !runtime.is_module_allowed("warn-pol", message.chat.id.0).await.unwrap_or(false) {
-                reply_ephemeral(&bot, &message, "模組名稱僅支援 NoLongName / NoHalal / NoSM / Flood / Captcha / Netban / CmdClean / GuestBan。").await?;
+                reply_ephemeral(&bot, &message, "模組名稱僅支援 NoLongName / NoHalal / NoSM / Flood / Captcha / Netban / CmdClean / GuestBan / NoContact / NoVoice / NoExec。").await?;
                 return Ok(());
             }
             if old_enabled.is_none() {
-                reply_ephemeral(&bot, &message, "模組名稱僅支援 NoLongName / NoHalal / NoSM / Flood / Captcha / Netban / CmdClean / GuestBan。").await?;
+                reply_ephemeral(&bot, &message, "模組名稱僅支援 NoLongName / NoHalal / NoSM / Flood / Captcha / Netban / CmdClean / GuestBan / NoContact / NoVoice / NoExec。").await?;
                 return Ok(());
             }
             runtime.set_group_module(message.chat.id.0, &key, enabled).await.ok();
@@ -6492,6 +6938,19 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
             if let Err(err) = train_ham(&runtime, &case.evidence_text, Some(&case.id)).await {
                 log_callback_error(&bot, &runtime, &case, "train_ham", &err.to_string()).await;
             }
+            // Strike the reporter. Read from `case`, not `updated`: the
+            // lines below overwrite actor_user_id with the reviewer.
+            let mut strike_note = String::new();
+            if let Some(reporter) = case.actor_user_id {
+                if !is_maintainer(&bot, &runtime.config, reporter).await {
+                    let count = runtime.add_report_strike(reporter).await.unwrap_or(0);
+                    strike_note = if count >= REPORT_STRIKE_LIMIT {
+                        format!("\n<b>舉報者</b>: <code>{reporter}</code> 已累計 {count} 次被拒，已暫停使用 /spam")
+                    } else {
+                        format!("\n<b>舉報者</b>: <code>{reporter}</code> 已累計 {count}/{REPORT_STRIKE_LIMIT} 次被拒")
+                    };
+                }
+            }
             let mut updated = case.clone();
             updated.action = ActionKind::ReportRejected;
             updated.status = "rejected_and_cleaned".to_string();
@@ -6501,13 +6960,14 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
                 log_callback_error(&bot, &runtime, &case, "store_case", &err.to_string()).await;
             }
             let body = format!(
-                "<b>新的 /spam 申請</b>\n\n<b>對象</b>: {} ({})\n<b>發起人</b>: {}\n<b>內容</b>: <blockquote>{}</blockquote>\n<b>案例</b>: <code>{}</code>\n<b>狀態</b>: 已拒絕受理\n<b>處理者</b>: <code>{}</code>",
+                "<b>新的 /spam 申請</b>\n\n<b>對象</b>: {} ({})\n<b>發起人</b>: {}\n<b>內容</b>: <blockquote>{}</blockquote>\n<b>案例</b>: <code>{}</code>\n<b>狀態</b>: 已拒絕受理\n<b>處理者</b>: <code>{}</code>{}",
                 escape_html(&case.target_name),
                 case.target_user_id,
                 escape_html(case.actor_name.as_deref().unwrap_or("unknown")),
                 escape_html(&case.evidence_text),
                 case.id,
-                from_id
+                from_id,
+                strike_note
             );
             let _ = bot.edit_message_text(message.chat().id, message.id(), body).parse_mode(ParseMode::Html).await;
             let _ = bot.edit_message_reply_markup(message.chat().id, message.id()).await;
@@ -6935,6 +7395,16 @@ async fn main() -> Result<()> {
                 // content scoring.
                 if runtime.config.test_group_id != Some(message.chat.id.0)
                     && check_reban_and_act(&bot, &runtime, &message).await
+                {
+                    return Ok(());
+                }
+
+                // Attachment policy (contact card / voice note / executable).
+                // Runs for every message type, before the content-based
+                // checks below - those only look at text, which these
+                // messages usually don't have.
+                if runtime.config.test_group_id != Some(message.chat.id.0)
+                    && check_attachment_policy_and_act(&bot, &runtime, &message).await
                 {
                     return Ok(());
                 }
@@ -7578,6 +8048,89 @@ mod tests {
         let owner: teloxide::types::ChatMember =
             serde_json::from_str(r#"{"user":{"id":8,"is_bot":false,"first_name":"O"},"status":"creator","is_anonymous":false}"#).unwrap();
         assert!(owner.kind.is_privileged() && owner.kind.can_delete_messages());
+    }
+
+    // The three attachment modules ban on message type, so the
+    // classification has to be exact: each fires only for its own kind, only
+    // when that module is on, and never for an ordinary message.
+    #[test]
+    fn attachment_violation_matches_only_the_enabled_module() {
+        let contact = r#"{"message_id":1,"date":1,"chat":{"id":-100,"type":"supergroup","title":"g"},"from":{"id":5,"is_bot":false,"first_name":"a"},"contact":{"phone_number":"+1","first_name":"x"}}"#;
+        let voice = r#"{"message_id":2,"date":1,"chat":{"id":-100,"type":"supergroup","title":"g"},"from":{"id":5,"is_bot":false,"first_name":"a"},"voice":{"file_id":"f","file_unique_id":"u","duration":3,"mime_type":null}}"#;
+        let exe = r#"{"message_id":3,"date":1,"chat":{"id":-100,"type":"supergroup","title":"g"},"from":{"id":5,"is_bot":false,"first_name":"a"},"document":{"file_id":"f","file_unique_id":"u","file_name":"invoice.exe"}}"#;
+        let pdf = r#"{"message_id":4,"date":1,"chat":{"id":-100,"type":"supergroup","title":"g"},"from":{"id":5,"is_bot":false,"first_name":"a"},"document":{"file_id":"f","file_unique_id":"u","file_name":"notes.pdf"}}"#;
+        let text = r#"{"message_id":5,"date":1,"chat":{"id":-100,"type":"supergroup","title":"g"},"from":{"id":5,"is_bot":false,"first_name":"a"},"text":"hello"}"#;
+        let m = |j: &str| serde_json::from_str::<Message>(j).unwrap();
+
+        let off = GroupModuleSettings::default();
+        for j in [contact, voice, exe, pdf, text] {
+            assert_eq!(attachment_violation(&m(j), &off), None, "modules default off - nothing should trip");
+        }
+
+        let all_on = GroupModuleSettings { no_contact: true, no_voice: true, no_exec: true, ..Default::default() };
+        assert_eq!(attachment_violation(&m(contact), &all_on), Some("CONTACT"));
+        assert_eq!(attachment_violation(&m(voice), &all_on), Some("VOICE"));
+        assert_eq!(attachment_violation(&m(exe), &all_on), Some("EXEC_FILE"));
+        assert_eq!(attachment_violation(&m(pdf), &all_on), None, "an ordinary document must not trip NoExec");
+        assert_eq!(attachment_violation(&m(text), &all_on), None);
+
+        // Each module is independent.
+        let only_contact = GroupModuleSettings { no_contact: true, ..Default::default() };
+        assert_eq!(attachment_violation(&m(contact), &only_contact), Some("CONTACT"));
+        assert_eq!(attachment_violation(&m(voice), &only_contact), None);
+        assert_eq!(attachment_violation(&m(exe), &only_contact), None);
+    }
+
+    // Extension parsing decides whether a file is treated as executable, so
+    // the edge cases matter: trailing dots, no extension, and the fact that
+    // the check is case-insensitive.
+    #[test]
+    fn file_extension_handles_awkward_names() {
+        assert_eq!(file_extension("a.EXE").as_deref(), Some("exe"));
+        assert_eq!(file_extension("archive.tar.gz").as_deref(), Some("gz"));
+        assert_eq!(file_extension("trailing.exe.").as_deref(), Some("exe"));
+        assert_eq!(file_extension("noext"), None);
+        assert_eq!(file_extension("weird.e xe"), None);
+        assert!(EXECUTABLE_EXTENSIONS.contains(&"apk") && EXECUTABLE_EXTENSIONS.contains(&"msi"));
+        assert!(!EXECUTABLE_EXTENSIONS.contains(&"pdf") && !EXECUTABLE_EXTENSIONS.contains(&"zip"));
+    }
+
+    // /spam's three-strike rule: strikes accumulate per reporter, and
+    // /report_reset clears them.
+    #[tokio::test]
+    async fn report_strikes_accumulate_and_reset() {
+        let runtime = test_runtime().await;
+        assert_eq!(runtime.report_strikes(555).await, 0);
+
+        assert_eq!(runtime.add_report_strike(555).await.unwrap(), 1);
+        assert_eq!(runtime.add_report_strike(555).await.unwrap(), 2);
+        let third = runtime.add_report_strike(555).await.unwrap();
+        assert_eq!(third, REPORT_STRIKE_LIMIT, "third rejection should hit the limit");
+        assert_eq!(runtime.report_strikes(666).await, 0, "strikes are per reporter");
+
+        runtime.clear_report_strikes(555).await.unwrap();
+        assert_eq!(runtime.report_strikes(555).await, 0);
+    }
+
+    // /ml_eval must never touch the live model, and must actually separate
+    // train from test - scoring a model on its own training rows would just
+    // measure memorisation.
+    #[tokio::test]
+    async fn ml_eval_is_read_only_and_reports_thresholds() {
+        let runtime = test_runtime().await;
+        for i in 0..15 {
+            train_spam(&runtime, &format!("免费代理 大水必红 赢钱 {i}"), None).await.unwrap();
+            train_ham(&runtime, &format!("大家好 請問有人可以幫忙編輯條目嗎 {i}"), None).await.unwrap();
+        }
+        let before = runtime.rebuild_model().await.unwrap();
+
+        let report = runtime.evaluate_model(0.2).await.unwrap();
+        assert!(report.contains("模型評估"), "got: {report}");
+        assert!(report.contains("0.85"), "the live threshold row should appear: {report}");
+
+        let after = runtime.rebuild_model().await.unwrap();
+        assert_eq!(before.spam_docs, after.spam_docs, "evaluation must not change the model");
+        assert_eq!(before.spam_tokens.len(), after.spam_tokens.len());
     }
 
     // Backs /reviewer add|del|list and the report-channel button guard.
