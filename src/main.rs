@@ -600,6 +600,9 @@ impl Runtime {
         if user_version < 13 {
             Self::migrate_v12_to_v13(conn)?;
         }
+        if user_version < 14 {
+            Self::migrate_v13_to_v14(conn)?;
+        }
         Ok(())
     }
 
@@ -915,6 +918,28 @@ impl Runtime {
             [],
         )?;
         tx.execute("PRAGMA user_version = 13", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Remembers where a `/spam` reporter's confirmation message lives, so
+    /// its text can be updated once the report is decided in the review
+    /// channel. Persisted rather than kept in memory because a review can
+    /// happen hours later, or after a redeploy - an in-memory map would lose
+    /// the message id across the very restarts that happen most often.
+    fn migrate_v13_to_v14(conn: &mut Connection) -> Result<()> {
+        let tx = conn.transaction()?;
+        tx.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS report_confirmations (
+                case_id TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL
+            )
+            "#,
+            [],
+        )?;
+        tx.execute("PRAGMA user_version = 14", [])?;
         tx.commit()?;
         Ok(())
     }
@@ -2497,6 +2522,43 @@ impl Runtime {
             cache.remove(&user_id);
         }
         Ok(())
+    }
+
+    /// Records the reporter-confirmation message for a case, so
+    /// `take_report_confirmation` can find it when the report is decided.
+    async fn set_report_confirmation(&self, case_id: &str, chat_id: i64, message_id: i32) -> Result<()> {
+        let case_id = case_id.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO report_confirmations (case_id, chat_id, message_id) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(case_id) DO UPDATE SET chat_id=excluded.chat_id, message_id=excluded.message_id",
+                params![case_id, chat_id, message_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Returns and removes the stored confirmation location for a case - it
+    /// is only edited once, so the row is consumed on read.
+    async fn take_report_confirmation(&self, case_id: &str) -> Option<(i64, i32)> {
+        let case_id = case_id.to_string();
+        self.with_conn(move |conn| {
+            let found = conn
+                .query_row(
+                    "SELECT chat_id, message_id FROM report_confirmations WHERE case_id = ?1",
+                    params![&case_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i32>(1)?)),
+                )
+                .ok();
+            if found.is_some() {
+                conn.execute("DELETE FROM report_confirmations WHERE case_id = ?1", params![&case_id])?;
+            }
+            Ok(found)
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// `/spam` three-strike rule. A third of reports were being rejected,
@@ -6089,8 +6151,14 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             // leaves it unset, and /case already renders that as "-".
             store_case(&runtime, &case).await.ok();
 
-            bot.send_message(message.chat.id, "已送交舉報處理頻道審核。")
+            // Remember this confirmation so it can be updated to the outcome
+            // once a reviewer decides. Reply to the report command so it's
+            // clear whose report it belongs to.
+            let sent = bot
+                .send_message(message.chat.id, "已送交舉報處理頻道審核。")
+                .reply_parameters(teloxide::types::ReplyParameters::new(message.id))
                 .await?;
+            let _ = runtime.set_report_confirmation(&case_id, message.chat.id.0, sent.id.0).await;
         }
         ModerationCommand::CaseLookup(case_id) => {
             match runtime.load_case(&case_id).await {
@@ -7299,6 +7367,11 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
             );
             let _ = bot.edit_message_text(message.chat().id, message.id(), body).parse_mode(ParseMode::Html).await;
             let _ = bot.edit_message_reply_markup(message.chat().id, message.id()).await;
+            if let Some((chat_id, msg_id)) = runtime.take_report_confirmation(&case.id).await {
+                let _ = bot
+                    .edit_message_text(ChatId(chat_id), MessageId(msg_id), "✅ 舉報已受理，對象已被封禁。")
+                    .await;
+            }
             bot.answer_callback_query(q.id).text("已受理並封禁").await?;
         }
         "reject" => {
@@ -7338,6 +7411,11 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
             );
             let _ = bot.edit_message_text(message.chat().id, message.id(), body).parse_mode(ParseMode::Html).await;
             let _ = bot.edit_message_reply_markup(message.chat().id, message.id()).await;
+            if let Some((chat_id, msg_id)) = runtime.take_report_confirmation(&case.id).await {
+                let _ = bot
+                    .edit_message_text(ChatId(chat_id), MessageId(msg_id), "此舉報未被受理。")
+                    .await;
+            }
             bot.answer_callback_query(q.id).text("已拒絕受理").await?;
         }
         _ => {}
@@ -8599,6 +8677,20 @@ mod tests {
         }
         assert!(!help.to_lowercase().contains("warn-pol"), "warn-pol must stay out of the public help");
         assert!(!help_op_text("").to_lowercase().contains("/magic"), "/magic stays undocumented");
+    }
+
+    // A /spam confirmation must be findable when the review lands (possibly
+    // after a restart), and consumed exactly once so a later reject can't
+    // re-edit a message an approve already rewrote.
+    #[tokio::test]
+    async fn report_confirmation_is_stored_and_taken_once() {
+        let runtime = test_runtime().await;
+        assert!(runtime.take_report_confirmation("case-x").await.is_none());
+
+        runtime.set_report_confirmation("case-x", -100, 42).await.unwrap();
+        assert_eq!(runtime.take_report_confirmation("case-x").await, Some((-100, 42)));
+        // Consumed on read - a second decision finds nothing to edit.
+        assert!(runtime.take_report_confirmation("case-x").await.is_none());
     }
 
     // The host is a source constant, so its authority must hold with an
