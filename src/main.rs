@@ -2868,7 +2868,7 @@ enum ModerationCommand {
     Unwhite(String),
     WhiteGlobal(String),
     UnwhiteGlobal(String),
-    HelpOp,
+    HelpOp(String),
     Check(String),
     Unban(String),
     Unmute(String),
@@ -2951,7 +2951,7 @@ fn parse_command(text: &str) -> ModerationCommand {
                 ModerationCommand::Unwhite(args.first().unwrap_or(&"").to_string())
             }
         }
-        "/help_op" => ModerationCommand::HelpOp,
+        "/help_op" => ModerationCommand::HelpOp(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/module" | "/moudle" => {
             let mut parts = text.split_whitespace();
             let _ = parts.next();
@@ -3313,11 +3313,143 @@ fn version_info_text() -> String {
 }
 
 fn help_text() -> String {
-    "<b>歡迎使用 Spam Protection Bot（SPB）全自動人工智障反廣告項目。</b>\n\n只需要把這個機器人拉進你的群組，並給它管理員權限（至少需要刪除訊息 + 封禁用戶權限），它就會自動開始工作。\n\n<b>機器人主要功能：</b>\n<code>/sb</code> 或 <code>/spamban</code>：回覆訊息使用，刪除該訊息並封禁該用戶（僅限本群；訊息內容會送交項目組審核，經批准後才會用於訓練模型）\n<code>/mute</code>：禁言\n<code>/kick</code>：踢出\n<code>/white</code>：加入本群白名單；若該用戶目前在本群被封禁，會一併解除封禁\n<code>/white -global</code>：加入全域白名單\n<code>/unwhite</code>：移出本群白名單\n<code>/unwhite -global</code>：移出全域白名單\n\n<b>群組管理員可用</b>\n<code>/module &lt;名稱&gt; &lt;on/off&gt;</code>：切換群組模組，名稱支援 NoLongName（英名檢查）/ NoHalal（清真檢查）/ NoSM（服務訊息刪除）/ Flood（洗版偵測，預設開啟）/ Captcha（新成員驗證，預設關閉）/ Netban（跨群組黑名單同步，預設關閉，需自行開啟；開啟後本群的封禁會同步到其他同樣開啟的群組，反之亦然）/ CmdClean（指令權限濫用防護，預設關閉；開啟後，沒有權限的人嘗試使用管理指令會被刪除訊息並警告一次，24 小時內再犯將被禁言 5 分鐘並記錄到日誌頻道。無論是否開啟，此類指令的錯誤提示訊息都會在 10 秒後自動刪除，減少洗版）/ GuestBan（防範 Telegram 訪客模式機器人濫用，預設開啟；任何人都能透過 @ 一個機器人使其在未加入本群的情況下直接發文，此模組會偵測並非本群成員卻發文的機器人帳號，直接刪除訊息並封禁）/ NoContact（禁止分享聯絡人，預設關閉）/ NoVoice（禁止語音訊息，預設關閉）/ NoExec（禁止可執行檔案，如 .exe/.apk/.msi 等，預設關閉）\n<code>/module</code>（不帶參數）：查看本群所有模組目前的開關狀態\n<code>/module all on/off</code>：一次開啟或關閉全部公開模組\n<code>/unban</code>：回覆要解封的用戶、或提供 user_id，解封本群該用戶（僅本群，不影響訓練資料，如需連同撤銷誤判樣本請找維護組）\n<code>/unmute</code>：回覆要解除禁言的用戶、或提供 user_id\n\n普通成員可使用 <code>/report</code> 或 <code>/spam</code> 舉報可疑訊息，交由項目組審核（累計 3 次舉報被拒後，將暫停使用此指令）\n任何人可輸入 <code>/case &lt;ID&gt;</code> 查詢某次封禁的詳細記錄\n\n<b>注意事項：</b>\n被封禁後想查原因：先發 <code>/id</code> 取得自己的 User ID，然後去日誌頻道 <code>@SpamProtectionLogging</code> 搜尋\n\n項目交流群：https://t.me/SpamProtectionChat\n日誌頻道：https://t.me/SpamProtectionLogging\n".to_string()
+    // Sectioned with rules rather than run as one paragraph: this is the
+    // first thing a new group sees, and the old single-block version buried
+    // the permissions requirement and the module list in a wall of text.
+    concat!(
+        "<b>Spam Protection Bot（SPB）</b>\n",
+        "全自動反廣告機器人。把它加進群組並給予<b>管理員權限</b>（至少需要「刪除訊息」與「封禁用戶」），即會自動開始運作。\n",
+        "\n<b>━━━ 所有人可用 ━━━</b>\n",
+        "<code>/spam</code>　回覆可疑訊息提交舉報，由項目組審核\n",
+        "　　※ 累計 3 次舉報被拒將暫停使用\n",
+        "<code>/case &lt;ID&gt;</code>　查詢某次封禁的詳細記錄\n",
+        "<code>/id</code>　取得自己的 User ID\n",
+        "\n<b>━━━ 群組管理員 ━━━</b>\n",
+        "<code>/sb</code>　回覆訊息：刪除該訊息並封禁該用戶\n",
+        "<code>/mute</code>　禁言　　<code>/kick</code>　踢出\n",
+        "<code>/unban</code>　<code>/unmute</code>　解除封禁／禁言（僅本群）\n",
+        "<code>/white</code>　<code>/unwhite</code>　本群白名單（加 <code>-global</code> 為全域）\n",
+        "<code>/module</code>　查看本群所有模組的開關狀態\n",
+        "<code>/module &lt;名稱&gt; on|off</code>　切換單一模組\n",
+        "<code>/module all on|off</code>　一次全開／全關\n",
+        "\n<b>━━━ 可用模組 ━━━</b>\n",
+        "<code>Flood</code>　洗版偵測　<i>預設開啟</i>\n",
+        "<code>GuestBan</code>　封鎖訪客模式機器人廣告　<i>預設開啟</i>\n",
+        "<code>NoLongName</code>　英文長名檢查\n",
+        "<code>NoHalal</code>　清真內容檢查\n",
+        "<code>NoSM</code>　自動刪除服務訊息\n",
+        "<code>Captcha</code>　新成員入群驗證\n",
+        "<code>Netban</code>　跨群組黑名單同步\n",
+        "<code>CmdClean</code>　指令權限濫用防護\n",
+        "<code>NoContact</code>　禁止分享聯絡人\n",
+        "<code>NoVoice</code>　禁止語音訊息\n",
+        "<code>NoExec</code>　禁止可執行檔（.exe/.apk/.msi 等）\n",
+        "　　※ 標示「預設開啟」以外的模組皆需自行開啟\n",
+        "　　※ <code>Flood</code> 與 <code>GuestBan</code> 為基礎防護，不會被 <code>/module all off</code> 關閉\n",
+        "\n<b>━━━ 被封禁後 ━━━</b>\n",
+        "先用 <code>/id</code> 取得自己的 User ID，再到日誌頻道 @SpamProtectionLogging 搜尋，或透過 @SEELE_01_BOT 申訴。\n",
+        "\n交流群 @SpamProtectionChat　·　日誌 @SpamProtectionLogging",
+    )
+    .to_string()
 }
 
-fn help_op_text() -> String {
-    "<b>維護指令</b>\n\n<b>模型 / 訓練</b>\n<code>/ml_score</code>：測試單條文本分數\n<code>/ml_score_debug</code>：看抽取結果與分數細節\n<code>/ml_stats</code>：查看樣本量與有效門檻\n<code>/ml_threshold &lt;值&gt;</code>：調整封禁門檻。在私訊/測試群/工作群組使用會調整全域門檻；在其他群組使用只影響該群組\n<code>/ml_export</code>：匯出訓練資料\n<code>/import</code>：匯入已輸出的訓練列表\n<code>/ml_train_spam</code>（別名 <code>/mark_spam</code>）：把回覆內容直接當 spam 訓練\n<code>/ml_clean_spam</code>：把回覆內容清成 ham / clean\n<code>/ml_undo_clean_spam</code>：撤銷回覆內容寫入 ham/clean 的樣本\n<code>/mark_ham</code>：將回覆內容標記為 ham\n<code>/ml_purge &lt;case_id&gt;</code>：依案例刪除誤樣本\n<code>/ml_purge_text &lt;文字片段&gt;</code>：依文字片段刪除誤樣本\n<code>/ml_rebuild</code>：重建模型\n<code>/ml_retrain</code>：清空詞頻並依目前分詞規則重播全部訓練樣本，用於分詞規則變更後修正舊資料\n<code>/ml_eval [保留比例]</code>：留出法評估。以部分樣本訓練、其餘測試，列出各門檻下的精確率/召回率/F1 與漏放、誤封數，用來決定門檻該設多少。不會改動實際模型\n\n<b>撤銷操作</b>\n<code>/unban</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可。會解封並在找得到對應案例時一併移除錯誤訓練樣本並重建模型，若該案例曾透過 Netban 同步封禁到其他群組，也會一併在那些群組解封（群組管理員也能用 /unban，但僅解封本群、不影響訓練資料與其他群組）\n<code>/unmute</code>：維護組專用完整版，回覆用戶、或提供 user_id / case_id 皆可，並會撤銷對應案例（群組管理員也能用 /unmute，但僅解除本群禁言）\n\n<b>批量訓練</b>\n<code>/ml_start_mass_train_smart</code>：進入 smart 批量訓練模式\n<code>/ml_start_mass_train_plain</code>：進入 plain 批量訓練模式\n<code>/ml_finish_mass_train</code>：結束 spam 批量訓練\n<code>/ml_start_mass_ham</code>：開始批量標記 ham\n<code>/ml_finish_mass_ham</code>：結束 ham 批量訓練\n\n<b>群組控制</b>\n<code>/setchat [chat_id]</code>：設定工作群組。不帶參數時直接綁定目前所在的群組；也可提供 chat_id 從其他地方設定。綁定後，若該群組串連的頻道發文時被 Telegram 自動釘選，機器人會自動取消釘選，避免洗掉手動釘選的訊息\n<code>/leave [&lt;chat_id&gt;] [原因]</code>：終止對指定群組（或目前群組）的服務。會先發出服務終止通知，接著離開該群，並把該群列入封禁名單——之後任何人再把機器人加回去，它都會再次自動退出\n<code>/forbid &lt;user_id&gt; [原因]</code>（或回覆該用戶）：禁止某帳號使用本項目的任何服務。該帳號的所有指令一律不予回應，且無法再將本機器人加入任何群組\n<code>/forgive &lt;chat_id 或 user_id&gt;</code>：解除群組或用戶的項目封禁（負數為群組、正數為用戶，自動判斷）。群組解封後仍需重新邀請機器人\n<code>/list_banned</code>：列出目前所有被封禁的群組與用戶\n<code>/whois &lt;user_id&gt;</code>（或回覆該用戶）：查詢該用戶的完整紀錄——身分、歷史封禁次數、目前生效中的封禁（跨所有群組）、是否在跨群組黑名單、舉報被拒次數\n<code>/report_reset &lt;user_id&gt;</code>（或回覆該用戶）：清除該用戶的舉報被拒計數，恢復其 /spam 權限\n<code>/reviewer add|del &lt;user_id&gt;</code>（或回覆該用戶）：授予或撤銷審核員權限；<code>/reviewer list</code> 列出目前審核員。審核員可以處理舉報頻道的受理/拒絕與訓練批准按鈕，但沒有其他維護權限。維護組本身不需要另外授予\n<code>/ping</code>：確認機器人在線，並回報目前運行的版本號與 commit hash\n<code>/set_audit_log [chat_id]</code>：設定維護操作日誌頻道。不帶參數時綁定目前所在的群組/頻道。設定後，每個會改變狀態的維護指令（門檻、白名單、模組開關、規則異動、封禁/禁言等）都會記錄在這裡，並附上 action id\n<code>/revert &lt;action_id&gt;</code>：復原指定的維護操作，回到變更前的狀態；封禁/禁言類會重用 /unban、/unmute 的邏輯。少數沒有明確「復原前狀態」的操作無法自動復原，會直接告知\n<code>/set_exchange_channel &lt;chat_id&gt;</code>：設定 PM 申訴機器人橋接用的交換頻道。設定後，機器人會回應 PM 透過該頻道發出的封禁查詢與解封請求，讓被封禁用戶能透過 PM 自助查詢並申訴\n<code>/pol show</code>：回覆一位用戶，查詢其在本群目前的警告次數\n<code>/pol clear</code>：回覆一位用戶，清除其在本群的所有警告\n\n<b>規則管理</b>\n<code>/add_rule &lt;regex&gt;</code>：新增正則規則，會再追問名稱\n<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>：只更新正則，不改名稱\n<code>/del_rule &lt;id&gt;</code>：刪除規則\n<code>/list_rules</code>：列出目前規則\n<code>/check_rules</code>：列出無法編譯的規則\n<code>/updateBL</code>：更新封禁代號說明（重新發文並釘選）\n<code>/refreshBL</code>：就地編輯上一則封禁代號說明，不重新發文/釘選\n\n<b>備註</b>\n這頁只放維護者會用到的指令。普通 <code>/help</code> 不會列出這些。\n".to_string()
+/// Maintainer help, split into sections.
+///
+/// It used to be one string listing every command with a full paragraph of
+/// explanation each. That had already reached 3,000 of Telegram's 4,096
+/// character limit, so it would eventually have started failing to send
+/// outright, and it was unreadable long before that. `/help_op` now gives a
+/// one-line index and `/help_op <section>` gives the detail.
+fn help_op_text(section: &str) -> String {
+    match section.trim().to_lowercase().as_str() {
+        "ml" | "model" | "模型" => concat!(
+            "<b>━━━ 模型 / 訓練 ━━━</b>\n",
+            "<code>/ml_score</code>　測試單條文本的分數\n",
+            "<code>/ml_score_debug</code>　逐詞看分數是怎麼算出來的\n",
+            "<code>/ml_stats</code>　樣本量、有效門檻、最大權重詞\n",
+            "<code>/ml_eval [保留比例]</code>　留出法評估：以部分樣本訓練、其餘測試，列出各門檻的精確率／召回率／F1 與漏放、誤封數。不會改動實際模型，用來決定門檻該設多少\n",
+            "<code>/ml_threshold &lt;值&gt;</code>　調整門檻（0.50–0.99）。在私訊／測試群／工作群使用＝全域；在其他群組使用＝僅該群\n",
+            "\n<b>訓練</b>\n",
+            "<code>/ml_train_spam</code>（＝<code>/mark_spam</code>）　把回覆內容當 spam 訓練\n",
+            "<code>/mark_ham</code>　標記為正常內容\n",
+            "<code>/ml_clean_spam</code>　把回覆內容清成 ham\n",
+            "<code>/ml_undo_clean_spam</code>　撤銷上一步\n",
+            "<code>/import</code>　匯入匯出格式的訓練列表\n",
+            "<code>/ml_export</code>　匯出全部訓練資料\n",
+            "\n<b>批量</b>\n",
+            "<code>/ml_start_mass_train_smart</code>｜<code>_plain</code>　開始（僅私訊）\n",
+            "<code>/ml_finish_mass_train</code>　結束 spam 批量\n",
+            "<code>/ml_start_mass_ham</code> → <code>/ml_finish_mass_ham</code>　ham 批量\n",
+            "\n<b>維護</b>\n",
+            "<code>/ml_purge &lt;case_id&gt;</code>　依案例刪除誤樣本\n",
+            "<code>/ml_purge_text &lt;片段&gt;</code>　依文字刪除誤樣本\n",
+            "<code>/ml_dedupe</code>　合併重複樣本、移除空白樣本\n",
+            "<code>/ml_rebuild</code>　從資料庫重載模型\n",
+            "<code>/ml_retrain</code>　清空詞頻並依<b>目前</b>分詞規則重播全部樣本。分詞規則改變後要跑這個，<code>/ml_rebuild</code> 不會修正舊詞頻\n",
+        ).to_string(),
+
+        "user" | "access" | "權限" => concat!(
+            "<b>━━━ 用戶與權限 ━━━</b>\n",
+            "<code>/whois &lt;user_id&gt;</code>（或回覆）　該用戶的完整紀錄：身分、歷史封禁次數、目前所有生效中的封禁、是否在跨群組黑名單、舉報被拒次數\n",
+            "<code>/unban</code>　維護組完整版：回覆／user_id／case_id 皆可。解封並移除對應誤訓練樣本、重建模型，若曾透過 Netban 同步也會一併解封\n",
+            "<code>/unmute</code>　同上，解除禁言並撤銷案例\n",
+            "\n<b>項目層級封禁</b>\n",
+            "<code>/forbid &lt;user_id&gt; [原因]</code>（或回覆）　禁止該帳號使用本項目：任何指令不予回應，且無法把機器人加進任何群組\n",
+            "<code>/forgive &lt;id&gt;</code>　解除封禁。負數＝群組、正數＝用戶，自動判斷\n",
+            "<code>/list_banned</code>　列出所有被封禁的群組與用戶\n",
+            "\n<b>審核員</b>\n",
+            "<code>/reviewer add|del &lt;user_id&gt;</code>（或回覆）　授予／撤銷審核員\n",
+            "<code>/reviewer list</code>　列出目前審核員\n",
+            "　　※ 審核員可處理舉報頻道的受理／拒絕與訓練批准按鈕，沒有其他維護權限。維護組不需另外授予\n",
+            "<code>/report_reset &lt;user_id&gt;</code>　清除舉報被拒計數，恢復其 <code>/spam</code>（累計 3 次即暫停）\n",
+        ).to_string(),
+
+        "group" | "ops" | "群組" => concat!(
+            "<b>━━━ 群組與運維 ━━━</b>\n",
+            "<code>/setchat [chat_id]</code>　設定工作群組。設定後，該群串連頻道發文被自動釘選時會自動取消釘選\n",
+            "<code>/leave [chat_id] [原因]</code>　終止服務：發出終止通知、離開該群、並列入封禁名單。之後任何人再加回機器人都會自動退出\n",
+            "<code>/pol show</code>｜<code>/pol clear</code>　查詢／清除該用戶在本群的警告次數\n",
+            "<code>/ping</code>　確認在線，回報版本與 commit\n",
+            "\n<b>日誌與橋接</b>\n",
+            "<code>/set_audit_log [chat_id]</code>　設定維護操作日誌頻道。設定後每個改變狀態的維護指令都會記錄並附上 action id\n",
+            "<code>/revert &lt;action_id&gt;</code>　復原指定維護操作。封禁／禁言類會重用 <code>/unban</code>、<code>/unmute</code> 的邏輯；少數操作無法自動復原\n",
+            "<code>/set_exchange_channel &lt;chat_id&gt;</code>　設定 PM 申訴橋接頻道\n",
+            "\n<b>封禁代號說明</b>\n",
+            "<code>/updateBL</code>　重新發文並釘選\n",
+            "<code>/refreshBL</code>　就地編輯上一則，不重新發文／釘選\n",
+        ).to_string(),
+
+        "rules" | "規則" => concat!(
+            "<b>━━━ 正則規則 ━━━</b>\n",
+            "<code>/add_rule &lt;regex&gt;</code>　新增，會再追問名稱\n",
+            "<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>　只改正則，不改名稱\n",
+            "<code>/del_rule &lt;id&gt;</code>　刪除\n",
+            "<code>/list_rules</code>　列出目前規則\n",
+            "<code>/check_rules</code>　列出無法編譯的規則\n",
+            "　　※ 規則命中即視為 spam（分數 1.0），會進入跨群組黑名單\n",
+        ).to_string(),
+
+        _ => concat!(
+            "<b>❖ 維護指令</b>\n",
+            "輸入 <code>/help_op &lt;分類&gt;</code> 查看該分類的完整說明。\n",
+            "\n<b>━━━ 分類 ━━━</b>\n",
+            "<code>/help_op ml</code>　模型、訓練、評估、批量\n",
+            "<code>/help_op user</code>　解封、項目層級封禁、審核員\n",
+            "<code>/help_op group</code>　群組、日誌、橋接、封禁代號\n",
+            "<code>/help_op rules</code>　正則規則\n",
+            "\n<b>━━━ 最常用 ━━━</b>\n",
+            "<code>/whois &lt;user_id&gt;</code>　一次看完某人的所有紀錄\n",
+            "<code>/unban</code>　解封並清除誤訓練樣本\n",
+            "<code>/ml_eval</code>　評估模型，決定門檻\n",
+            "<code>/ml_stats</code>　樣本量與有效門檻\n",
+            "<code>/case &lt;ID&gt;</code>　查詢單一案例\n",
+            "<code>/revert &lt;action_id&gt;</code>　復原維護操作\n",
+            "\n<b>━━━ 備註 ━━━</b>\n",
+            "· 這裡只列維護者指令，普通 <code>/help</code> 不會顯示。\n",
+            "· 群組管理員指令（<code>/sb</code>、<code>/module</code> 等）見 <code>/help</code>。\n",
+            "· 審核員只能處理舉報頻道的按鈕，其餘維護指令仍需維護組權限。\n",
+        ).to_string(),
+    }
 }
 
 fn format_score_debug(report: &ScoreDebugReport) -> String {
@@ -5128,9 +5260,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 .reply_markup(terms_button("閱讀使用規範 / Terms of Use"))
                 .await?;
         }
-        ModerationCommand::HelpOp => {
+        ModerationCommand::HelpOp(section) => {
             require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
-            bot.send_message(message.chat.id, help_op_text()).parse_mode(ParseMode::Html).await?;
+            bot.send_message(message.chat.id, help_op_text(&section)).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::MyId => {
             let requester = message.from.as_ref();
@@ -8205,6 +8337,40 @@ mod tests {
         assert!(noop("Bad Request: something entirely new").is_none());
     }
 
+    // Telegram rejects a sendMessage over 4096 characters, and these grow
+    // every time a command is added - /help_op was at 3,000 before being
+    // split into sections. A help text that has quietly outgrown the limit
+    // fails at the worst moment: someone asking how to use the bot.
+    #[test]
+    fn help_texts_fit_in_a_telegram_message() {
+        const LIMIT: usize = 4096;
+        let mut pages = vec![("/help".to_string(), help_text())];
+        for section in ["", "ml", "user", "group", "rules", "nonsense-falls-back-to-index"] {
+            pages.push((format!("/help_op {section}"), help_op_text(section)));
+        }
+        for (name, text) in pages {
+            let n = text.chars().count();
+            assert!(n <= LIMIT, "{name} is {n} chars, over Telegram's {LIMIT} limit");
+            assert!(!text.is_empty(), "{name} is empty");
+            // Unclosed tags render as literal text and look broken.
+            assert_eq!(text.matches("<b>").count(), text.matches("</b>").count(), "{name} has unbalanced <b>");
+            assert_eq!(text.matches("<code>").count(), text.matches("</code>").count(), "{name} has unbalanced <code>");
+            assert_eq!(text.matches("<i>").count(), text.matches("</i>").count(), "{name} has unbalanced <i>");
+        }
+    }
+
+    // The public help must not advertise the maintainer-gated module, and
+    // must still cover the ones groups are expected to turn on themselves.
+    #[test]
+    fn public_help_lists_every_public_module_and_hides_warn_pol() {
+        let help = help_text();
+        for (_, display, _) in PUBLIC_MODULES {
+            assert!(help.contains(display), "/help never mentions the {display} module");
+        }
+        assert!(!help.to_lowercase().contains("warn-pol"), "warn-pol must stay out of the public help");
+        assert!(!help_op_text("").to_lowercase().contains("/magic"), "/magic stays undocumented");
+    }
+
     // Backs /reviewer add|del|list and the report-channel button guard.
     // Granting must be scoped to the one account named, and revoking must
     // actually revoke - a stale grant here means someone keeps the ability
@@ -8856,5 +9022,7 @@ mod tests {
         assert_eq!(reply.from.as_ref().unwrap().id.0, 999);
     }
 }
+
+
 
 
