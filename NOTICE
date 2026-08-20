@@ -1,0 +1,39 @@
+Spam Protection Bot (SPB)
+Copyright (C) 2026  Pepper
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or (at your
+option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public License
+for more details.  You should have received a copy of the license in the
+file LICENSE; if not, see <https://www.gnu.org/licenses/>.
+
+Because this is network server software, the AGPL's section 13 applies:
+if you run a modified version of this program and let users interact with
+it over a network, you must offer those users the corresponding source of
+your modified version.
+
+
+NAME AND BRANDING
+-----------------
+The source code is free software under the AGPL. The names "Spam Protection
+Bot" and "SPB", the @SpamProtection* usernames and channels, the project's
+logo, and the SEELE / appeal-bridge branding are NOT licensed for reuse and
+remain the property of the copyright holder.
+
+A modified or redistributed version must be given a different name and must
+not present itself as the official Spam Protection Bot, use its usernames,
+or imply endorsement by or affiliation with this project. (This is the same
+arrangement used by, e.g., Firefox: the code is open, the brand is not.)
+
+
+AUTHORSHIP
+----------
+This notice and the copyright headers must be retained in all copies and
+derivative works, as required by the AGPL. Removing or altering the
+authorship of this project does not transfer any rights and does not make a
+fork the official project.

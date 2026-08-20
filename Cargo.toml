@@ -2,6 +2,8 @@
 name = "wikipedia-zh-antispam"
 version = "0.1.3"
 edition = "2021"
+license = "AGPL-3.0-or-later"
+authors = ["Pepper"]
 
 [dependencies]
 anyhow = "1"

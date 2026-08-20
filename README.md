@@ -118,3 +118,15 @@ Set the following environment variables before running:
    ```bash
    cargo run --release
    ```
+
+## License / 授權
+
+Licensed under the **GNU Affero General Public License v3.0 or later** (AGPL-3.0-or-later). See [LICENSE](LICENSE).
+
+Because this is network server software, if you run a **modified** version and let users interact with it over Telegram, AGPL section 13 requires you to publish your modified source to those users.
+
+The names *Spam Protection Bot* / *SPB*, the project's Telegram usernames and channels, and its branding are **not** covered by the license and remain the author's. A fork must use a different name. See [NOTICE](NOTICE).
+
+本專案採用 **GNU Affero 通用公共授權條款第 3 版或更新版本**（AGPL-3.0-or-later），詳見 [LICENSE](LICENSE)。這是網路伺服器軟體，若你運行**修改後**的版本並讓使用者透過 Telegram 與其互動，AGPL 第 13 條要求你向這些使用者公開你修改後的原始碼。
+
+「Spam Protection Bot」/「SPB」名稱、相關 Telegram 使用者名稱、頻道與品牌識別不在授權範圍內，仍屬作者所有；衍生版本須改用不同名稱，詳見 [NOTICE](NOTICE)。

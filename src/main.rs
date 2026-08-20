@@ -1,3 +1,16 @@
+// Spam Protection Bot (SPB)
+// Copyright (C) 2026  Pepper
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+// This program is free software: you can redistribute it and/or modify it
+// under the terms of the GNU Affero General Public License, version 3 or
+// (at your option) any later version. It is distributed WITHOUT ANY
+// WARRANTY; see the LICENSE file, or <https://www.gnu.org/licenses/>.
+//
+// The name "Spam Protection Bot"/"SPB", its usernames, channels and
+// branding are not covered by this license and remain the author's; see
+// NOTICE. A modified or redistributed version must use a different name.
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use jieba_rs::Jieba;
