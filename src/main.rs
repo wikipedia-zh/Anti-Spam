@@ -18,7 +18,6 @@ struct Config {
     log_channel_id: i64,
     report_channel_id: i64,
     test_group_id: Option<i64>,
-    maintainer_ids: Vec<i64>,
     data_dir: PathBuf,
     sqlite_path: PathBuf,
     spam_threshold: f64,
@@ -38,11 +37,6 @@ impl Config {
             .context("REPORT_CHANNEL_ID is required")?
             .parse()?;
         let test_group_id = env::var("TEST_GROUP_ID").ok().and_then(|v| v.parse::<i64>().ok());
-        let maintainer_ids = env::var("MAINTAINER_IDS")
-            .unwrap_or_default()
-            .split(',')
-            .filter_map(|v| v.trim().parse::<i64>().ok())
-            .collect::<Vec<_>>();
         let data_dir = env::var("DATA_DIR").unwrap_or_else(|_| "data".to_string());
         let sqlite_path = env::var("SQLITE_PATH").unwrap_or_else(|_| format!("{data_dir}/bot.db"));
         let spam_threshold = env::var("SPAM_THRESHOLD")
@@ -55,7 +49,6 @@ impl Config {
             log_channel_id,
             report_channel_id,
             test_group_id,
-            maintainer_ids,
             data_dir: PathBuf::from(data_dir),
             sqlite_path: PathBuf::from(sqlite_path),
             spam_threshold,
@@ -203,6 +196,7 @@ enum UndoData {
     GroupBanned { chat_id: i64 },
     UserBanned { user_id: i64 },
     Reviewer { user_id: i64, old_enabled: bool },
+    Maintainer { user_id: i64, old_enabled: bool },
     /// A synthetic case_id-like handle passed as `case_id` into
     /// `train_spam`/`train_ham` purely so `purge_training_by_case` can find
     /// and remove exactly this training sample later - not a real case.
@@ -272,6 +266,12 @@ struct Runtime {
     /// written through on every change.
     banned_groups: RwLock<std::collections::HashSet<i64>>,
     banned_users: RwLock<std::collections::HashSet<i64>>,
+    /// Command-granted maintainers (see migrate_v12_to_v13). Cached in
+    /// memory like the other permission sets because it is read on every
+    /// message (moderation exemption) and every maintainer command. The
+    /// host is not stored here - it is a source constant - so this can be
+    /// empty while the host still has full authority.
+    maintainers: RwLock<std::collections::HashSet<i64>>,
     /// This bot's own account id, resolved once. `get_me()` was being called
     /// per message via `ensure_bot_can_moderate` (and again per bot-authored
     /// message via the guest-mode check) purely to learn an id that cannot
@@ -418,6 +418,7 @@ impl Runtime {
         let spam_rules = Self::load_spam_rules(&conn)?;
         let banned_groups = Self::load_id_set(&conn, "SELECT chat_id FROM banned_groups")?;
         let banned_users = Self::load_id_set(&conn, "SELECT user_id FROM banned_users")?;
+        let maintainers = Self::load_id_set(&conn, "SELECT user_id FROM maintainers")?;
         Ok(Self {
             config,
             db: Arc::new(StdMutex::new(conn)),
@@ -435,6 +436,7 @@ impl Runtime {
             recent_messages: Mutex::new(HashMap::new()),
             banned_groups: RwLock::new(banned_groups),
             banned_users: RwLock::new(banned_users),
+            maintainers: RwLock::new(maintainers),
             me_id: OnceLock::new(),
         })
     }
@@ -594,6 +596,9 @@ impl Runtime {
         }
         if user_version < 12 {
             Self::migrate_v11_to_v12(conn)?;
+        }
+        if user_version < 13 {
+            Self::migrate_v12_to_v13(conn)?;
         }
         Ok(())
     }
@@ -887,6 +892,29 @@ impl Runtime {
             [],
         )?;
         tx.execute("PRAGMA user_version = 12", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The maintainer role, now granted by command and stored here rather
+    /// than read from a `MAINTAINER_IDS` env var. The env var no longer
+    /// confers any authority - which is exactly the "remove all current
+    /// maintainers" step: on first run against an existing database this
+    /// table is empty, so nobody but the hardcoded host (see `HOST_ID`) has
+    /// power until the host grants it.
+    fn migrate_v12_to_v13(conn: &mut Connection) -> Result<()> {
+        let tx = conn.transaction()?;
+        tx.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS maintainers (
+                user_id INTEGER PRIMARY KEY,
+                added_by INTEGER,
+                created_at TEXT NOT NULL
+            )
+            "#,
+            [],
+        )?;
+        tx.execute("PRAGMA user_version = 13", [])?;
         tx.commit()?;
         Ok(())
     }
@@ -2509,6 +2537,51 @@ impl Runtime {
         .await
     }
 
+    /// The permission predicate everything gates on: the host, or a
+    /// command-granted maintainer. Replaces the old env-var check and the
+    /// old `is_special_user` (they were the same set, so they are collapsed
+    /// into one). Also the moderation-exemption test - a maintainer is never
+    /// auto-banned.
+    async fn is_maintainer(&self, user_id: i64) -> bool {
+        is_host(user_id) || self.maintainers.read().await.contains(&user_id)
+    }
+
+    async fn set_maintainer(&self, user_id: i64, enabled: bool, added_by: Option<i64>) -> Result<()> {
+        self.with_conn(move |conn| {
+            if enabled {
+                conn.execute(
+                    "INSERT OR IGNORE INTO maintainers (user_id, added_by, created_at) VALUES (?1, ?2, ?3)",
+                    params![user_id, added_by, Utc::now().to_rfc3339()],
+                )?;
+            } else {
+                conn.execute("DELETE FROM maintainers WHERE user_id = ?1", params![user_id])?;
+            }
+            Ok(())
+        })
+        .await?;
+        let mut cache = self.maintainers.write().await;
+        if enabled {
+            cache.insert(user_id);
+        } else {
+            cache.remove(&user_id);
+        }
+        Ok(())
+    }
+
+    /// Granted maintainers only (the host is a constant, not a row here).
+    async fn list_maintainers(&self) -> Result<Vec<(i64, String)>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT user_id, created_at FROM maintainers ORDER BY created_at ASC")?;
+            let mut rows = stmt.query([])?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next()? {
+                out.push((row.get(0)?, row.get(1)?));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// Reviewer-role checks. Read straight from SQLite rather than cached
     /// like the denial lists: these are only consulted when someone presses
     /// a button in the report channel, not on every message, so there's no
@@ -2749,7 +2822,7 @@ impl Runtime {
         let mut name_guard = Vec::new();
         let mut no_halal = Vec::new();
 
-        if settings.no_long_name && !is_special_user(&self.config, user.id.0 as i64) {
+        if settings.no_long_name && !self.is_maintainer(user.id.0 as i64).await {
             let r = evaluate_no_long_name(user);
             if !r.is_empty() {
                 reasons.extend(r.clone());
@@ -2757,7 +2830,7 @@ impl Runtime {
             }
         }
 
-        if settings.no_halal && !is_special_user(&self.config, user.id.0 as i64) {
+        if settings.no_halal && !self.is_maintainer(user.id.0 as i64).await {
             let r = evaluate_module_checks(user, user.username.as_deref(), bio, message_text);
             if !r.is_empty() {
                 reasons.extend(r.clone());
@@ -2857,6 +2930,7 @@ enum ModerationCommand {
     Forgive(String),
     ListBanned,
     Reviewer(String, String),
+    Maintainer(String, String),
     Whois(String),
     ReportReset(String),
     MlEval(String),
@@ -2935,6 +3009,10 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/report_reset" => ModerationCommand::ReportReset(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/ml_eval" => ModerationCommand::MlEval(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/reviewer" => ModerationCommand::Reviewer(
+            text.split_whitespace().nth(1).unwrap_or("").to_string(),
+            text.split_whitespace().nth(2).unwrap_or("").to_string(),
+        ),
+        "/maintainer" => ModerationCommand::Maintainer(
             text.split_whitespace().nth(1).unwrap_or("").to_string(),
             text.split_whitespace().nth(2).unwrap_or("").to_string(),
         ),
@@ -3669,20 +3747,13 @@ fn format_case_lookup(case: &CaseRecord, link: &str, reason_link: &str) -> Strin
     )
 }
 
-async fn is_maintainer(bot: &Bot, config: &Config, user_id: i64) -> bool {
-    if config.maintainer_ids.contains(&user_id) {
-        return true;
-    }
-    let _ = bot;
-    false
-}
 
 /// Guards a command handler arm behind `is_maintainer`, replying with `$msg` and
 /// returning early otherwise. Collapses the same 4-line permission check that
 /// used to be repeated at the top of ~24 command arms in `handle_command`.
 macro_rules! require_maintainer {
     ($bot:expr, $runtime:expr, $from_id:expr, $message:expr, $msg:expr) => {
-        if !is_maintainer($bot, &$runtime.config, $from_id).await {
+        if !$runtime.is_maintainer($from_id).await {
             $bot.send_message($message.chat.id, $msg).await?;
             return Ok(());
         }
@@ -3723,8 +3794,18 @@ fn short_user(user: &teloxide::types::User) -> String {
     }
 }
 
-fn is_special_user(config: &Config, user_id: i64) -> bool {
-    config.maintainer_ids.contains(&user_id)
+
+/// The project host (項目主持人). Hardcoded, singular, and unremovable by any
+/// command - the root of the permission hierarchy. Everyone else's
+/// authority is granted downward from here: the host grants maintainers,
+/// maintainers grant reviewers. This being a source constant rather than a
+/// database row or an env var is deliberate - it is the one authority that
+/// must survive a wiped database, a changed environment, or a fork of this
+/// code (see the note answering that question in the project history).
+const HOST_ID: i64 = 5172206551;
+
+fn is_host(user_id: i64) -> bool {
+    user_id == HOST_ID
 }
 
 /// Telegram's own reserved pseudo-accounts, not real chat members and never
@@ -3922,7 +4003,7 @@ async fn notify_bot_added(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) 
         if user.is_bot {
             continue;
         }
-        if is_special_user(&runtime.config, user.id.0 as i64) || is_platform_pseudo_user(user.id.0 as i64) {
+        if runtime.is_maintainer(user.id.0 as i64).await || is_platform_pseudo_user(user.id.0 as i64) {
             continue;
         }
         if runtime.is_global_whitelisted(user.id.0 as i64).await.unwrap_or(false) {
@@ -4855,7 +4936,7 @@ async fn check_flood_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Messag
     let chat_id = message.chat.id.0;
     let user_id = user.id.0 as i64;
 
-    if is_special_user(&runtime.config, user_id) || is_platform_pseudo_user(user_id) {
+    if runtime.is_maintainer(user_id).await || is_platform_pseudo_user(user_id) {
         return Ok(false);
     }
     if runtime.is_global_whitelisted(user_id).await.unwrap_or(false) {
@@ -4920,7 +5001,7 @@ async fn check_netban_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Messa
     let chat_id = message.chat.id.0;
     let user_id = user.id.0 as i64;
 
-    if is_special_user(&runtime.config, user_id) || is_platform_pseudo_user(user_id) {
+    if runtime.is_maintainer(user_id).await || is_platform_pseudo_user(user_id) {
         return false;
     }
 
@@ -4971,7 +5052,7 @@ async fn check_reban_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Messag
     let chat_id = message.chat.id.0;
     let user_id = user.id.0 as i64;
 
-    if is_special_user(&runtime.config, user_id) || is_platform_pseudo_user(user_id) {
+    if runtime.is_maintainer(user_id).await || is_platform_pseudo_user(user_id) {
         return false;
     }
     if runtime.is_global_whitelisted(user_id).await.unwrap_or(false) {
@@ -5071,7 +5152,7 @@ async fn check_attachment_policy_and_act(bot: &Bot, runtime: &Arc<Runtime>, mess
     let chat_id = message.chat.id.0;
     let user_id = user.id.0 as i64;
 
-    if is_special_user(&runtime.config, user_id) || is_platform_pseudo_user(user_id) {
+    if runtime.is_maintainer(user_id).await || is_platform_pseudo_user(user_id) {
         return false;
     }
 
@@ -5223,7 +5304,7 @@ async fn check_guest_bot_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Me
             // immediately and skip anyone already banned here, so the
             // follow-up replies don't each open a duplicate case.
             runtime.forget_recent_message(chat_id, invoker_msg_id).await;
-            let invoker_exempt = is_special_user(&runtime.config, invoker_id)
+            let invoker_exempt = runtime.is_maintainer(invoker_id).await
                 || is_platform_pseudo_user(invoker_id)
                 || runtime.is_global_whitelisted(invoker_id).await.unwrap_or(false)
                 || runtime.is_group_whitelisted(chat_id, invoker_id).await.unwrap_or(false)
@@ -5269,7 +5350,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
     let cmd = parse_command(text);
     let Some(from) = message.from.as_ref() else { return Ok(()); };
     let from_id = from.id.0 as i64;
-    let is_private_maintainer = message.chat.is_private() && runtime.config.maintainer_ids.contains(&from_id);
+    let is_private_maintainer = message.chat.is_private() && runtime.is_maintainer(from_id).await;
 
     // Project-level denial: someone on the `/forbid` list gets no response
     // to anything, anywhere. Silent rather than an error reply - there's no
@@ -5277,7 +5358,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
     // would just invite argument in whatever group they tried it in.
     // Maintainers are exempt so a mis-`/forbid` can never lock out the
     // people who'd have to undo it.
-    if !runtime.config.maintainer_ids.contains(&from_id) && runtime.is_user_banned(from_id).await {
+    if !runtime.is_maintainer(from_id).await && runtime.is_user_banned(from_id).await {
         return Ok(());
     }
 
@@ -5313,12 +5394,23 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 .or(requester);
             let uid = target_user.map(|u| u.id.0.to_string()).unwrap_or_else(|| "unknown".to_string());
             let target_name = target_user.map(short_user).unwrap_or_else(|| "unknown".to_string());
-            let maintainer = if let Some(user) = target_user {
-                if is_maintainer(&bot, &runtime.config, user.id.0 as i64).await { "yes" } else { "no" }
+            // The role line is only shown to staff. /id is a public command,
+            // so printing everyone's role would let any member probe who is a
+            // maintainer just by replying to them.
+            // from_id is the person who typed /id. Maintainer covers the host.
+            let viewer_is_staff = runtime.is_maintainer(from_id).await;
+            let role_line = if viewer_is_staff {
+                let role = match target_user.map(|u| u.id.0 as i64) {
+                    Some(id) if is_host(id) => "項目主持人",
+                    Some(id) if runtime.is_maintainer(id).await => "維護組",
+                    Some(id) if runtime.is_reviewer(id).await => "審核員",
+                    _ => "一般用戶",
+                };
+                format!("\n• 身分: {role}")
             } else {
-                "no"
+                String::new()
             };
-            let body = format!("<b>查詢結果</b>\n• 對象: <code>{target_name}</code>\n• Telegram ID: <code>{uid}</code>\n• Maintainer: {maintainer}");
+            let body = format!("<b>查詢結果</b>\n• 對象: <code>{target_name}</code>\n• Telegram ID: <code>{uid}</code>{role_line}");
             bot.send_message(message.chat.id, body).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::MyChat => {
@@ -5500,7 +5592,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "/forbid 只接受 user_id。要封禁群組請用 /leave。").await?;
                 return Ok(());
             }
-            if is_special_user(&runtime.config, target_id) || is_platform_pseudo_user(target_id) {
+            if runtime.is_maintainer(target_id).await || is_platform_pseudo_user(target_id) {
                 bot.send_message(message.chat.id, "不能對項目維護人員或 Telegram 系統帳號執行此指令。").await?;
                 return Ok(());
             }
@@ -5567,11 +5659,12 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let forbidden = runtime.is_user_banned(target_id).await;
             let reviewer = runtime.is_reviewer(target_id).await;
             let report_strikes = runtime.report_strikes(target_id).await;
-            let maintainer = is_special_user(&runtime.config, target_id);
+            let maintainer = runtime.is_maintainer(target_id).await;
 
             let mut out = format!("<b>❖ 用戶查詢</b>\n<b>User ID</b>: <code>{target_id}</code>\n");
             let mut tags = Vec::new();
-            if maintainer { tags.push("維護組"); }
+            if is_host(target_id) { tags.push("項目主持人"); }
+            else if maintainer { tags.push("維護組"); }
             if reviewer { tags.push("審核員"); }
             if global_wl { tags.push("全域白名單"); }
             if forbidden { tags.push("已禁止使用本項目"); }
@@ -5653,6 +5746,56 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             }
             bot.send_message(message.chat.id, out).parse_mode(ParseMode::Html).await?;
         }
+        ModerationCommand::Maintainer(sub, target) => {
+            // Host only. Maintainers grant reviewers; only the host grants
+            // maintainers, and the host itself can never be removed.
+            if !is_host(from_id) {
+                bot.send_message(message.chat.id, "只有項目主持人可以管理維護組。").await?;
+                return Ok(());
+            }
+            let usage = "用法：/maintainer add|del <user_id>（或回覆該用戶）、/maintainer list";
+            match sub.trim().to_lowercase().as_str() {
+                "list" | "" => {
+                    let ms = runtime.list_maintainers().await.unwrap_or_default();
+                    let mut out = format!("<b>❖ 權限名單</b>\n\n<b>項目主持人</b>\n<code>{HOST_ID}</code>（不可移除）\n\n<b>維護組</b>");
+                    if ms.is_empty() {
+                        out.push_str("\n（無）");
+                    }
+                    for (id, created_at) in &ms {
+                        out.push_str(&format!("\n<code>{id}</code> <i>{}</i>", escape_html(created_at)));
+                    }
+                    out.push_str("\n\n維護組可授予審核員、白名單等，但不能管理維護組本身。");
+                    bot.send_message(message.chat.id, out).parse_mode(ParseMode::Html).await?;
+                }
+                verb @ ("add" | "del" | "remove") => {
+                    let target_id = target
+                        .trim()
+                        .parse::<i64>()
+                        .ok()
+                        .or_else(|| real_reply(&message).and_then(|r| r.from.as_ref()).map(|u| u.id.0 as i64));
+                    let Some(target_id) = target_id else {
+                        bot.send_message(message.chat.id, usage).await?;
+                        return Ok(());
+                    };
+                    if is_host(target_id) {
+                        bot.send_message(message.chat.id, "項目主持人的權限無法透過指令變更。").await?;
+                        return Ok(());
+                    }
+                    let enabled = verb == "add";
+                    runtime.set_maintainer(target_id, enabled, Some(from_id)).await.ok();
+                    log_maintainer_action(
+                        &bot, &runtime, from_id, &short_user(from), None, "/maintainer",
+                        &format!("{} 維護組 user_id={target_id}", if enabled { "新增" } else { "移除" }),
+                        UndoData::Maintainer { user_id: target_id, old_enabled: !enabled },
+                    )
+                    .await;
+                    bot.send_message(message.chat.id, format!("{} <code>{target_id}</code> 的維護組權限。", if enabled { "已授予" } else { "已撤銷" })).parse_mode(ParseMode::Html).await?;
+                }
+                _ => {
+                    bot.send_message(message.chat.id, usage).await?;
+                }
+            }
+        }
         ModerationCommand::Reviewer(sub, target) => {
             require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以管理審核員。");
             let usage = "用法：/reviewer add|del <user_id>（或回覆該用戶）、/reviewer list";
@@ -5711,7 +5854,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 return Ok(());
             }
 
-            if is_group_admin(&bot, message.chat.id, target_id).await || is_special_user(&runtime.config, target_id) || is_platform_pseudo_user(target_id) {
+            if is_group_admin(&bot, message.chat.id, target_id).await || runtime.is_maintainer(target_id).await || is_platform_pseudo_user(target_id) {
                 reply_ephemeral(&bot, &message, "不能對群組管理員或項目維護人員執行此指令。").await?;
                 return Ok(());
             }
@@ -5793,7 +5936,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let chat_id = message.chat.id.0;
             let settings = runtime.get_group_modules(chat_id).await.unwrap_or_default();
             let authorized = settings.pol
-                && (is_maintainer(&bot, &runtime.config, from_id).await || is_group_admin(&bot, message.chat.id, from_id).await);
+                && (runtime.is_maintainer(from_id).await || is_group_admin(&bot, message.chat.id, from_id).await);
             if !authorized {
                 // Unauthorized use - module not enabled here, or the caller
                 // isn't an admin/maintainer - is completely silent. Deleting
@@ -5826,7 +5969,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                         reply_ephemeral(&bot, &message, "請回覆一條訊息後再使用此指令。").await?;
                         return Ok(());
                     };
-                    if is_group_admin(&bot, message.chat.id, target_id).await || is_special_user(&runtime.config, target_id) || is_platform_pseudo_user(target_id) {
+                    if is_group_admin(&bot, message.chat.id, target_id).await || runtime.is_maintainer(target_id).await || is_platform_pseudo_user(target_id) {
                         reply_ephemeral(&bot, &message, "不能對群組管理員或項目維護人員執行此指令。").await?;
                         return Ok(());
                     }
@@ -5880,7 +6023,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             // Three rejected reports and the command is gone. Maintainers are
             // exempt so a bad streak can't lock out the people who clear it.
             let strikes = runtime.report_strikes(from_id).await;
-            if strikes >= REPORT_STRIKE_LIMIT && !is_maintainer(&bot, &runtime.config, from_id).await {
+            if strikes >= REPORT_STRIKE_LIMIT && !runtime.is_maintainer(from_id).await {
                 reply_ephemeral(
                     &bot,
                     &message,
@@ -6558,7 +6701,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             bot.send_message(message.chat.id, format!("已匯入並訓練 {count} 筆。\n\n匯入字串：\n{}", debug.join("\n---\n"))).await?;
         }
         ModerationCommand::MlStartMassTrainWithMode(mode) => {
-            if !message.chat.is_private() || !is_maintainer(&bot, &runtime.config, from_id).await {
+            if !message.chat.is_private() || !runtime.is_maintainer(from_id).await {
                 bot.send_message(message.chat.id, "只允許維護者在私訊中啟動批量訓練。") .await?;
                 return Ok(());
             }
@@ -6568,7 +6711,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 .await?;
         }
         ModerationCommand::MlStartMassHam => {
-            if !message.chat.is_private() || !is_maintainer(&bot, &runtime.config, from_id).await {
+            if !message.chat.is_private() || !runtime.is_maintainer(from_id).await {
                 bot.send_message(message.chat.id, "只允許維護者在私訊中啟動批量訓練。") .await?;
                 return Ok(());
             }
@@ -6578,7 +6721,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 .await?;
         }
         ModerationCommand::MlDebugParse => {
-            if !message.chat.is_private() || !is_maintainer(&bot, &runtime.config, from_id).await {
+            if !message.chat.is_private() || !runtime.is_maintainer(from_id).await {
                 bot.send_message(message.chat.id, "只允許維護者在私訊中使用 /ml_debug_parse。") .await?;
                 return Ok(());
             }
@@ -6620,7 +6763,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             bot.send_message(message.chat.id, out).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::MlFinishMassTrain => {
-            if !message.chat.is_private() || !is_maintainer(&bot, &runtime.config, from_id).await {
+            if !message.chat.is_private() || !runtime.is_maintainer(from_id).await {
                 bot.send_message(message.chat.id, "只允許維護者在私訊中結束批量訓練。") .await?;
                 return Ok(());
             }
@@ -6658,7 +6801,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             runtime.clear_mass_train(from_id).await;
         }
         ModerationCommand::MlFinishMassHam => {
-            if !message.chat.is_private() || !is_maintainer(&bot, &runtime.config, from_id).await {
+            if !message.chat.is_private() || !runtime.is_maintainer(from_id).await {
                 bot.send_message(message.chat.id, "只允許維護者在私訊中結束批量訓練。") .await?;
                 return Ok(());
             }
@@ -6683,7 +6826,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             runtime.clear_mass_train(from_id).await;
         }
         ModerationCommand::Unban(arg) => {
-            let is_maintainer_user = is_maintainer(&bot, &runtime.config, from_id).await;
+            let is_maintainer_user = runtime.is_maintainer(from_id).await;
             let is_admin_user = (message.chat.is_group() || message.chat.is_supergroup())
                 && is_group_admin(&bot, message.chat.id, from_id).await;
             if !is_maintainer_user && !is_admin_user {
@@ -6793,7 +6936,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             }
         }
         ModerationCommand::Unmute(arg) => {
-            let is_maintainer_user = is_maintainer(&bot, &runtime.config, from_id).await;
+            let is_maintainer_user = runtime.is_maintainer(from_id).await;
             let is_admin_user = (message.chat.is_group() || message.chat.is_supergroup())
                 && is_group_admin(&bot, message.chat.id, from_id).await;
             if !is_maintainer_user && !is_admin_user {
@@ -6927,6 +7070,10 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     Ok(()) => Ok(format!("已將 user_id={user_id} 的審核員權限復原為 {old_enabled}。")),
                     Err(e) => Err(e.to_string()),
                 },
+                UndoData::Maintainer { user_id, old_enabled } => match runtime.set_maintainer(user_id, old_enabled, None).await {
+                    Ok(()) => Ok(format!("已將 user_id={user_id} 的維護組權限復原為 {old_enabled}。")),
+                    Err(e) => Err(e.to_string()),
+                },
                 UndoData::GroupModulesBulk { chat_id, old } => {
                     let mut failed = Vec::new();
                     for (module, old_enabled) in &old {
@@ -7048,7 +7195,7 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
     // into the shared model, so it takes an explicit reviewer grant (or
     // maintainer). Checked once, before any decision branch, so no button
     // added later can miss it.
-    if !is_maintainer(&bot, &runtime.config, from_id).await && !runtime.is_reviewer(from_id).await {
+    if !runtime.is_maintainer(from_id).await && !runtime.is_reviewer(from_id).await {
         bot.answer_callback_query(q.id).text("只有審核員或維護組可以處理此項目").await?;
         return Ok(());
     }
@@ -7162,7 +7309,7 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
             // lines below overwrite actor_user_id with the reviewer.
             let mut strike_note = String::new();
             if let Some(reporter) = case.actor_user_id {
-                if !is_maintainer(&bot, &runtime.config, reporter).await {
+                if !runtime.is_maintainer(reporter).await {
                     let count = runtime.add_report_strike(reporter).await.unwrap_or(0);
                     strike_note = if count >= REPORT_STRIKE_LIMIT {
                         format!("\n<b>舉報者</b>: <code>{reporter}</code> 已累計 {count} 次被拒，已暫停使用 /spam")
@@ -7210,7 +7357,7 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
     if runtime.is_group_whitelisted(message.chat.id.0, user.id.0 as i64).await.unwrap_or(false) {
         return Ok(());
     }
-    if is_group_admin(&bot, message.chat.id, user.id.0 as i64).await || is_special_user(&runtime.config, user.id.0 as i64) {
+    if is_group_admin(&bot, message.chat.id, user.id.0 as i64).await || runtime.is_maintainer(user.id.0 as i64).await {
         return Ok(());
     }
     if let Ok(check) = runtime.check_group_modules(&bot, message.chat.id.0, user, None, message.text().or(message.caption())).await {
@@ -7721,7 +7868,6 @@ mod tests {
             log_channel_id: -1,
             report_channel_id: -1,
             test_group_id: None,
-            maintainer_ids: vec![],
             data_dir: dir.clone(),
             sqlite_path: dir.join("bot.db"),
             spam_threshold: 0.85,
@@ -7827,7 +7973,6 @@ mod tests {
             log_channel_id: -1,
             report_channel_id: -1,
             test_group_id: None,
-            maintainer_ids: vec![],
             data_dir: dir.clone(),
             sqlite_path: db_path.clone(),
             spam_threshold: 0.85,
@@ -8014,7 +8159,6 @@ mod tests {
             log_channel_id: -1,
             report_channel_id: -1,
             test_group_id: None,
-            maintainer_ids: vec![],
             data_dir: dir.clone(),
             sqlite_path: db_path.clone(),
             spam_threshold: 0.85,
@@ -8457,6 +8601,52 @@ mod tests {
         assert!(!help_op_text("").to_lowercase().contains("/magic"), "/magic stays undocumented");
     }
 
+    // The host is a source constant, so its authority must hold with an
+    // empty database and cannot be granted or revoked. Maintainers are
+    // command-granted rows; a fresh database has none, which is the
+    // "remove all current maintainers" outcome.
+    #[tokio::test]
+    async fn host_is_always_maintainer_and_cannot_be_removed_from_the_table() {
+        let runtime = test_runtime().await;
+        assert!(is_host(HOST_ID));
+        assert!(runtime.is_maintainer(HOST_ID).await, "host must be a maintainer with no DB row at all");
+        assert_eq!(runtime.list_maintainers().await.unwrap().len(), 0, "fresh DB has no granted maintainers");
+
+        // Even a stray delete/insert of the host id doesn't change host status.
+        runtime.set_maintainer(HOST_ID, false, Some(1)).await.unwrap();
+        assert!(runtime.is_maintainer(HOST_ID).await, "host authority is not stored in the table");
+    }
+
+    // Maintainers are granted and revoked like reviewers, scoped per user,
+    // and the grant survives a restart (cache is loaded from the table).
+    #[tokio::test]
+    async fn maintainer_grants_round_trip_and_persist() {
+        let dir = std::env::temp_dir().join(format!("spb_test_{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let config = Config {
+            bot_token: "test".to_string(),
+            log_channel_id: -1,
+            report_channel_id: -1,
+            test_group_id: None,
+            data_dir: dir.clone(),
+            sqlite_path: dir.join("bot.db"),
+            spam_threshold: 0.85,
+            owner_id: None,
+        };
+        {
+            let runtime = Runtime::load(config.clone()).await.unwrap();
+            assert!(!runtime.is_maintainer(555).await);
+            runtime.set_maintainer(555, true, Some(HOST_ID)).await.unwrap();
+            assert!(runtime.is_maintainer(555).await);
+            assert!(!runtime.is_maintainer(666).await, "granting one must not grant another");
+        }
+        let restarted = Runtime::load(config).await.unwrap();
+        assert!(restarted.is_maintainer(555).await, "a maintainer grant must survive a restart");
+
+        restarted.set_maintainer(555, false, Some(HOST_ID)).await.unwrap();
+        assert!(!restarted.is_maintainer(555).await);
+    }
+
     // Backs /reviewer add|del|list and the report-channel button guard.
     // Granting must be scoped to the one account named, and revoking must
     // actually revoke - a stale grant here means someone keeps the ability
@@ -8520,7 +8710,6 @@ mod tests {
             log_channel_id: -1,
             report_channel_id: -1,
             test_group_id: None,
-            maintainer_ids: vec![],
             data_dir: dir.clone(),
             sqlite_path: dir.join("bot.db"),
             spam_threshold: 0.85,
