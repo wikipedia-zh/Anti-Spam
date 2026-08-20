@@ -3313,42 +3313,50 @@ fn version_info_text() -> String {
 }
 
 fn help_text() -> String {
-    // Sectioned with rules rather than run as one paragraph: this is the
-    // first thing a new group sees, and the old single-block version buried
-    // the permissions requirement and the module list in a wall of text.
+    // Layout notes, learned the hard way: `<code>` renders monospace, and
+    // monospace CJK is wide, so a line that looks short in source wraps on a
+    // phone. Ideographic spaces (U+3000) as pseudo-columns make it worse -
+    // nothing aligns, and a wrapped line loses the indent entirely. So:
+    // one item per line, a single ASCII space before the description, and
+    // short enough that nothing wraps at default phone width. Modules are
+    // grouped by default state rather than repeating "預設開啟" on each row.
     concat!(
         "<b>Spam Protection Bot（SPB）</b>\n",
-        "全自動反廣告機器人。把它加進群組並給予<b>管理員權限</b>（至少需要「刪除訊息」與「封禁用戶」），即會自動開始運作。\n",
-        "\n<b>━━━ 所有人可用 ━━━</b>\n",
-        "<code>/spam</code>　回覆可疑訊息提交舉報，由項目組審核\n",
-        "　　※ 累計 3 次舉報被拒將暫停使用\n",
-        "<code>/case &lt;ID&gt;</code>　查詢某次封禁的詳細記錄\n",
-        "<code>/id</code>　取得自己的 User ID\n",
-        "\n<b>━━━ 群組管理員 ━━━</b>\n",
-        "<code>/sb</code>　回覆訊息：刪除該訊息並封禁該用戶\n",
-        "<code>/mute</code>　禁言　　<code>/kick</code>　踢出\n",
-        "<code>/unban</code>　<code>/unmute</code>　解除封禁／禁言（僅本群）\n",
-        "<code>/white</code>　<code>/unwhite</code>　本群白名單（加 <code>-global</code> 為全域）\n",
-        "<code>/module</code>　查看本群所有模組的開關狀態\n",
-        "<code>/module &lt;名稱&gt; on|off</code>　切換單一模組\n",
-        "<code>/module all on|off</code>　一次全開／全關\n",
-        "\n<b>━━━ 可用模組 ━━━</b>\n",
-        "<code>Flood</code>　洗版偵測　<i>預設開啟</i>\n",
-        "<code>GuestBan</code>　封鎖訪客模式機器人廣告　<i>預設開啟</i>\n",
-        "<code>NoLongName</code>　英文長名檢查\n",
-        "<code>NoHalal</code>　清真內容檢查\n",
-        "<code>NoSM</code>　自動刪除服務訊息\n",
-        "<code>Captcha</code>　新成員入群驗證\n",
-        "<code>Netban</code>　跨群組黑名單同步\n",
-        "<code>CmdClean</code>　指令權限濫用防護\n",
-        "<code>NoContact</code>　禁止分享聯絡人\n",
-        "<code>NoVoice</code>　禁止語音訊息\n",
-        "<code>NoExec</code>　禁止可執行檔（.exe/.apk/.msi 等）\n",
-        "　　※ 標示「預設開啟」以外的模組皆需自行開啟\n",
-        "　　※ <code>Flood</code> 與 <code>GuestBan</code> 為基礎防護，不會被 <code>/module all off</code> 關閉\n",
-        "\n<b>━━━ 被封禁後 ━━━</b>\n",
-        "先用 <code>/id</code> 取得自己的 User ID，再到日誌頻道 @SpamProtectionLogging 搜尋，或透過 @SEELE_01_BOT 申訴。\n",
-        "\n交流群 @SpamProtectionChat　·　日誌 @SpamProtectionLogging",
+        "全自動反廣告機器人。加進群組後請給予管理員權限（至少「刪除訊息」與「封禁用戶」），即會自動運作。\n",
+        "\n<b>━━ 所有人 ━━</b>\n",
+        "<code>/spam</code> 回覆可疑訊息提交舉報\n",
+        "<code>/case &lt;ID&gt;</code> 查詢封禁記錄\n",
+        "<code>/id</code> 取得自己的 User ID\n",
+        "· 舉報累計 3 次被拒將暫停使用\n",
+        "\n<b>━━ 群組管理員 ━━</b>\n",
+        "<code>/sb</code> 刪除訊息並封禁\n",
+        "<code>/mute</code> 禁言\n",
+        "<code>/kick</code> 踢出\n",
+        "<code>/unban</code> <code>/unmute</code> 解除（僅本群）\n",
+        "<code>/white</code> <code>/unwhite</code> 本群白名單\n",
+        "· 加 <code>-global</code> 為全域白名單\n",
+        "<code>/module</code> 查看模組開關狀態\n",
+        "<code>/module 名稱 on|off</code> 切換\n",
+        "<code>/module all on|off</code> 全開／全關\n",
+        "\n<b>━━ 模組 ━━</b>\n",
+        "<b>預設開啟</b>\n",
+        "· Flood 洗版偵測\n",
+        "· GuestBan 訪客機器人廣告\n",
+        "<b>需自行開啟</b>\n",
+        "· NoLongName 英文長名檢查\n",
+        "· NoHalal 清真內容檢查\n",
+        "· NoSM 自動刪除服務訊息\n",
+        "· Captcha 入群驗證\n",
+        "· Netban 跨群黑名單同步\n",
+        "· CmdClean 指令濫用防護\n",
+        "· NoContact 禁止分享聯絡人\n",
+        "· NoVoice 禁止語音訊息\n",
+        "· NoExec 禁止可執行檔\n",
+        "\n基礎防護（Flood、GuestBan）不會被 <code>/module all off</code> 關閉。\n",
+        "\n<b>━━ 被封禁後 ━━</b>\n",
+        "用 <code>/id</code> 取得 User ID，到 @SpamProtectionLogging 搜尋，或向 @SEELE_01_BOT 申訴。\n",
+        "\n交流群 @SpamProtectionChat\n",
+        "日誌 @SpamProtectionLogging",
     )
     .to_string()
 }
@@ -3358,96 +3366,130 @@ fn help_text() -> String {
 /// It used to be one string listing every command with a full paragraph of
 /// explanation each. That had already reached 3,000 of Telegram's 4,096
 /// character limit, so it would eventually have started failing to send
-/// outright, and it was unreadable long before that. `/help_op` now gives a
-/// one-line index and `/help_op <section>` gives the detail.
+/// outright, and it was unreadable long before that.
+///
+/// Same layout rules as `help_text`: one command per line, a single ASCII
+/// space before the description, no ideographic-space columns, and lines
+/// short enough not to wrap on a phone once `<code>` widens them.
 fn help_op_text(section: &str) -> String {
     match section.trim().to_lowercase().as_str() {
         "ml" | "model" | "模型" => concat!(
-            "<b>━━━ 模型 / 訓練 ━━━</b>\n",
-            "<code>/ml_score</code>　測試單條文本的分數\n",
-            "<code>/ml_score_debug</code>　逐詞看分數是怎麼算出來的\n",
-            "<code>/ml_stats</code>　樣本量、有效門檻、最大權重詞\n",
-            "<code>/ml_eval [保留比例]</code>　留出法評估：以部分樣本訓練、其餘測試，列出各門檻的精確率／召回率／F1 與漏放、誤封數。不會改動實際模型，用來決定門檻該設多少\n",
-            "<code>/ml_threshold &lt;值&gt;</code>　調整門檻（0.50–0.99）。在私訊／測試群／工作群使用＝全域；在其他群組使用＝僅該群\n",
+            "<b>━━ 模型 / 訓練 ━━</b>\n",
+            "\n<b>查看</b>\n",
+            "<code>/ml_stats</code> 樣本量與有效門檻\n",
+            "<code>/ml_score</code> 測試單條文本分數\n",
+            "<code>/ml_score_debug</code> 逐詞看分數怎麼算\n",
+            "<code>/ml_eval [比例]</code> 留出法評估\n",
+            "· 列出各門檻的精確率／召回率／F1\n",
+            "· 只讀，不會改動實際模型\n",
+            "<code>/ml_threshold &lt;值&gt;</code> 調整門檻\n",
+            "· 私訊／測試群／工作群＝全域\n",
+            "· 其他群組＝僅該群\n",
             "\n<b>訓練</b>\n",
-            "<code>/ml_train_spam</code>（＝<code>/mark_spam</code>）　把回覆內容當 spam 訓練\n",
-            "<code>/mark_ham</code>　標記為正常內容\n",
-            "<code>/ml_clean_spam</code>　把回覆內容清成 ham\n",
-            "<code>/ml_undo_clean_spam</code>　撤銷上一步\n",
-            "<code>/import</code>　匯入匯出格式的訓練列表\n",
-            "<code>/ml_export</code>　匯出全部訓練資料\n",
-            "\n<b>批量</b>\n",
-            "<code>/ml_start_mass_train_smart</code>｜<code>_plain</code>　開始（僅私訊）\n",
-            "<code>/ml_finish_mass_train</code>　結束 spam 批量\n",
-            "<code>/ml_start_mass_ham</code> → <code>/ml_finish_mass_ham</code>　ham 批量\n",
+            "<code>/ml_train_spam</code> 標記為 spam\n",
+            "<code>/mark_ham</code> 標記為正常\n",
+            "<code>/ml_clean_spam</code> 清成 ham\n",
+            "<code>/ml_undo_clean_spam</code> 撤銷上一步\n",
+            "<code>/import</code> 匯入訓練列表\n",
+            "<code>/ml_export</code> 匯出訓練資料\n",
+            "\n<b>批量（限私訊）</b>\n",
+            "<code>/ml_start_mass_train_smart</code>\n",
+            "<code>/ml_start_mass_train_plain</code>\n",
+            "<code>/ml_finish_mass_train</code>\n",
+            "<code>/ml_start_mass_ham</code>\n",
+            "<code>/ml_finish_mass_ham</code>\n",
             "\n<b>維護</b>\n",
-            "<code>/ml_purge &lt;case_id&gt;</code>　依案例刪除誤樣本\n",
-            "<code>/ml_purge_text &lt;片段&gt;</code>　依文字刪除誤樣本\n",
-            "<code>/ml_dedupe</code>　合併重複樣本、移除空白樣本\n",
-            "<code>/ml_rebuild</code>　從資料庫重載模型\n",
-            "<code>/ml_retrain</code>　清空詞頻並依<b>目前</b>分詞規則重播全部樣本。分詞規則改變後要跑這個，<code>/ml_rebuild</code> 不會修正舊詞頻\n",
+            "<code>/ml_purge &lt;case_id&gt;</code> 刪誤樣本\n",
+            "<code>/ml_purge_text &lt;片段&gt;</code> 依文字刪\n",
+            "<code>/ml_dedupe</code> 合併重複、移除空白\n",
+            "<code>/ml_rebuild</code> 從資料庫重載\n",
+            "<code>/ml_retrain</code> 重算全部詞頻\n",
+            "· 分詞規則改變後要跑這個\n",
+            "· <code>/ml_rebuild</code> 不會修正舊詞頻\n",
         ).to_string(),
 
         "user" | "access" | "權限" => concat!(
-            "<b>━━━ 用戶與權限 ━━━</b>\n",
-            "<code>/whois &lt;user_id&gt;</code>（或回覆）　該用戶的完整紀錄：身分、歷史封禁次數、目前所有生效中的封禁、是否在跨群組黑名單、舉報被拒次數\n",
-            "<code>/unban</code>　維護組完整版：回覆／user_id／case_id 皆可。解封並移除對應誤訓練樣本、重建模型，若曾透過 Netban 同步也會一併解封\n",
-            "<code>/unmute</code>　同上，解除禁言並撤銷案例\n",
+            "<b>━━ 用戶與權限 ━━</b>\n",
+            "\n<b>查詢與解除</b>\n",
+            "<code>/whois &lt;user_id&gt;</code> 完整紀錄\n",
+            "· 身分、歷史封禁次數\n",
+            "· 目前所有生效中的封禁\n",
+            "· 跨群組黑名單、舉報被拒次數\n",
+            "<code>/unban</code> 維護組完整版\n",
+            "· 回覆／user_id／case_id 皆可\n",
+            "· 一併移除誤訓練樣本並重建模型\n",
+            "· 曾 Netban 同步的群組也會解封\n",
+            "<code>/unmute</code> 解除禁言並撤銷案例\n",
             "\n<b>項目層級封禁</b>\n",
-            "<code>/forbid &lt;user_id&gt; [原因]</code>（或回覆）　禁止該帳號使用本項目：任何指令不予回應，且無法把機器人加進任何群組\n",
-            "<code>/forgive &lt;id&gt;</code>　解除封禁。負數＝群組、正數＝用戶，自動判斷\n",
-            "<code>/list_banned</code>　列出所有被封禁的群組與用戶\n",
+            "<code>/forbid &lt;user_id&gt; [原因]</code>\n",
+            "· 該帳號所有指令不予回應\n",
+            "· 且無法把機器人加進任何群組\n",
+            "<code>/forgive &lt;id&gt;</code> 解除\n",
+            "· 負數＝群組，正數＝用戶\n",
+            "<code>/list_banned</code> 列出封禁名單\n",
             "\n<b>審核員</b>\n",
-            "<code>/reviewer add|del &lt;user_id&gt;</code>（或回覆）　授予／撤銷審核員\n",
-            "<code>/reviewer list</code>　列出目前審核員\n",
-            "　　※ 審核員可處理舉報頻道的受理／拒絕與訓練批准按鈕，沒有其他維護權限。維護組不需另外授予\n",
-            "<code>/report_reset &lt;user_id&gt;</code>　清除舉報被拒計數，恢復其 <code>/spam</code>（累計 3 次即暫停）\n",
+            "<code>/reviewer add|del &lt;user_id&gt;</code>\n",
+            "<code>/reviewer list</code>\n",
+            "· 只能處理舉報頻道的按鈕\n",
+            "· 維護組不需另外授予\n",
+            "<code>/report_reset &lt;user_id&gt;</code>\n",
+            "· 清除舉報被拒計數（滿 3 次暫停）\n",
         ).to_string(),
 
         "group" | "ops" | "群組" => concat!(
-            "<b>━━━ 群組與運維 ━━━</b>\n",
-            "<code>/setchat [chat_id]</code>　設定工作群組。設定後，該群串連頻道發文被自動釘選時會自動取消釘選\n",
-            "<code>/leave [chat_id] [原因]</code>　終止服務：發出終止通知、離開該群、並列入封禁名單。之後任何人再加回機器人都會自動退出\n",
-            "<code>/pol show</code>｜<code>/pol clear</code>　查詢／清除該用戶在本群的警告次數\n",
-            "<code>/ping</code>　確認在線，回報版本與 commit\n",
+            "<b>━━ 群組與運維 ━━</b>\n",
+            "\n<b>群組</b>\n",
+            "<code>/setchat [chat_id]</code> 設定工作群\n",
+            "· 會自動取消頻道發文的自動釘選\n",
+            "<code>/leave [chat_id] [原因]</code> 終止服務\n",
+            "· 發出終止通知並離開該群\n",
+            "· 列入封禁名單，加回會自動退出\n",
+            "<code>/pol show</code> 查詢本群警告次數\n",
+            "<code>/pol clear</code> 清除警告\n",
+            "<code>/ping</code> 版本與 commit\n",
             "\n<b>日誌與橋接</b>\n",
-            "<code>/set_audit_log [chat_id]</code>　設定維護操作日誌頻道。設定後每個改變狀態的維護指令都會記錄並附上 action id\n",
-            "<code>/revert &lt;action_id&gt;</code>　復原指定維護操作。封禁／禁言類會重用 <code>/unban</code>、<code>/unmute</code> 的邏輯；少數操作無法自動復原\n",
-            "<code>/set_exchange_channel &lt;chat_id&gt;</code>　設定 PM 申訴橋接頻道\n",
+            "<code>/set_audit_log [chat_id]</code>\n",
+            "· 記錄每個改變狀態的維護指令\n",
+            "<code>/revert &lt;action_id&gt;</code> 復原操作\n",
+            "· 少數操作無法自動復原\n",
+            "<code>/set_exchange_channel &lt;chat_id&gt;</code>\n",
+            "· PM 申訴橋接頻道\n",
             "\n<b>封禁代號說明</b>\n",
-            "<code>/updateBL</code>　重新發文並釘選\n",
-            "<code>/refreshBL</code>　就地編輯上一則，不重新發文／釘選\n",
+            "<code>/updateBL</code> 重新發文並釘選\n",
+            "<code>/refreshBL</code> 就地編輯上一則\n",
         ).to_string(),
 
         "rules" | "規則" => concat!(
-            "<b>━━━ 正則規則 ━━━</b>\n",
-            "<code>/add_rule &lt;regex&gt;</code>　新增，會再追問名稱\n",
-            "<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code>　只改正則，不改名稱\n",
-            "<code>/del_rule &lt;id&gt;</code>　刪除\n",
-            "<code>/list_rules</code>　列出目前規則\n",
-            "<code>/check_rules</code>　列出無法編譯的規則\n",
-            "　　※ 規則命中即視為 spam（分數 1.0），會進入跨群組黑名單\n",
+            "<b>━━ 正則規則 ━━</b>\n",
+            "<code>/add_rule &lt;regex&gt;</code> 新增\n",
+            "· 會再追問規則名稱\n",
+            "<code>/edit_rule &lt;id&gt; &lt;regex&gt;</code> 改正則\n",
+            "<code>/del_rule &lt;id&gt;</code> 刪除\n",
+            "<code>/list_rules</code> 列出目前規則\n",
+            "<code>/check_rules</code> 列出無法編譯的\n",
+            "\n· 規則命中即視為 spam（分數 1.0）\n",
+            "· 會進入跨群組黑名單\n",
         ).to_string(),
 
         _ => concat!(
             "<b>❖ 維護指令</b>\n",
-            "輸入 <code>/help_op &lt;分類&gt;</code> 查看該分類的完整說明。\n",
-            "\n<b>━━━ 分類 ━━━</b>\n",
-            "<code>/help_op ml</code>　模型、訓練、評估、批量\n",
-            "<code>/help_op user</code>　解封、項目層級封禁、審核員\n",
-            "<code>/help_op group</code>　群組、日誌、橋接、封禁代號\n",
-            "<code>/help_op rules</code>　正則規則\n",
-            "\n<b>━━━ 最常用 ━━━</b>\n",
-            "<code>/whois &lt;user_id&gt;</code>　一次看完某人的所有紀錄\n",
-            "<code>/unban</code>　解封並清除誤訓練樣本\n",
-            "<code>/ml_eval</code>　評估模型，決定門檻\n",
-            "<code>/ml_stats</code>　樣本量與有效門檻\n",
-            "<code>/case &lt;ID&gt;</code>　查詢單一案例\n",
-            "<code>/revert &lt;action_id&gt;</code>　復原維護操作\n",
-            "\n<b>━━━ 備註 ━━━</b>\n",
-            "· 這裡只列維護者指令，普通 <code>/help</code> 不會顯示。\n",
-            "· 群組管理員指令（<code>/sb</code>、<code>/module</code> 等）見 <code>/help</code>。\n",
-            "· 審核員只能處理舉報頻道的按鈕，其餘維護指令仍需維護組權限。\n",
+            "<code>/help_op &lt;分類&gt;</code> 查看完整說明\n",
+            "\n<b>━━ 分類 ━━</b>\n",
+            "<code>/help_op ml</code> 模型與訓練\n",
+            "<code>/help_op user</code> 用戶與權限\n",
+            "<code>/help_op group</code> 群組與運維\n",
+            "<code>/help_op rules</code> 正則規則\n",
+            "\n<b>━━ 最常用 ━━</b>\n",
+            "<code>/whois &lt;user_id&gt;</code> 某人的所有紀錄\n",
+            "<code>/unban</code> 解封並清除誤樣本\n",
+            "<code>/ml_eval</code> 評估模型、決定門檻\n",
+            "<code>/ml_stats</code> 樣本量與門檻\n",
+            "<code>/case &lt;ID&gt;</code> 查詢單一案例\n",
+            "<code>/revert &lt;action_id&gt;</code> 復原操作\n",
+            "\n<b>━━ 備註 ━━</b>\n",
+            "· 這裡只列維護者指令\n",
+            "· 群組管理員指令見 <code>/help</code>\n",
+            "· 審核員僅能處理舉報頻道按鈕\n",
         ).to_string(),
     }
 }
@@ -8359,6 +8401,50 @@ mod tests {
         }
     }
 
+    // The first version of this rewrite looked fine in source and wrapped
+    // badly on a phone: `<code>` renders monospace, monospace CJK is wide,
+    // and ideographic spaces used as pseudo-columns don't align - a wrapped
+    // line also loses its indent. Observed wrap point was ~43 columns, so
+    // list lines are held well under that. Prose paragraphs are exempt:
+    // they wrap at word boundaries and read correctly.
+    #[test]
+    fn help_list_lines_are_narrow_enough_for_a_phone() {
+        const MAX_COLUMNS: usize = 38;
+        let strip = |t: &str| {
+            let (mut out, mut in_tag) = (String::new(), false);
+            for c in t.chars() {
+                match c {
+                    '<' => in_tag = true,
+                    '>' => in_tag = false,
+                    _ if !in_tag => out.push(c),
+                    _ => {}
+                }
+            }
+            out.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+        };
+        // CJK glyphs occupy two columns.
+        let width = |l: &str| -> usize { l.chars().map(|c| if (c as u32) > 0x2E80 { 2 } else { 1 }).sum() };
+
+        for (name, text) in [
+            ("/help", help_text()),
+            ("/help_op", help_op_text("")),
+            ("/help_op ml", help_op_text("ml")),
+            ("/help_op user", help_op_text("user")),
+            ("/help_op group", help_op_text("group")),
+            ("/help_op rules", help_op_text("rules")),
+        ] {
+            let plain = strip(&text);
+            assert!(!plain.contains('\u{3000}'), "{name} uses an ideographic space as a column separator");
+            for line in plain.lines() {
+                // A command/bullet line must not wrap. Prose is allowed to.
+                let is_list_line = line.starts_with('/') || line.starts_with('·');
+                if is_list_line {
+                    assert!(width(line) <= MAX_COLUMNS, "{name}: line is {} columns, will wrap: {line}", width(line));
+                }
+            }
+        }
+    }
+
     // The public help must not advertise the maintainer-gated module, and
     // must still cover the ones groups are expected to turn on themselves.
     #[test]
@@ -9022,6 +9108,7 @@ mod tests {
         assert_eq!(reply.from.as_ref().unwrap().id.0, 999);
     }
 }
+
 
 
 
