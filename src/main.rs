@@ -4000,10 +4000,21 @@ async fn check_captcha_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Mess
         // Clean up the question itself, not just the answer - it was still
         // sitting in the chat with nothing telling anyone it got resolved.
         let _ = bot.delete_message(message.chat.id, challenge_message_id).await;
-        let _ = bot
+        if let Ok(sent) = bot
             .send_message(message.chat.id, format!("✅ {} 驗證通過，歡迎！", escape_html(&short_user(user))))
             .parse_mode(ParseMode::Html)
-            .await;
+            .await
+        {
+            // Clear the welcome after 30s, same self-delete pattern as
+            // notify_group - it's a transient confirmation, not chat history.
+            let bot = bot.clone();
+            let chat_id = message.chat.id;
+            let sent_id = sent.id;
+            tokio::spawn(async move {
+                sleep(Duration::from_secs(30)).await;
+                let _ = bot.delete_message(chat_id, sent_id).await;
+            });
+        }
     } else {
         // Wrong guess: delete it and let them try again until the timeout.
         let _ = bot.delete_message(message.chat.id, message.id).await;
