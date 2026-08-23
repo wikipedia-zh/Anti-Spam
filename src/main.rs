@@ -2158,6 +2158,18 @@ impl Runtime {
         .await
     }
 
+    async fn spam_rule_pattern_exists(&self, pattern: &str) -> bool {
+        let pattern = pattern.to_string();
+        self.with_conn(move |conn| {
+            Ok(conn
+                .query_row("SELECT COUNT(*) FROM spam_rules WHERE pattern = ?1", params![pattern], |row| row.get::<_, i64>(0))
+                .unwrap_or(0)
+                > 0)
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     async fn add_spam_rule(&self, pattern: &str, description: &str) -> Result<i64> {
         FancyRegex::new(pattern).context("invalid regex pattern")?;
         let pattern = pattern.to_string();
@@ -3720,6 +3732,46 @@ fn module_flag(settings: &GroupModuleSettings, key: &str) -> Option<bool> {
 /// run after an `@` ends at the first character outside that set - which
 /// leaves CJK text, emoji, and punctuation in the remainder, exactly the
 /// content that should disqualify a message from looking like a bare summon.
+/// If `text` is nothing but one or more bot @-mentions (ignoring emoji,
+/// whitespace and punctuation), returns the bot usernames, lowercased and
+/// without the @. This is the shape of guest-mode summon spam: a bare
+/// "@somebot", or "@a_bot @b_bot 🎉". Returns None the moment there is any
+/// real word content, or a mention that isn't a bot (Telegram bot
+/// usernames end in "bot").
+fn bot_mentions_only(text: &str) -> Option<Vec<String>> {
+    let mut bots = Vec::new();
+    let mut leftover = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '@' {
+            let mut name = String::new();
+            while chars.peek().is_some_and(|n| n.is_ascii_alphanumeric() || *n == '_') {
+                name.push(chars.next().unwrap());
+            }
+            if name.is_empty() {
+                leftover.push('@');
+            } else {
+                bots.push(name.to_lowercase());
+            }
+        } else {
+            leftover.push(c);
+        }
+    }
+    if bots.is_empty() {
+        return None;
+    }
+    if !bots.iter().all(|b| b.ends_with("bot")) {
+        return None;
+    }
+    // Any letter or digit left over (CJK included) means real text, not a
+    // bare summon. Emoji and punctuation are fine.
+    if leftover.chars().any(|c| c.is_alphanumeric()) {
+        return None;
+    }
+    let mut seen = std::collections::HashSet::new();
+    Some(bots.into_iter().filter(|b| seen.insert(b.clone())).collect())
+}
+
 fn strip_mentions(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -3805,7 +3857,7 @@ fn global_whitelist_check_text() -> String {
 }
 
 fn build_blacklist_reason_text(_runtime: &Runtime) -> String {
-    "<b>❖ 封禁代號說明</b>\n\n- <code>NLDIGIT</code>: 英名含數字\n- <code>NL13</code>: 英名多段且總長度 >= 13\n- <code>NLTAIL</code>: 英名多段且尾段過長\n- <code>NLSINGLE</code>: 英名單段且長度 >= 11\n- <code>ARABIC</code>: 偵測到清真\n- <code>REGEX</code>: 觸發正則規則\n- <code>FLOOD</code>: 洗版偵測（5 秒內傳送 5 條以上訊息）\n- <code>PERM_REPEAT</code>: 24 小時內重複嘗試使用無權限的指令\n- <code>GUEST_MODE</code>: 訪客模式機器人（未加入本群卻發文）\n- <code>GUEST_MODE_INVOKER</code>: 召喚訪客模式機器人的人\n- <code>CONTACT</code>: 在群組分享聯絡人\n- <code>VOICE</code>: 傳送語音訊息\n- <code>EXEC_FILE</code>: 傳送可執行檔案\n\n申訴找 @SEELE_01_BOT".to_string()
+    "<b>❖ 封禁代號說明</b>\n\n- <code>NLDIGIT</code>: 英名含數字\n- <code>NL13</code>: 英名多段且總長度 >= 13\n- <code>NLTAIL</code>: 英名多段且尾段過長\n- <code>NLSINGLE</code>: 英名單段且長度 >= 11\n- <code>ARABIC</code>: 偵測到清真\n- <code>REGEX</code>: 觸發正則規則\n- <code>FLOOD</code>: 洗版偵測（5 秒內傳送 5 條以上訊息）\n- <code>PERM_REPEAT</code>: 24 小時內重複嘗試使用無權限的指令\n- <code>GUEST_MODE</code>: 訪客模式機器人（未加入本群卻發文）\n- <code>GUEST_MODE_INVOKER</code>: 召喚訪客模式機器人的人\n- <code>CONTACT</code>: 在群組分享聯絡人\n- <code>VOICE</code>: 傳送語音訊息\n- <code>EXEC_FILE</code>: 傳送可執行檔案\n- <code>ML</code>: 機器學習模型判定為垃圾訊息\n- <code>BOTSPAM</code>: 純機器人提及（訪客模式召喚廣告）\n\n申訴找 @SEELE_01_BOT".to_string()
 }
 
 fn format_case_lookup(case: &CaseRecord, link: &str, reason_link: &str) -> String {
@@ -4294,7 +4346,7 @@ async fn delete_message_if_exists(bot: &Bot, chat_id: ChatId, message_id: Messag
 async fn notify_group(bot: &Bot, runtime: &Runtime, case: &CaseRecord, log_message_id: i32, header: &str) -> Result<()> {
     let link = public_log_link(&runtime.config, log_message_id);
     let reason_link = runtime.blacklist_reason_link().await.unwrap_or_else(|| link.clone());
-    let reason = case.matched_rule_pattern.as_deref().unwrap_or("N");
+    let reason = case.matched_rule_pattern.as_deref().unwrap_or("-");
     let text = format!(
         "{header}\n\n<b>操作</b>: {}\n<b>對象</b>: <code>{}</code>\n<b>原因</b>: {}\n<b>證據</b>: <a href=\"{}\">查看日誌</a>\n<b>案例</b>: <code>{}</code>",
         chinese_case_action(case),
@@ -5951,6 +6003,17 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 ModerationCommand::Kick => ActionKind::Kick,
                 _ => unreachable!(),
             };
+            // A /sb on a message that is nothing but bot @-mentions is
+            // guest-mode summon spam. Storing that as an ML sample would just
+            // teach the model a username token; a regex rule catches the bot
+            // handle deterministically instead. Detected here so the case
+            // reason reflects it.
+            let bot_spam = if matches!(action, ActionKind::SpamBan) {
+                bot_mentions_only(&evidence_text)
+            } else {
+                None
+            };
+
             let case_id = Uuid::new_v4().to_string();
             let mut case = CaseRecord {
                 id: case_id.clone(),
@@ -5964,7 +6027,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 evidence_text: evidence_text.clone(),
                 model_score: None,
                 matched_rule_id: None,
-                matched_rule_pattern: None,
+                matched_rule_pattern: bot_spam.as_ref().map(|_| "BOTSPAM".to_string()),
                 status: "done".to_string(),
                 log_message_id: None,
                 created_at: Utc::now(),
@@ -5997,7 +6060,41 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             if action == ActionKind::SpamBan {
                 propagate_network_ban(&bot, &runtime, &case).await;
                 broadcast_ban_status(&bot, &runtime, case.target_user_id, true).await;
-                queue_training_review(&bot, &runtime, &case).await;
+                if let Some(bots) = &bot_spam {
+                    // Turn each mentioned bot into a regex rule so the handle
+                    // is caught anywhere it appears next. Skip duplicates.
+                    let mut created = Vec::new();
+                    for b in bots {
+                        let pattern = format!("(?i)@{b}\\b");
+                        if runtime.spam_rule_pattern_exists(&pattern).await {
+                            continue;
+                        }
+                        if let Ok(id) = runtime
+                            .add_spam_rule(&pattern, &format!("純機器人提及 spam：@{b}（/sb 自動建立）"))
+                            .await
+                        {
+                            created.push((id, b.clone()));
+                        }
+                    }
+                    if !created.is_empty() {
+                        let list = created
+                            .iter()
+                            .map(|(id, b)| format!("@{b}（規則 #{id}）"))
+                            .collect::<Vec<_>>()
+                            .join("、");
+                        let _ = bot
+                            .send_message(
+                                ChatId(runtime.config.log_channel_id),
+                                format!("<b>已自動建立機器人提及規則</b>\n來源：群組 <code>{}</code> 的 /sb\n{list}\n如為誤判請用 /del_rule 移除。", message.chat.id.0),
+                            )
+                            .parse_mode(ParseMode::Html)
+                            .await;
+                    }
+                    // Deliberately no training-review queue: a bare username
+                    // is not useful ML signal, the rule does the work.
+                } else {
+                    queue_training_review(&bot, &runtime, &case).await;
+                }
             }
 
             // Reuses the case's own case_id as the revert handle - no new ID
@@ -7519,7 +7616,7 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
         evidence_text: text.to_string(),
         model_score: Some(score),
         matched_rule_id: None,
-        matched_rule_pattern: None,
+        matched_rule_pattern: Some("ML".to_string()),
         status: "auto_banned".to_string(),
         log_message_id: None,
         created_at: Utc::now(),
@@ -8715,6 +8812,30 @@ mod tests {
         assert_eq!(runtime.take_report_confirmation("case-x").await, Some((-100, 42)));
         // Consumed on read - a second decision finds nothing to edit.
         assert!(runtime.take_report_confirmation("case-x").await.is_none());
+    }
+
+    // A /sb on a pure bot-mention message becomes a regex rule, not an ML
+    // sample. The detection has to accept the real summon shapes (bare
+    // handle, several handles, a trailing emoji) and reject anything with
+    // real words or a non-bot mention.
+    #[test]
+    fn bot_mentions_only_matches_summons_and_rejects_conversation() {
+        assert_eq!(bot_mentions_only("@iurfdervfbot"), Some(vec!["iurfdervfbot".to_string()]));
+        assert_eq!(
+            bot_mentions_only("@a_bot @b_bot 🎉"),
+            Some(vec!["a_bot".to_string(), "b_bot".to_string()])
+        );
+        // Case-insensitive and de-duplicated.
+        assert_eq!(bot_mentions_only("@SpamBot @spambot"), Some(vec!["spambot".to_string()]));
+
+        // Real text alongside the mention -> not a bare summon.
+        assert_eq!(bot_mentions_only("try @iurfdervfbot now"), None);
+        assert_eq!(bot_mentions_only("看看 @somebot 這個"), None);
+        // A mention that isn't a bot.
+        assert_eq!(bot_mentions_only("@realuser"), None);
+        // No mention at all.
+        assert_eq!(bot_mentions_only("hello"), None);
+        assert_eq!(bot_mentions_only("🎉🎉"), None);
     }
 
     // The host is a source constant, so its authority must hold with an
