@@ -3772,6 +3772,46 @@ fn bot_mentions_only(text: &str) -> Option<Vec<String>> {
     Some(bots.into_iter().filter(|b| seen.insert(b.clone())).collect())
 }
 
+/// Turns a pure bot-mention message into regex rules - one per handle - so
+/// the bot is caught deterministically wherever it appears next. Shared by
+/// the manual /sb path and the auto-ban path (a member pasting bot handles
+/// as an advert scores as spam and lands here too, not just guest-mode
+/// summons). Logs each created rule to the log channel for review. Returns
+/// true if `evidence` was a pure bot mention at all (whether or not new
+/// rules were created), so the caller can label the case BOTSPAM and skip
+/// ML training on a bare username.
+async fn capture_bot_spam_rules(bot: &Bot, runtime: &Runtime, chat_id: i64, evidence: &str) -> bool {
+    let Some(bots) = bot_mentions_only(evidence) else { return false; };
+    let mut created = Vec::new();
+    for b in &bots {
+        let pattern = format!("(?i)@{b}\\b");
+        if runtime.spam_rule_pattern_exists(&pattern).await {
+            continue;
+        }
+        if let Ok(id) = runtime
+            .add_spam_rule(&pattern, &format!("純機器人提及 spam：@{b}（自動建立）"))
+            .await
+        {
+            created.push((id, b.clone()));
+        }
+    }
+    if !created.is_empty() {
+        let list = created
+            .iter()
+            .map(|(id, b)| format!("@{b}（規則 #{id}）"))
+            .collect::<Vec<_>>()
+            .join("、");
+        let _ = bot
+            .send_message(
+                ChatId(runtime.config.log_channel_id),
+                format!("<b>已自動建立機器人提及規則</b>\n來源：群組 <code>{chat_id}</code>\n{list}\n如為誤判請用 /del_rule 移除。"),
+            )
+            .parse_mode(ParseMode::Html)
+            .await;
+    }
+    true
+}
+
 fn strip_mentions(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -6060,38 +6100,10 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             if action == ActionKind::SpamBan {
                 propagate_network_ban(&bot, &runtime, &case).await;
                 broadcast_ban_status(&bot, &runtime, case.target_user_id, true).await;
-                if let Some(bots) = &bot_spam {
-                    // Turn each mentioned bot into a regex rule so the handle
-                    // is caught anywhere it appears next. Skip duplicates.
-                    let mut created = Vec::new();
-                    for b in bots {
-                        let pattern = format!("(?i)@{b}\\b");
-                        if runtime.spam_rule_pattern_exists(&pattern).await {
-                            continue;
-                        }
-                        if let Ok(id) = runtime
-                            .add_spam_rule(&pattern, &format!("純機器人提及 spam：@{b}（/sb 自動建立）"))
-                            .await
-                        {
-                            created.push((id, b.clone()));
-                        }
-                    }
-                    if !created.is_empty() {
-                        let list = created
-                            .iter()
-                            .map(|(id, b)| format!("@{b}（規則 #{id}）"))
-                            .collect::<Vec<_>>()
-                            .join("、");
-                        let _ = bot
-                            .send_message(
-                                ChatId(runtime.config.log_channel_id),
-                                format!("<b>已自動建立機器人提及規則</b>\n來源：群組 <code>{}</code> 的 /sb\n{list}\n如為誤判請用 /del_rule 移除。", message.chat.id.0),
-                            )
-                            .parse_mode(ParseMode::Html)
-                            .await;
-                    }
-                    // Deliberately no training-review queue: a bare username
-                    // is not useful ML signal, the rule does the work.
+                if bot_spam.is_some() {
+                    // A bare username is not useful ML signal; the rule does
+                    // the work, so skip the training-review queue.
+                    capture_bot_spam_rules(&bot, &runtime, message.chat.id.0, &evidence_text).await;
                 } else {
                     queue_training_review(&bot, &runtime, &case).await;
                 }
@@ -7610,6 +7622,11 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
         return Ok(());
     }
 
+    // A pure bot-mention message that scores as spam is bot-advert spam,
+    // not just any ML hit - label it BOTSPAM and turn the handle into a
+    // regex rule below, same as a manual /sb would.
+    let is_bot_spam = bot_mentions_only(&text).is_some();
+
     let case_id = Uuid::new_v4().to_string();
     let mut case = CaseRecord {
         id: case_id,
@@ -7623,7 +7640,7 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
         evidence_text: text.to_string(),
         model_score: Some(score),
         matched_rule_id: None,
-        matched_rule_pattern: Some("ML".to_string()),
+        matched_rule_pattern: Some(if is_bot_spam { "BOTSPAM" } else { "ML" }.to_string()),
         status: "auto_banned".to_string(),
         log_message_id: None,
         created_at: Utc::now(),
@@ -7637,6 +7654,9 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
     notify_group(&bot, &runtime, &case, log_message_id, "<b>自動機器學習封禁</b>").await.ok();
     propagate_network_ban(&bot, &runtime, &case).await;
     broadcast_ban_status(&bot, &runtime, case.target_user_id, true).await;
+    if is_bot_spam {
+        capture_bot_spam_rules(&bot, &runtime, message.chat.id.0, &text).await;
+    }
     Ok(())
 }
 
