@@ -6553,6 +6553,13 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 Ok(_) => {
                     bot.send_message(message.chat.id, format!("已就地更新，沒有重新發文/釘選：<code>{}</code>", existing_id)).parse_mode(ParseMode::Html).await?;
                 }
+                Err(err) if err.to_string().contains("message is not modified") => {
+                    // Telegram only returns this when the content is already
+                    // byte-identical, i.e. the pinned message is up to date.
+                    // That's success, not failure - don't push people to
+                    // /updateBL and re-post a duplicate.
+                    bot.send_message(message.chat.id, "封禁代號說明已是最新，無需變更。").await?;
+                }
                 Err(err) => {
                     bot.send_message(message.chat.id, format!("編輯失敗（訊息可能已被刪除），改用 /updateBL：{err}")).await?;
                 }
