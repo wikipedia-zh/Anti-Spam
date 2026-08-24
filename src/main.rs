@@ -3512,7 +3512,7 @@ fn help_text() -> String {
         "· NoHalal 清真內容檢查\n",
         "· NoSM 自動刪除服務訊息\n",
         "· Captcha 入群驗證\n",
-        "· Netban 跨群黑名單同步\n",
+        "· Netban 訂閱專案黑名單\n",
         "· CmdClean 指令濫用防護\n",
         "· NoContact 禁止分享聯絡人\n",
         "· NoVoice 禁止語音訊息\n",
@@ -4634,7 +4634,14 @@ async fn broadcast_unban_if_fully_clear(bot: &Bot, runtime: &Runtime, user_id: i
 ///
 /// Note the origin group's netban setting plays no part: it governs what a
 /// group *receives*, never what it can impose on everyone else.
-fn netban_eligible(action: &ActionKind, model_score: Option<f64>, global_threshold: f64) -> bool {
+fn netban_eligible(action: &ActionKind, model_score: Option<f64>, global_threshold: f64, reason: Option<&str>) -> bool {
+    // Pure bot-mention spam qualifies however it was caught, including a
+    // manual /sb - a bare bot handle is an unambiguous spam-bot advert, and
+    // the same /sb also creates a regex rule, so the account belongs on the
+    // shared blacklist too.
+    if reason == Some("BOTSPAM") {
+        return true;
+    }
     match action {
         ActionKind::ReportApproved | ActionKind::GuestBotBan | ActionKind::GuestInvokerBan => true,
         ActionKind::AutoBan => model_score.is_some_and(|score| score >= global_threshold),
@@ -4691,9 +4698,19 @@ async fn queue_training_review(bot: &Bot, runtime: &Runtime, case: &CaseRecord) 
 /// else. See `netban_eligible` for which actions qualify at all.
 async fn propagate_network_ban(bot: &Bot, runtime: &Runtime, case: &CaseRecord) {
     let global = runtime.current_threshold().await.unwrap_or(runtime.config.spam_threshold);
-    if !netban_eligible(&case.action, case.model_score, global) {
+    if !netban_eligible(&case.action, case.model_score, global, case.matched_rule_pattern.as_deref()) {
         return;
     }
+    commit_network_ban(bot, runtime, case).await;
+}
+
+/// Adds a case to the shared blacklist and bans its target in every
+/// subscribed (netban-enabled) group. Eligibility is the caller's call -
+/// `propagate_network_ban` gates on `netban_eligible`, while a reviewer
+/// approving a /sb promotes that ban here directly (one admin's /sb stays
+/// local; a reviewer approving it is the second gate that makes it
+/// project-wide).
+async fn commit_network_ban(bot: &Bot, runtime: &Runtime, case: &CaseRecord) {
     if runtime.is_global_whitelisted(case.target_user_id).await.unwrap_or(false) {
         return;
     }
@@ -7437,7 +7454,11 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
                     bot.answer_callback_query(q.id).text("訓練失敗").await?;
                     return Ok(());
                 }
-                ("已批准並寫入模型", "已批准訓練")
+                // A reviewer approving a /sb is the second gate that promotes
+                // it from a local ban to the shared blacklist.
+                commit_network_ban(&bot, &runtime, &case).await;
+                broadcast_ban_status(&bot, &runtime, case.target_user_id, true).await;
+                ("已批准並寫入模型，且已加入專案黑名單", "已批准並加入黑名單")
             }
             "reject" => ("已拒絕，未寫入模型（封禁不受影響）", "已拒絕訓練"),
             _ => return Ok(()),
@@ -9035,13 +9056,13 @@ mod tests {
 
         // A group with a 0.01 override would ban on this locally; it must
         // not reach the shared blacklist.
-        assert!(!netban_eligible(&ActionKind::AutoBan, Some(0.10), global));
-        assert!(!netban_eligible(&ActionKind::AutoBan, Some(0.84), global));
+        assert!(!netban_eligible(&ActionKind::AutoBan, Some(0.10), global, None));
+        assert!(!netban_eligible(&ActionKind::AutoBan, Some(0.84), global, None));
 
         // Clears the project bar. Regex rule matches score 1.0, so
         // maintainer-managed rules land here too.
-        assert!(netban_eligible(&ActionKind::AutoBan, Some(0.85), global));
-        assert!(netban_eligible(&ActionKind::AutoBan, Some(1.0), global));
+        assert!(netban_eligible(&ActionKind::AutoBan, Some(0.85), global, None));
+        assert!(netban_eligible(&ActionKind::AutoBan, Some(1.0), global, None));
     }
 
     // The project/group dividing line: one group admin, or one group's house
@@ -9053,23 +9074,30 @@ mod tests {
 
         // A group admin's /sb is a call about their own room. Route it
         // through /spam if it deserves to be project-wide.
-        assert!(!netban_eligible(&ActionKind::SpamBan, None, global));
-        assert!(!netban_eligible(&ActionKind::SpamBan, Some(0.99), global));
+        assert!(!netban_eligible(&ActionKind::SpamBan, None, global, None));
+        assert!(!netban_eligible(&ActionKind::SpamBan, Some(0.99), global, None));
 
         // NoHalal / NoLongName are unscored per-group policy opt-ins, not
         // spam findings - they arrive as AutoBan with no score.
-        assert!(!netban_eligible(&ActionKind::AutoBan, None, global));
+        assert!(!netban_eligible(&ActionKind::AutoBan, None, global, None));
 
         // Not bans at all.
-        assert!(!netban_eligible(&ActionKind::Mute, None, global));
-        assert!(!netban_eligible(&ActionKind::Kick, None, global));
-        assert!(!netban_eligible(&ActionKind::FloodMute, None, global));
+        assert!(!netban_eligible(&ActionKind::Mute, None, global, None));
+        assert!(!netban_eligible(&ActionKind::Kick, None, global, None));
+        assert!(!netban_eligible(&ActionKind::FloodMute, None, global, None));
 
         // Project-level determinations still qualify: a maintainer pressed
         // approve, or it's guest-mode abuse (inherently cross-group).
-        assert!(netban_eligible(&ActionKind::ReportApproved, None, global));
-        assert!(netban_eligible(&ActionKind::GuestBotBan, None, global));
-        assert!(netban_eligible(&ActionKind::GuestInvokerBan, None, global));
+        assert!(netban_eligible(&ActionKind::ReportApproved, None, global, None));
+        assert!(netban_eligible(&ActionKind::GuestBotBan, None, global, None));
+        assert!(netban_eligible(&ActionKind::GuestInvokerBan, None, global, None));
+
+        // BOTSPAM goes on the blacklist however it was caught - a manual /sb
+        // (SpamBan) included, which is otherwise never eligible.
+        assert!(netban_eligible(&ActionKind::SpamBan, None, global, Some("BOTSPAM")));
+        assert!(netban_eligible(&ActionKind::AutoBan, Some(0.10), global, Some("BOTSPAM")));
+        // A plain /sb with no BOTSPAM reason stays local.
+        assert!(!netban_eligible(&ActionKind::SpamBan, None, global, Some("ML")));
     }
 
     // The flag must survive a re-persist: log_message_id backfills and status
