@@ -7907,6 +7907,13 @@ async fn handle_exchange_post(bot: Bot, runtime: Arc<Runtime>, post: Message) ->
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // teloxide logs getUpdates failures, network retries and dispatcher
+    // errors through the `log` crate. Without a backend those vanish - which
+    // is why a stalled poller once went dark with no trace in kubectl logs.
+    // Default to info so those diagnostics show; RUST_LOG can override.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    log::info!("spb starting: {}", version_info_text().replace('\n', " "));
+
     let config = Config::from_env()?;
     let bot = Bot::new(config.bot_token.clone());
     let runtime = Arc::new(Runtime::load(config).await?);
@@ -7916,6 +7923,33 @@ async fn main() -> Result<()> {
         // shouldn't block (or fail) startup if the DM can't be delivered -
         // e.g. the owner never having started a chat with the bot.
         let _ = bot.send_message(ChatId(owner_id), version_info_text()).parse_mode(ParseMode::Html).await;
+    }
+
+    // Liveness heartbeat. Every 30s, confirm the Telegram connection is
+    // actually alive (get_me) and stamp a file next to the database. The
+    // job's health check restarts the pod if this stops updating, so a
+    // dead-but-Running poller no longer sits silently until someone notices.
+    {
+        let bot = bot.clone();
+        let hb_path = runtime
+            .config
+            .sqlite_path
+            .parent()
+            .map(|p| p.join("spb.heartbeat"))
+            .unwrap_or_else(|| PathBuf::from("spb.heartbeat"));
+        tokio::spawn(async move {
+            loop {
+                match bot.get_me().await {
+                    Ok(_) => {
+                        if let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                            let _ = tokio::fs::write(&hb_path, dur.as_secs().to_string()).await;
+                        }
+                    }
+                    Err(err) => log::warn!("heartbeat get_me failed: {err}"),
+                }
+                sleep(Duration::from_secs(30)).await;
+            }
+        });
     }
 
     let message_handler = Update::filter_message().endpoint({
