@@ -121,12 +121,8 @@ Set the following environment variables before running:
 
 ## License / 授權
 
-Licensed under the **GNU Affero General Public License v3.0 or later** (AGPL-3.0-or-later). See [LICENSE](LICENSE).
+**Source-available, not open source. All rights reserved.** See [LICENSE](LICENSE).
 
-Because this is network server software, if you run a **modified** version and let users interact with it over Telegram, AGPL section 13 requires you to publish your modified source to those users.
+The source is published for transparency/audit and because Toolforge requires hosted tools' source to be public. No license is granted: no one may use, modify, run, deploy, or host this software except the copyright holder and those they authorize. The name "Spam Protection Bot" / "SPB" and its branding are reserved.
 
-The names *Spam Protection Bot* / *SPB*, the project's Telegram usernames and channels, and its branding are **not** covered by the license and remain the author's. A fork must use a different name. See [NOTICE](NOTICE).
-
-本專案採用 **GNU Affero 通用公共授權條款第 3 版或更新版本**（AGPL-3.0-or-later），詳見 [LICENSE](LICENSE)。這是網路伺服器軟體，若你運行**修改後**的版本並讓使用者透過 Telegram 與其互動，AGPL 第 13 條要求你向這些使用者公開你修改後的原始碼。
-
-「Spam Protection Bot」/「SPB」名稱、相關 Telegram 使用者名稱、頻道與品牌識別不在授權範圍內，仍屬作者所有；衍生版本須改用不同名稱，詳見 [NOTICE](NOTICE)。
+**原始碼公開，但非開源，保留一切權利。** 詳見 [LICENSE](LICENSE)。原始碼公開僅為透明與稽核之用，並因 Toolforge 規定託管工具須公開原始碼。本專案不授予任何使用授權：除著作權人及其書面授權者外，任何人不得使用、修改、執行、部署或託管本軟體。「Spam Protection Bot」/「SPB」名稱與品牌識別保留一切權利。

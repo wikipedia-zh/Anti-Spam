@@ -7,7 +7,7 @@ description: "Spam Protection Bot（SPB）使用規範"
 # Spam Protection Bot — 使用規範 / Terms of Use
 
 **生效日期 / Effective date:** 2026-08-15
-**最後更新 / Last updated:** 2026-08-15
+**最後更新 / Last updated:** 2026-08-25
 
 本文件同時提供繁體中文與英文版本。若兩者有歧義，以繁體中文版為準。
 This document is provided in Traditional Chinese and English. In case of ambiguity, the Traditional Chinese version prevails.
@@ -65,15 +65,18 @@ Spam Protection Bot（下稱「SPB」或「本機器人」）是一個由志願�
 
 對封禁有異議者，請透過 [@SEELE_01_BOT](https://t.me/SEELE_01_BOT) 提出申訴。此為唯一受理管道，透過其他方式提出的申訴不予處理。
 
-### 8. 服務終止
+### 8. 服務終止與拒絕服務
 
-本項目保留在下列情況下，對特定群組或帳號終止服務的權利：
+本服務由專案擁有者自願提供，並無提供義務。**專案擁有者保留隨時、依其單方且完全的裁量權（sole and absolute discretion），拒絕或終止對任何使用者或群組提供服務的權利，無論是否給予理由。**
+
+在下列情況下（但不限於此），可能終止或拒絕服務：
 
 - 違反本規範；
+- 基於信任與安全（trust and safety）之考量——包括但不限於濫用、規避封禁、危害其他使用者或公眾、或任何專案擁有者認為構成風險的行為；
 - 經評估認為繼續提供服務將損害本項目、其他使用者或公眾利益；
 - 基於資源管理或服務完整性之考量。
 
-服務終止後，該群組不得再使用本項目的任何功能。相關紀錄將被保留。本項目保留在必要時公開更多資訊的權利。
+**基於信任與安全所作的封禁或拒絕服務，專案擁有者沒有義務提供公開說明或理由，亦沒有義務事先通知。** 相關內部紀錄將被保留。專案擁有者保留在必要時公開更多資訊的權利，但無提供之義務。此類決定為最終決定；唯一的申訴管道為 [@SEELE_01_BOT](https://t.me/SEELE_01_BOT)，且是否受理由專案擁有者裁量。
 
 ### 9. 免責聲明
 
@@ -136,15 +139,18 @@ You must not:
 
 If you disagree with a ban, appeal through [@SEELE_01_BOT](https://t.me/SEELE_01_BOT). This is the only channel through which appeals are accepted; appeals submitted by other means will not be processed.
 
-### 8. Termination of service
+### 8. Termination and refusal of service
 
-The project reserves the right to terminate service to a group or account where:
+This service is provided voluntarily by the project owner, who is under no obligation to provide it. **The project owner reserves the right, at any time and at their sole and absolute discretion, to refuse or terminate service to any user or group, with or without reason.**
+
+Service may be terminated or refused where (without limitation):
 
 - these terms have been breached;
-- continuing to provide service is judged to be harmful to the project, other users, or the public interest;
+- for trust-and-safety reasons — including but not limited to abuse, ban evasion, harm to other users or the public, or any conduct the owner considers a risk;
+- continuing to provide service is judged harmful to the project, other users, or the public interest;
 - termination is warranted by resource management or service integrity considerations.
 
-Once service is terminated, the group may no longer use any of the project's features. Records are retained. The project reserves the right to disclose further information where necessary.
+**For bans or refusals of service made on trust-and-safety grounds, the project owner is under no obligation to provide any public explanation or reason, and no obligation to give prior notice.** Internal records are retained. The owner reserves the right, but is not obliged, to disclose further information. Such decisions are final; the only appeal channel is [@SEELE_01_BOT](https://t.me/SEELE_01_BOT), and whether an appeal is considered is at the owner's discretion.
 
 ### 9. Disclaimer
 
