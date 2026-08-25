@@ -1,15 +1,11 @@
 // Spam Protection Bot (SPB)
-// Copyright (C) 2026  Pepper
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 Pepper. All rights reserved.
 //
-// This program is free software: you can redistribute it and/or modify it
-// under the terms of the GNU Affero General Public License, version 3 or
-// (at your option) any later version. It is distributed WITHOUT ANY
-// WARRANTY; see the LICENSE file, or <https://www.gnu.org/licenses/>.
-//
-// The name "Spam Protection Bot"/"SPB", its usernames, channels and
-// branding are not covered by this license and remain the author's; see
-// NOTICE. A modified or redistributed version must use a different name.
+// Source-available, NOT open source. No license is granted. The source is
+// published for transparency/audit and because Toolforge requires it; it
+// grants no permission to use, modify, run, deploy, or host this software.
+// Only the copyright holder and those they authorize may operate it. See
+// the LICENSE file.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -311,7 +307,6 @@ struct PendingCaptcha {
 
 #[derive(Clone)]
 struct GroupModuleSettings {
-    no_long_name: bool,
     no_halal: bool,
     no_service_messages: bool,
     // Unlike the content-policy modules above (which default off, since
@@ -355,7 +350,6 @@ struct GroupModuleSettings {
 impl Default for GroupModuleSettings {
     fn default() -> Self {
         Self {
-            no_long_name: false,
             no_halal: false,
             no_service_messages: false,
             flood_control: true,
@@ -2252,23 +2246,25 @@ impl Runtime {
                     "INSERT OR IGNORE INTO group_module_settings (chat_id) VALUES (?1)",
                     params![chat_id],
                 )?;
-                let mut stmt = conn.prepare("SELECT no_long_name, no_halal, no_service_messages, flood_control, captcha, spam_threshold_override, netban, cmd_clean, pol, guest_ban, no_contact, no_voice, no_exec FROM group_module_settings WHERE chat_id = ?1")?;
+                // no_long_name column intentionally not selected: the module
+                // was removed after too many false positives. The DB column
+                // is left in place (harmless) rather than migrated away.
+                let mut stmt = conn.prepare("SELECT no_halal, no_service_messages, flood_control, captcha, spam_threshold_override, netban, cmd_clean, pol, guest_ban, no_contact, no_voice, no_exec FROM group_module_settings WHERE chat_id = ?1")?;
                 let mut rows = stmt.query(params![chat_id])?;
                 if let Some(row) = rows.next()? {
                     Ok(GroupModuleSettings {
-                        no_long_name: row.get::<_, i64>(0)? != 0,
-                        no_halal: row.get::<_, i64>(1)? != 0,
-                        no_service_messages: row.get::<_, i64>(2)? != 0,
-                        flood_control: row.get::<_, i64>(3)? != 0,
-                        captcha: row.get::<_, i64>(4)? != 0,
-                        spam_threshold_override: row.get::<_, Option<f64>>(5)?,
-                        netban: row.get::<_, i64>(6)? != 0,
-                        cmd_clean: row.get::<_, i64>(7)? != 0,
-                        pol: row.get::<_, i64>(8)? != 0,
-                        guest_ban: row.get::<_, i64>(9)? != 0,
-                        no_contact: row.get::<_, i64>(10)? != 0,
-                        no_voice: row.get::<_, i64>(11)? != 0,
-                        no_exec: row.get::<_, i64>(12)? != 0,
+                        no_halal: row.get::<_, i64>(0)? != 0,
+                        no_service_messages: row.get::<_, i64>(1)? != 0,
+                        flood_control: row.get::<_, i64>(2)? != 0,
+                        captcha: row.get::<_, i64>(3)? != 0,
+                        spam_threshold_override: row.get::<_, Option<f64>>(4)?,
+                        netban: row.get::<_, i64>(5)? != 0,
+                        cmd_clean: row.get::<_, i64>(6)? != 0,
+                        pol: row.get::<_, i64>(7)? != 0,
+                        guest_ban: row.get::<_, i64>(8)? != 0,
+                        no_contact: row.get::<_, i64>(9)? != 0,
+                        no_voice: row.get::<_, i64>(10)? != 0,
+                        no_exec: row.get::<_, i64>(11)? != 0,
                     })
                 } else {
                     Ok(GroupModuleSettings::default())
@@ -2287,12 +2283,6 @@ impl Runtime {
                 params![chat_id],
             )?;
             match module.as_str() {
-            "nolongname" => {
-                conn.execute(
-                    "UPDATE group_module_settings SET no_long_name = ?2 WHERE chat_id = ?1",
-                    params![chat_id, if enabled { 1 } else { 0 }],
-                )?;
-            }
             "nohalal" => {
                 conn.execute(
                     "UPDATE group_module_settings SET no_halal = ?2 WHERE chat_id = ?1",
@@ -2906,16 +2896,7 @@ impl Runtime {
         drop(rules);
         
         let settings = self.get_group_modules(chat_id).await?;
-        let mut name_guard = Vec::new();
         let mut no_halal = Vec::new();
-
-        if settings.no_long_name && !self.is_maintainer(user.id.0 as i64).await {
-            let r = evaluate_no_long_name(user);
-            if !r.is_empty() {
-                reasons.extend(r.clone());
-                name_guard = r;
-            }
-        }
 
         if settings.no_halal && !self.is_maintainer(user.id.0 as i64).await {
             let r = evaluate_module_checks(user, user.username.as_deref(), bio, message_text);
@@ -2941,7 +2922,7 @@ impl Runtime {
         }
         reasons.extend(regex_hits);
 
-        Ok(ModuleCheckResult { reasons, name_guard, no_halal })
+        Ok(ModuleCheckResult { reasons, name_guard: Vec::new(), no_halal })
     }
 
     async fn inspect_message(&self, _display_name: &str, text: &str) -> Result<InspectionResult> {
@@ -3207,61 +3188,6 @@ fn contains_arabic_script(text: &str) -> bool {
         || ('\u{FE70}'..='\u{FEFF}').contains(&c))
 }
 
-fn clean_name_parts(text: &str) -> (String, Vec<String>) {
-    let clean = text
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == ' ' || *c == '-')
-        .collect::<String>();
-    let parts = clean
-        .split([' ', '-'])
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim().to_string())
-        .collect::<Vec<_>>();
-    (clean, parts)
-}
-
-fn evaluate_name_guard(full_name: &str) -> Vec<String> {
-    if !full_name.is_ascii() {
-        return Vec::new();
-    }
-
-    let (clean, parts) = clean_name_parts(full_name);
-    if clean.trim().is_empty() {
-        return Vec::new();
-    }
-
-    let has_digits = clean.chars().any(|c| c.is_ascii_digit());
-    let total_len = clean.chars().filter(|c| c.is_ascii_alphanumeric()).count();
-    let mut reasons = Vec::new();
-
-    if has_digits && total_len >= 7 {
-        reasons.push("NLDIGIT".to_string());
-    }
-    if parts.len() >= 2 && total_len >= 13 {
-        reasons.push("NL13".to_string());
-    }
-    if parts.len() >= 2 && parts.last().map(|s| s.len() >= 5).unwrap_or(false) {
-        reasons.push("NLTAIL".to_string());
-    }
-    if parts.len() == 1 && total_len >= 11 {
-        reasons.push("NLSINGLE".to_string());
-    }
-    reasons
-}
-
-fn evaluate_no_long_name(user: &teloxide::types::User) -> Vec<String> {
-    evaluate_name_guard(&display_name_only(user))
-}
-
-fn display_name_only(user: &teloxide::types::User) -> String {
-    let mut name = user.first_name.clone();
-    if let Some(last) = &user.last_name {
-        name.push(' ');
-        name.push_str(last);
-    }
-    name
-}
-
 fn evaluate_module_checks(user: &teloxide::types::User, username: Option<&str>, bio: Option<&str>, message_text: Option<&str>) -> Vec<String> {
     let mut reasons = Vec::new();
     let name = short_user(user);
@@ -3508,7 +3434,6 @@ fn help_text() -> String {
         "· Flood 洗版偵測\n",
         "· GuestBan 訪客機器人廣告\n",
         "<b>需自行開啟</b>\n",
-        "· NoLongName 英文長名檢查\n",
         "· NoHalal 清真內容檢查\n",
         "· NoSM 自動刪除服務訊息\n",
         "· Captcha 入群驗證\n",
@@ -3692,7 +3617,6 @@ fn public_log_link(config: &Config, message_id: i32) -> String {
 /// quietly stripping a group's spam defences in one keystroke. Turning
 /// either off individually still works and is unaffected.
 const PUBLIC_MODULES: &[(&str, &str, bool)] = &[
-    ("nolongname", "NoLongName", false),
     ("nohalal", "NoHalal", false),
     ("nosm", "NoSM", false),
     ("flood", "Flood", true),
@@ -3710,7 +3634,6 @@ const PUBLIC_MODULES: &[(&str, &str, bool)] = &[
 /// from a valid name.
 fn module_flag(settings: &GroupModuleSettings, key: &str) -> Option<bool> {
     Some(match key {
-        "nolongname" => settings.no_long_name,
         "nohalal" => settings.no_halal,
         "nosm" => settings.no_service_messages,
         "flood" => settings.flood_control,
@@ -3897,7 +3820,7 @@ fn global_whitelist_check_text() -> String {
 }
 
 fn build_blacklist_reason_text(_runtime: &Runtime) -> String {
-    "<b>❖ 封禁代號說明</b>\n\n- <code>NLDIGIT</code>: 英名含數字\n- <code>NL13</code>: 英名多段且總長度 >= 13\n- <code>NLTAIL</code>: 英名多段且尾段過長\n- <code>NLSINGLE</code>: 英名單段且長度 >= 11\n- <code>ARABIC</code>: 偵測到清真\n- <code>REGEX</code>: 觸發正則規則\n- <code>FLOOD</code>: 洗版偵測（5 秒內傳送 5 條以上訊息）\n- <code>PERM_REPEAT</code>: 24 小時內重複嘗試使用無權限的指令\n- <code>GUEST_MODE</code>: 訪客模式機器人（未加入本群卻發文）\n- <code>GUEST_MODE_INVOKER</code>: 召喚訪客模式機器人的人\n- <code>CONTACT</code>: 在群組分享聯絡人\n- <code>VOICE</code>: 傳送語音訊息\n- <code>EXEC_FILE</code>: 傳送可執行檔案\n- <code>ML</code>: 機器學習模型判定為垃圾訊息\n- <code>BOTSPAM</code>: 純機器人提及（訪客模式召喚廣告）\n\n申訴找 @SEELE_01_BOT".to_string()
+    "<b>❖ 封禁代號說明</b>\n\n- <code>ARABIC</code>: 偵測到清真\n- <code>REGEX</code>: 觸發正則規則\n- <code>FLOOD</code>: 洗版偵測（5 秒內傳送 5 條以上訊息）\n- <code>PERM_REPEAT</code>: 24 小時內重複嘗試使用無權限的指令\n- <code>GUEST_MODE</code>: 訪客模式機器人（未加入本群卻發文）\n- <code>GUEST_MODE_INVOKER</code>: 召喚訪客模式機器人的人\n- <code>CONTACT</code>: 在群組分享聯絡人\n- <code>VOICE</code>: 傳送語音訊息\n- <code>EXEC_FILE</code>: 傳送可執行檔案\n- <code>ML</code>: 機器學習模型判定為垃圾訊息\n- <code>BOTSPAM</code>: 純機器人提及（訪客模式召喚廣告）\n\n申訴找 @SEELE_01_BOT".to_string()
 }
 
 fn format_case_lookup(case: &CaseRecord, link: &str, reason_link: &str) -> String {
@@ -4194,17 +4117,12 @@ async fn notify_bot_added(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) 
         let enabled = runtime.get_group_modules(message.chat.id.0).await.unwrap_or_default();
         let mut banned = false;
 
-        if enabled.no_long_name || enabled.no_halal {
-            let reasons = if enabled.no_long_name { evaluate_name_guard(&display_name_only(user)) } else { Vec::new() };
-            let mut arabic_reasons = if enabled.no_halal {
+        if enabled.no_halal {
+            let all_reasons = {
                 let profile = runtime.load_user_profile(bot, user.id.0 as i64).await.ok();
                 let bio = profile.as_ref().and_then(|p| p.bio.as_deref());
                 evaluate_module_checks(user, user.username.as_deref(), bio, None)
-            } else {
-                Vec::new()
             };
-            let mut all_reasons = reasons;
-            all_reasons.append(&mut arabic_reasons);
 
             if !all_reasons.is_empty() {
                 banned = true;
@@ -6672,11 +6590,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             // name" error as any typo - anyone not already allowlisted
             // can't tell "warn-pol" is a real module from that message.
             if key == "warn-pol" && enabled && !runtime.is_module_allowed("warn-pol", message.chat.id.0).await.unwrap_or(false) {
-                reply_ephemeral(&bot, &message, "模組名稱僅支援 NoLongName / NoHalal / NoSM / Flood / Captcha / Netban / CmdClean / GuestBan / NoContact / NoVoice / NoExec。").await?;
+                reply_ephemeral(&bot, &message, "模組名稱僅支援 NoHalal / NoSM / Flood / Captcha / Netban / CmdClean / GuestBan / NoContact / NoVoice / NoExec。").await?;
                 return Ok(());
             }
             if old_enabled.is_none() {
-                reply_ephemeral(&bot, &message, "模組名稱僅支援 NoLongName / NoHalal / NoSM / Flood / Captcha / Netban / CmdClean / GuestBan / NoContact / NoVoice / NoExec。").await?;
+                reply_ephemeral(&bot, &message, "模組名稱僅支援 NoHalal / NoSM / Flood / Captcha / Netban / CmdClean / GuestBan / NoContact / NoVoice / NoExec。").await?;
                 return Ok(());
             }
             runtime.set_group_module(message.chat.id.0, &key, enabled).await.ok();
@@ -8537,21 +8455,6 @@ mod tests {
         assert!(groups.is_empty() && users.is_empty());
     }
 
-    // The bot banned itself out of a group: joining one with NoLongName on
-    // ran the name guard over every new member including itself, and its own
-    // display name trips two rules. Telegram enforces a ban by removing the
-    // member, so the bot vanished from the group and it read as it quitting.
-    // This pins the underlying fact - the name really does match - so the
-    // `is_bot` skip in notify_bot_added's loop can't be dropped without a
-    // failure here explaining why it exists.
-    #[test]
-    fn the_bots_own_display_name_trips_the_name_guard() {
-        let reasons = evaluate_name_guard("Spam Protection");
-        assert!(
-            reasons.contains(&"NL13".to_string()) && reasons.contains(&"NLTAIL".to_string()),
-            "expected NL13 + NLTAIL for the bot's own name, got {reasons:?} - notify_bot_added must skip bot accounts"
-        );
-    }
 
     // GroupAnonymousBot and the channel-post sender are flagged is_bot and
     // are genuinely absent from the member list, which is exactly the
