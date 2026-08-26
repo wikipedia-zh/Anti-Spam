@@ -1250,7 +1250,7 @@ impl Runtime {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, action, chat_id, target_user_id, target_name, actor_user_id, actor_name, source_message_id, evidence_text, model_score, matched_rule_id, matched_rule_pattern, status, log_message_id, created_at
-                 FROM cases WHERE target_user_id = ?1 AND action IN ('auto_ban', 'spam_ban', 'report_approved')
+                 FROM cases WHERE target_user_id = ?1 AND action IN ('auto_ban', 'spam_ban', 'report_approved', 'guest_bot_ban', 'guest_invoker_ban')
                  ORDER BY created_at DESC",
             )?;
             let mut rows = stmt.query(params![user_id])?;
@@ -7043,19 +7043,21 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 return Ok(());
             };
 
-            // Best-effort: reverse a tracked case too, if one exists, to also
-            // clean up any training data it contributed. Not finding one is
-            // completely normal for a user this project never banned.
-            let case = match case_from_id {
-                Some(case) => Some(case),
-                None => runtime
-                    .load_latest_case_by_actions(chat_id, target_user_id, &["auto_ban", "spam_ban", "report_approved"])
-                    .await
-                    .ok()
-                    .flatten(),
-            };
+            // Reverse EVERY active ban this user has, wherever it happened -
+            // not just one case in the current chat. Leaving another case
+            // active kept the user on the blacklist, so check_reban_and_act
+            // / check_netban_and_act would re-ban them in that group the
+            // moment they posted again - the reported "unban then re-ban".
+            let mut active = runtime.find_active_bans_for_user(target_user_id).await.unwrap_or_default();
+            if let Some(c) = case_from_id {
+                if !active.iter().any(|a| a.id == c.id) {
+                    active.push(c);
+                }
+            }
 
-            let Some(case) = case else {
+            if active.is_empty() {
+                // No case this project tracks - just lift a raw Telegram ban
+                // in the resolved chat.
                 if let Err(err) = bot.unban_chat_member(ChatId(chat_id), UserId(target_user_id as u64)).await {
                     let Some(reason) = unban_noop_reason(&err) else {
                         bot.send_message(message.chat.id, format!("解封失敗：{err}")).await?;
@@ -7071,12 +7073,22 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 .parse_mode(ParseMode::Html)
                 .await?;
                 return Ok(());
-            };
-
-            match reverse_ban_case(&bot, &runtime, case, from_id, &short_user(from)).await {
-                Ok(summary) => { bot.send_message(message.chat.id, summary).parse_mode(ParseMode::Html).await?; }
-                Err(err) => { bot.send_message(message.chat.id, err).await?; }
             }
+
+            let total = active.len();
+            let mut reversed = 0usize;
+            let mut errors = Vec::new();
+            for c in active {
+                match reverse_ban_case(&bot, &runtime, c, from_id, &short_user(from)).await {
+                    Ok(_) => reversed += 1,
+                    Err(err) => errors.push(err),
+                }
+            }
+            let mut reply = format!("已解封用戶 <code>{target_user_id}</code>，撤銷 {reversed}/{total} 筆封禁案例並清除對應訓練樣本，同時移出跨群組黑名單。");
+            if !errors.is_empty() {
+                reply.push_str(&format!("\n部分失敗：{}", errors.join("；")));
+            }
+            bot.send_message(message.chat.id, reply).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::Unmute(arg) => {
             let is_maintainer_user = runtime.is_maintainer(from_id).await;
@@ -9023,6 +9035,51 @@ mod tests {
             Some(case.id.clone()),
             "re-persisting the case must not clear its netban flag"
         );
+    }
+
+    // The reported "unban then re-ban": /unban used to reverse only the
+    // latest case in the current chat, so a second active ban elsewhere
+    // kept the user on the blacklist and check_reban_and_act re-banned
+    // them. find_active_bans_for_user must surface every active ban so the
+    // handler can reverse them all.
+    #[tokio::test]
+    async fn unban_must_see_every_active_ban_not_just_one() {
+        let runtime = test_runtime().await;
+        let mut c1 = dummy_case(ActionKind::AutoBan, 100, 200, Utc::now() - chrono::TimeDelta::hours(1));
+        c1.model_score = Some(0.99);
+        let mut c2 = dummy_case(ActionKind::AutoBan, 300, 200, Utc::now());
+        c2.model_score = Some(0.99);
+        runtime.persist_case(&c1).await.unwrap();
+        runtime.persist_case(&c2).await.unwrap();
+        runtime.mark_netban_eligible(&c1.id).await.unwrap();
+        runtime.mark_netban_eligible(&c2.id).await.unwrap();
+
+        assert_eq!(runtime.find_active_bans_for_user(200).await.unwrap().len(), 2, "both bans must be visible");
+
+        // Reversing only one leaves the user network-banned via the other -
+        // exactly the old bug.
+        let mut one = c2.clone();
+        one.action = ActionKind::Unbanned;
+        runtime.persist_case(&one).await.unwrap();
+        assert!(runtime.find_active_network_ban(200).await.unwrap().is_some(), "still banned via the un-reversed case");
+        assert!(runtime.find_active_ban_in_chat(100, 200).await.unwrap().is_some(), "reban net would still fire in group 100");
+
+        // Reversing all of them clears the blacklist and the reban net.
+        let mut two = c1.clone();
+        two.action = ActionKind::Unbanned;
+        runtime.persist_case(&two).await.unwrap();
+        assert!(runtime.find_active_network_ban(200).await.unwrap().is_none());
+        assert!(runtime.find_active_ban_in_chat(100, 200).await.unwrap().is_none());
+    }
+
+    // guest-mode bans must also count as "banned somewhere" so /unban
+    // reverses them and they clear from the blacklist.
+    #[tokio::test]
+    async fn find_active_bans_includes_guest_bans() {
+        let runtime = test_runtime().await;
+        let g = dummy_case(ActionKind::GuestBotBan, 100, 200, Utc::now());
+        runtime.persist_case(&g).await.unwrap();
+        assert_eq!(runtime.find_active_bans_for_user(200).await.unwrap().len(), 1);
     }
 
     // Backs check_reban_and_act's same-chat ban-evasion safety net. Unlike
