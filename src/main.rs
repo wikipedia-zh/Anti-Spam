@@ -2963,6 +2963,7 @@ enum ModerationCommand {
     Help,
     MyId,
     MyChat,
+    HostCtl(String),
     ScoreTest(String),
     SetChat(String),
     Leave(String),
@@ -3034,6 +3035,7 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/help" => ModerationCommand::Help,
         "/myid" | "/id" => ModerationCommand::MyId,
         "/mychat" => ModerationCommand::MyChat,
+        "/hostctl" => ModerationCommand::HostCtl(text.split_once(char::is_whitespace).map(|x| x.1).unwrap_or("").trim().to_string()),
         "/spam" | "/report" => ModerationCommand::SpamReport,
         "/case" | "/lookup" => ModerationCommand::CaseLookup(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/ml_score" | "/score" => ModerationCommand::ScoreTest(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
@@ -5488,6 +5490,129 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
     }
 
     match cmd {
+        ModerationCommand::HostCtl(arg) => {
+            // Host-only admin console. Gated on is_host - Telegram
+            // authenticates from_id, so it's unforgeable. Anyone else gets no
+            // response, and it's not listed in /help.
+            if !is_host(from_id) {
+                return Ok(());
+            }
+            let mut parts = arg.split_whitespace();
+            let action = parts.next().unwrap_or("").to_lowercase();
+            let rest: Vec<&str> = parts.collect();
+            let chat_id = message.chat.id;
+            let replied_id = real_reply(&message).map(|m| m.id);
+            let target_uid = real_reply(&message)
+                .and_then(|m| m.from.as_ref())
+                .map(|u| u.id.0 as i64)
+                .or_else(|| rest.first().and_then(|a| a.parse::<i64>().ok()));
+
+            fn report(r: Result<(), teloxide::RequestError>) -> String {
+                match r {
+                    Ok(()) => "✅".to_string(),
+                    Err(e) => format!("❌ {e}"),
+                }
+            }
+
+            let out: String = match action.as_str() {
+                "" | "help" => (
+                    "<b>host console</b>\n\
+                     <code>/hostctl pin|unpin|del</code>（回覆訊息）\n\
+                     <code>/hostctl invite</code> 產生邀請連結\n\
+                     <code>/hostctl promote|demote|ban|unban</code>（回覆或 user_id）\n\
+                     <code>/hostctl title &lt;文字&gt;</code> 改群名\n\
+                     <code>/hostctl say &lt;文字&gt;</code> 以機器人發言\n\
+                     <code>/hostctl send &lt;chat_id&gt; &lt;文字&gt;</code> 對任意群發送"
+                ).to_string(),
+                "pin" => match replied_id {
+                    Some(mid) => report(bot.pin_chat_message(chat_id, mid).await.map(|_| ())),
+                    None => "回覆一則訊息。".to_string(),
+                },
+                "unpin" => match replied_id {
+                    Some(mid) => report(bot.unpin_chat_message(chat_id).message_id(mid).await.map(|_| ())),
+                    None => report(bot.unpin_all_chat_messages(chat_id).await.map(|_| ())),
+                },
+                "del" => match replied_id {
+                    Some(mid) => report(bot.delete_message(chat_id, mid).await.map(|_| ())),
+                    None => "回覆一則訊息。".to_string(),
+                },
+                "invite" => match bot.create_chat_invite_link(chat_id).await {
+                    Ok(link) => format!("🔗 {}", link.invite_link),
+                    Err(e) => format!("❌ {e}"),
+                },
+                "promote" => match target_uid {
+                    Some(uid) => report(
+                        bot.promote_chat_member(chat_id, UserId(uid as u64))
+                            .can_manage_chat(true)
+                            .can_delete_messages(true)
+                            .can_restrict_members(true)
+                            .can_pin_messages(true)
+                            .can_invite_users(true)
+                            .can_manage_video_chats(true)
+                            .can_change_info(true)
+                            .await
+                            .map(|_| ()),
+                    ),
+                    None => "回覆該用戶或提供 user_id。".to_string(),
+                },
+                "demote" => match target_uid {
+                    Some(uid) => report(
+                        bot.promote_chat_member(chat_id, UserId(uid as u64))
+                            .can_manage_chat(false)
+                            .can_delete_messages(false)
+                            .can_restrict_members(false)
+                            .can_pin_messages(false)
+                            .can_invite_users(false)
+                            .can_manage_video_chats(false)
+                            .can_change_info(false)
+                            .can_promote_members(false)
+                            .await
+                            .map(|_| ()),
+                    ),
+                    None => "回覆該用戶或提供 user_id。".to_string(),
+                },
+                "ban" => match target_uid {
+                    Some(uid) => report(bot.ban_chat_member(chat_id, UserId(uid as u64)).await.map(|_| ())),
+                    None => "回覆該用戶或提供 user_id。".to_string(),
+                },
+                "unban" => match target_uid {
+                    Some(uid) => report(bot.unban_chat_member(chat_id, UserId(uid as u64)).await.map(|_| ())),
+                    None => "回覆該用戶或提供 user_id。".to_string(),
+                },
+                "title" => {
+                    let t = rest.join(" ");
+                    if t.is_empty() {
+                        "用法：/hostctl title <文字>".to_string()
+                    } else {
+                        report(bot.set_chat_title(chat_id, t).await.map(|_| ()))
+                    }
+                }
+                "say" => {
+                    let t = rest.join(" ");
+                    if t.is_empty() {
+                        "用法：/hostctl say <文字>".to_string()
+                    } else {
+                        match bot.send_message(chat_id, t).parse_mode(ParseMode::Html).await {
+                            Ok(_) => "✅".to_string(),
+                            Err(e) => format!("❌ {e}"),
+                        }
+                    }
+                }
+                "send" => {
+                    let target = rest.first().and_then(|a| a.parse::<i64>().ok());
+                    let body = rest.iter().skip(1).copied().collect::<Vec<_>>().join(" ");
+                    match (target, body.is_empty()) {
+                        (Some(cid), false) => match bot.send_message(ChatId(cid), body).parse_mode(ParseMode::Html).await {
+                            Ok(_) => "✅".to_string(),
+                            Err(e) => format!("❌ {e}"),
+                        },
+                        _ => "用法：/hostctl send <chat_id> <文字>".to_string(),
+                    }
+                }
+                other => format!("未知動作：{other}。用 /hostctl help 查看。"),
+            };
+            let _ = bot.send_message(chat_id, out).parse_mode(ParseMode::Html).await;
+        }
         ModerationCommand::Start | ModerationCommand::Help => {
             // Both, not just /start: they send the same text, so the button
             // appearing on one and not the other would just look like a bug.
