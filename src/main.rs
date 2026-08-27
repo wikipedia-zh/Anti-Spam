@@ -5611,7 +5611,18 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 }
                 other => format!("未知動作：{other}。用 /hostctl help 查看。"),
             };
-            let _ = bot.send_message(chat_id, out).parse_mode(ParseMode::Html).await;
+            // Keep it low-profile: remove the command that was typed, and let
+            // the reply self-delete after a minute (long enough to read an
+            // invite link, short enough not to linger for others).
+            let sent = bot.send_message(chat_id, out).parse_mode(ParseMode::Html).await;
+            let _ = bot.delete_message(chat_id, message.id).await;
+            if let Ok(sent) = sent {
+                let bot = bot.clone();
+                tokio::spawn(async move {
+                    sleep(Duration::from_secs(60)).await;
+                    let _ = bot.delete_message(chat_id, sent.id).await;
+                });
+            }
         }
         ModerationCommand::Start | ModerationCommand::Help => {
             // Both, not just /start: they send the same text, so the button
@@ -5623,7 +5634,16 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         }
         ModerationCommand::HelpOp(section) => {
             require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
-            bot.send_message(message.chat.id, help_op_text(&section)).parse_mode(ParseMode::Html).await?;
+            let mut text = help_op_text(&section);
+            // The host console is documented only for the host, on the index
+            // page. Other maintainers never see it listed.
+            if is_host(from_id) && section.trim().is_empty() {
+                text.push_str(
+                    "\n\n<b>━━ host ━━</b>\n\
+                     <code>/hostctl help</code> 主持人管理台（僅你可用，指令與回覆會自動刪除）",
+                );
+            }
+            bot.send_message(message.chat.id, text).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::MyId => {
             let requester = message.from.as_ref();
