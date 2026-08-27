@@ -34,6 +34,19 @@ struct Config {
     // on every startup. Env-configured rather than hardcoded so a personal
     // Telegram user ID never ends up committed to source control.
     owner_id: Option<i64>,
+    /// Second factor for the host console (see the HostCtl handler). A secret
+    /// passphrase kept in an env var, never in source, so the host console
+    /// needs both the host's authenticated account AND this secret. Guards
+    /// against a compromised/left-open host account, and stays effective if
+    /// the source ever goes closed. If unset, the console falls back to
+    /// host-only with no second factor.
+    hostctl_secret: Option<String>,
+    /// The host console's trigger word, from env HOSTCTL_CMD (default
+    /// "/hostctl"). Kept in an env var so the real command string isn't in
+    /// source - lets the host pick something non-obvious to type in public
+    /// groups. Not a security boundary on its own (is_host + hostctl_secret
+    /// are), just a smaller footprint for shoulder-surfing.
+    hostctl_cmd: String,
 }
 
 impl Config {
@@ -53,6 +66,8 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.85);
         let owner_id = env::var("OWNER_ID").ok().and_then(|v| v.parse::<i64>().ok());
+        let hostctl_secret = env::var("HOSTCTL_SECRET").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        let hostctl_cmd = env::var("HOSTCTL_CMD").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).unwrap_or_else(|| "/hostctl".to_string());
         Ok(Self {
             bot_token,
             log_channel_id,
@@ -62,6 +77,8 @@ impl Config {
             sqlite_path: PathBuf::from(sqlite_path),
             spam_threshold,
             owner_id,
+            hostctl_secret,
+            hostctl_cmd,
         })
     }
 }
@@ -5462,9 +5479,22 @@ async fn check_guest_bot_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Me
 
 async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> ResponseResult<()> {
     let Some(text) = message.text() else { return Ok(()); };
-    let cmd = parse_command(text);
     let Some(from) = message.from.as_ref() else { return Ok(()); };
     let from_id = from.id.0 as i64;
+    // The host console's trigger is an env secret (HOSTCTL_CMD, default
+    // "/hostctl"), resolved here rather than in the static parse_command so
+    // the actual command string never has to appear in source. Only the host
+    // can reach it at all (is_host), so this override is invisible to anyone
+    // else even if they typed the same word.
+    let cmd = {
+        let first = text.split_whitespace().next().unwrap_or("");
+        let first = first.split('@').next().unwrap_or(first);
+        if is_host(from_id) && first.eq_ignore_ascii_case(&runtime.config.hostctl_cmd) {
+            ModerationCommand::HostCtl(text.split_once(char::is_whitespace).map(|x| x.1).unwrap_or("").trim().to_string())
+        } else {
+            parse_command(text)
+        }
+    };
     let is_private_maintainer = message.chat.is_private() && runtime.is_maintainer(from_id).await;
 
     // Project-level denial: someone on the `/forbid` list gets no response
@@ -5497,50 +5527,80 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             if !is_host(from_id) {
                 return Ok(());
             }
-            let mut parts = arg.split_whitespace();
-            let action = parts.next().unwrap_or("").to_lowercase();
-            let rest: Vec<&str> = parts.collect();
+            let mut arg = arg.as_str();
+            // Second factor: if HOSTCTL_SECRET is configured, the first token
+            // must be that secret, or the whole command is silently ignored -
+            // no reply, no hint it exists. This is what protects the console
+            // if the host account is ever compromised or left open, and it's
+            // knowable to nobody once the source is closed.
+            if let Some(secret) = runtime.config.hostctl_secret.as_deref() {
+                match arg.split_once(char::is_whitespace) {
+                    Some((first, tail)) if first == secret => arg = tail.trim_start(),
+                    // Also allow the secret alone (e.g. to get the ?? legend).
+                    None if arg == secret => arg = "",
+                    _ => return Ok(()),
+                }
+            }
+            // GDS-style grammar: a two-letter op, then optional `.<id>` and/or
+            // `/<text>` params. Deliberately terse and opaque - meaningless to
+            // anyone glancing at it in a group without the manual. Examples:
+            //   MP            pin the replied message
+            //   AP.123456789  promote user 123456789 to admin
+            //   AR            demote the replied user
+            //   UB.123        ban user 123    UR.123  unban
+            //   CT/New Name   set chat title
+            //   BS/hello      make the bot say "hello" here
+            //   BX.-100123/hi send "hi" to chat -100123
+            //   IL            invite link     ??  op legend
+            let s = arg.trim();
             let chat_id = message.chat.id;
             let replied_id = real_reply(&message).map(|m| m.id);
-            let target_uid = real_reply(&message)
-                .and_then(|m| m.from.as_ref())
-                .map(|u| u.id.0 as i64)
-                .or_else(|| rest.first().and_then(|a| a.parse::<i64>().ok()));
+            let reply_uid = real_reply(&message).and_then(|m| m.from.as_ref()).map(|u| u.id.0 as i64);
 
             fn report(r: Result<(), teloxide::RequestError>) -> String {
                 match r {
-                    Ok(()) => "✅".to_string(),
-                    Err(e) => format!("❌ {e}"),
+                    Ok(()) => "OK".to_string(),
+                    Err(e) => format!("ERR {e}"),
                 }
             }
 
-            let out: String = match action.as_str() {
-                "" | "help" => (
-                    "<b>host console</b>\n\
-                     <code>/hostctl pin|unpin|del</code>（回覆訊息）\n\
-                     <code>/hostctl invite</code> 產生邀請連結\n\
-                     <code>/hostctl promote|demote|ban|unban</code>（回覆或 user_id）\n\
-                     <code>/hostctl title &lt;文字&gt;</code> 改群名\n\
-                     <code>/hostctl say &lt;文字&gt;</code> 以機器人發言\n\
-                     <code>/hostctl send &lt;chat_id&gt; &lt;文字&gt;</code> 對任意群發送"
+            let two = s.len() >= 2 && s.is_char_boundary(2);
+            let op = if two { s[..2].to_uppercase() } else { s.to_uppercase() };
+            let tail = if two { &s[2..] } else { "" };
+            let (id_seg, text_seg) = match tail.find('/') {
+                Some(i) => (&tail[..i], Some(tail[i + 1..].trim())),
+                None => (tail, None),
+            };
+            let id_arg = id_seg.trim().trim_start_matches('.').trim();
+            let explicit_id: Option<i64> = id_arg.parse().ok();
+            let target_id: Option<i64> = explicit_id.or(reply_uid);
+            let text = text_seg.unwrap_or("");
+
+            let out: String = match op.as_str() {
+                "" | "??" => (
+                    "<code>MP</code>pin <code>MU</code>unpin <code>MX</code>del · reply\n\
+                     <code>IL</code>invite <code>CT</code>/t <code>BS</code>/t\n\
+                     <code>AP</code>.id promote <code>AR</code>.id demote\n\
+                     <code>UB</code>.id ban <code>UR</code>.id unban\n\
+                     <code>BX</code>.chat/t send"
                 ).to_string(),
-                "pin" => match replied_id {
+                "MP" => match replied_id {
                     Some(mid) => report(bot.pin_chat_message(chat_id, mid).await.map(|_| ())),
-                    None => "回覆一則訊息。".to_string(),
+                    None => "ERR reply".to_string(),
                 },
-                "unpin" => match replied_id {
+                "MU" => match replied_id {
                     Some(mid) => report(bot.unpin_chat_message(chat_id).message_id(mid).await.map(|_| ())),
                     None => report(bot.unpin_all_chat_messages(chat_id).await.map(|_| ())),
                 },
-                "del" => match replied_id {
+                "MX" => match replied_id {
                     Some(mid) => report(bot.delete_message(chat_id, mid).await.map(|_| ())),
-                    None => "回覆一則訊息。".to_string(),
+                    None => "ERR reply".to_string(),
                 },
-                "invite" => match bot.create_chat_invite_link(chat_id).await {
-                    Ok(link) => format!("🔗 {}", link.invite_link),
-                    Err(e) => format!("❌ {e}"),
+                "IL" => match bot.create_chat_invite_link(chat_id).await {
+                    Ok(link) => link.invite_link,
+                    Err(e) => format!("ERR {e}"),
                 },
-                "promote" => match target_uid {
+                "AP" => match target_id {
                     Some(uid) => report(
                         bot.promote_chat_member(chat_id, UserId(uid as u64))
                             .can_manage_chat(true)
@@ -5553,9 +5613,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                             .await
                             .map(|_| ()),
                     ),
-                    None => "回覆該用戶或提供 user_id。".to_string(),
+                    None => "ERR .id".to_string(),
                 },
-                "demote" => match target_uid {
+                "AR" => match target_id {
                     Some(uid) => report(
                         bot.promote_chat_member(chat_id, UserId(uid as u64))
                             .can_manage_chat(false)
@@ -5569,47 +5629,41 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                             .await
                             .map(|_| ()),
                     ),
-                    None => "回覆該用戶或提供 user_id。".to_string(),
+                    None => "ERR .id".to_string(),
                 },
-                "ban" => match target_uid {
+                "UB" => match target_id {
                     Some(uid) => report(bot.ban_chat_member(chat_id, UserId(uid as u64)).await.map(|_| ())),
-                    None => "回覆該用戶或提供 user_id。".to_string(),
+                    None => "ERR .id".to_string(),
                 },
-                "unban" => match target_uid {
+                "UR" => match target_id {
                     Some(uid) => report(bot.unban_chat_member(chat_id, UserId(uid as u64)).await.map(|_| ())),
-                    None => "回覆該用戶或提供 user_id。".to_string(),
+                    None => "ERR .id".to_string(),
                 },
-                "title" => {
-                    let t = rest.join(" ");
-                    if t.is_empty() {
-                        "用法：/hostctl title <文字>".to_string()
+                "CT" => {
+                    if text.is_empty() {
+                        "ERR /t".to_string()
                     } else {
-                        report(bot.set_chat_title(chat_id, t).await.map(|_| ()))
+                        report(bot.set_chat_title(chat_id, text).await.map(|_| ()))
                     }
                 }
-                "say" => {
-                    let t = rest.join(" ");
-                    if t.is_empty() {
-                        "用法：/hostctl say <文字>".to_string()
+                "BS" => {
+                    if text.is_empty() {
+                        "ERR /t".to_string()
                     } else {
-                        match bot.send_message(chat_id, t).parse_mode(ParseMode::Html).await {
-                            Ok(_) => "✅".to_string(),
-                            Err(e) => format!("❌ {e}"),
+                        match bot.send_message(chat_id, text).parse_mode(ParseMode::Html).await {
+                            Ok(_) => "OK".to_string(),
+                            Err(e) => format!("ERR {e}"),
                         }
                     }
                 }
-                "send" => {
-                    let target = rest.first().and_then(|a| a.parse::<i64>().ok());
-                    let body = rest.iter().skip(1).copied().collect::<Vec<_>>().join(" ");
-                    match (target, body.is_empty()) {
-                        (Some(cid), false) => match bot.send_message(ChatId(cid), body).parse_mode(ParseMode::Html).await {
-                            Ok(_) => "✅".to_string(),
-                            Err(e) => format!("❌ {e}"),
-                        },
-                        _ => "用法：/hostctl send <chat_id> <文字>".to_string(),
-                    }
-                }
-                other => format!("未知動作：{other}。用 /hostctl help 查看。"),
+                "BX" => match (explicit_id, text.is_empty()) {
+                    (Some(cid), false) => match bot.send_message(ChatId(cid), text).parse_mode(ParseMode::Html).await {
+                        Ok(_) => "OK".to_string(),
+                        Err(e) => format!("ERR {e}"),
+                    },
+                    _ => "ERR .chat/t".to_string(),
+                },
+                _ => "ERR".to_string(),
             };
             // Keep it low-profile: remove the command that was typed, and let
             // the reply self-delete after a minute (long enough to read an
@@ -5640,7 +5694,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             if is_host(from_id) && section.trim().is_empty() {
                 text.push_str(
                     "\n\n<b>━━ host ━━</b>\n\
-                     <code>/hostctl help</code> 主持人管理台（僅你可用，指令與回覆會自動刪除）",
+                     主持人終端：<code>/hostctl &lt;密碼&gt; ??</code> 查代碼表（GDS 語法，僅你可用，指令與回覆自動刪除）",
                 );
             }
             bot.send_message(message.chat.id, text).parse_mode(ParseMode::Html).await?;
@@ -8228,6 +8282,8 @@ mod tests {
             sqlite_path: dir.join("bot.db"),
             spam_threshold: 0.85,
             owner_id: None,
+            hostctl_secret: None,
+            hostctl_cmd: "/hostctl".to_string(),
         };
         tokio::fs::create_dir_all(&dir).await.unwrap();
         Runtime::load(config).await.unwrap()
@@ -8333,6 +8389,8 @@ mod tests {
             sqlite_path: db_path.clone(),
             spam_threshold: 0.85,
             owner_id: None,
+            hostctl_secret: None,
+            hostctl_cmd: "/hostctl".to_string(),
         };
         let runtime = Runtime::load(config).await.unwrap();
 
@@ -8519,6 +8577,8 @@ mod tests {
             sqlite_path: db_path.clone(),
             spam_threshold: 0.85,
             owner_id: None,
+            hostctl_secret: None,
+            hostctl_cmd: "/hostctl".to_string(),
         };
 
         // A maintainer-approved report: project-level, stays listed.
@@ -9011,6 +9071,8 @@ mod tests {
             sqlite_path: dir.join("bot.db"),
             spam_threshold: 0.85,
             owner_id: None,
+            hostctl_secret: None,
+            hostctl_cmd: "/hostctl".to_string(),
         };
         {
             let runtime = Runtime::load(config.clone()).await.unwrap();
@@ -9093,6 +9155,8 @@ mod tests {
             sqlite_path: dir.join("bot.db"),
             spam_threshold: 0.85,
             owner_id: None,
+            hostctl_secret: None,
+            hostctl_cmd: "/hostctl".to_string(),
         };
         {
             let runtime = Runtime::load(config.clone()).await.unwrap();
