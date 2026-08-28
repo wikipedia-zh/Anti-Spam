@@ -7,7 +7,7 @@ description: "Spam Protection Bot（SPB）使用規範"
 # Spam Protection Bot — 使用規範 / Terms of Use
 
 **生效日期 / Effective date:** 2026-08-15
-**最後更新 / Last updated:** 2026-08-25
+**最後更新 / Last updated:** 2026-08-28
 
 本文件同時提供繁體中文與英文版本。若兩者有歧義，以繁體中文版為準。
 This document is provided in Traditional Chinese and English. In case of ambiguity, the Traditional Chinese version prevails.
@@ -31,13 +31,14 @@ Spam Protection Bot（下稱「SPB」或「本機器人」）是一個由志願�
 - 該群組的擁有者與管理團隊；
 - 在群組中使用本機器人指令的所有使用者。
 
-### 3. 使用條件
+### 3. 使用條件 {#eligibility}
 
+- **本服務僅供公開群組使用。** 私密（非公開）群組並非垃圾訊息散布的對象，並無使用本服務之必要；為合理配置有限資源，本項目不對私密群組提供服務，並保留隨時終止對此類群組服務的權利。
 - 本機器人需要「刪除訊息」與「封禁使用者」權限才能運作。若權限不足，部分或全部功能將無法使用。
 - 群組管理員可自行決定啟用或停用各項模組，並承擔該設定造成的後果。
 - 本機器人的判斷以自動化模型與規則為基礎，可能產生誤判。群組應自行保留人工覆核的能力。
 
-### 4. 禁止行為
+### 4. 禁止行為 {#prohibited}
 
 不得從事下列行為：
 
@@ -65,7 +66,7 @@ Spam Protection Bot（下稱「SPB」或「本機器人」）是一個由志願�
 
 對封禁有異議者，請透過 [@SEELE_01_BOT](https://t.me/SEELE_01_BOT) 提出申訴。此為唯一受理管道，透過其他方式提出的申訴不予處理。
 
-### 8. 服務終止與拒絕服務
+### 8. 服務終止與拒絕服務 {#termination}
 
 本服務由專案擁有者自願提供，並無提供義務。**專案擁有者保留隨時、依其單方且完全的裁量權（sole and absolute discretion），拒絕或終止對任何使用者或群組提供服務的權利，無論是否給予理由。**
 
@@ -107,6 +108,7 @@ These terms apply to:
 
 ### 3. Conditions of use
 
+- **The service is for public groups only.** Private (non-public) groups are not targets for spam distribution and have no need for the service; to allocate limited resources responsibly, the project does not serve private groups and reserves the right to terminate service to any such group at any time.
 - The bot requires "delete messages" and "ban users" permissions to function. Without them, some or all features will not work.
 - Group administrators decide which modules to enable, and are responsible for the consequences of those settings.
 - The bot's decisions are based on automated models and rules and may be wrong. Groups should retain their own capacity for human review.
