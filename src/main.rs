@@ -4265,20 +4265,55 @@ fn welcome_text() -> String {
     "<b>Spam Protection Bot（SPB）已加入本群</b>\n\n本機器人會自動偵測並處理垃圾訊息。請群組管理員給予「刪除訊息」與「封禁使用者」權限，否則無法正常運作。\n\n使用本機器人即表示同意本項目的使用規範，請點擊下方按鈕閱讀。管理員可用 <code>/module</code> 查看與調整各項功能，<code>/help</code> 查看指令說明。".to_string()
 }
 
+/// A ground for `/leave`, resolved to a display label and the Terms-of-Use
+/// section it points at. A maintainer types a short code after the chat id
+/// (`/leave -100… TnS`); a known code links straight to the relevant clause,
+/// anything else is carried through as free-text with no specific anchor.
+struct TerminationReason {
+    label: String,
+    anchor: Option<&'static str>,
+}
+
+/// Turns the raw reason typed after `/leave` into a `TerminationReason`.
+/// Codes are matched loosely: case-insensitive, punctuation and spacing
+/// ignored, so `TnS`, `T&S` and `trust and safety` all land on the same
+/// clause. Free text (including Chinese) that matches no code is kept
+/// verbatim as the label with no anchor.
+fn classify_termination_reason(raw: &str) -> TerminationReason {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return TerminationReason { label: String::new(), anchor: None };
+    }
+    let norm: String = trimmed.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_uppercase();
+    let (label, anchor): (&str, Option<&'static str>) = match norm.as_str() {
+        "TNS" | "TS" | "TNSTS" | "TRUSTANDSAFETY" | "TRUSTSAFETY" => ("信任與安全（Trust & Safety）", Some("termination")),
+        "PRIVATE" | "PRIV" | "PG" | "PRIVATEGROUP" => ("本服務不適用於私密（非公開）群組", Some("eligibility")),
+        "ABUSE" | "MISUSE" => ("濫用本項目服務", Some("prohibited")),
+        "RESOURCE" | "RES" => ("資源管理與服務完整性", Some("termination")),
+        _ => (trimmed, None),
+    };
+    TerminationReason { label: label.to_string(), anchor }
+}
+
 /// The notice posted to a group as `/leave` terminates service for it.
 /// Deliberately formal and self-contained: it's the only thing that group
 /// will ever receive from the bot again, so it has to state the scope, the
 /// grounds, and the one appeal route without assuming the reader can ask a
 /// follow-up. Same `❖` heading and `@SEELE_01_BOT` appeal line as the
 /// blacklist-reason notice, so it reads as the same project's voice.
-fn service_termination_text(reason: Option<&str>) -> String {
-    // `使用規範` is the link, and the specific reason is only appended when a
-    // maintainer actually typed one. `/leave` defaults its stored reason to
-    // "違反使用規則", which rendered here as "violated the rules: violated
-    // the rules" - the placeholder said nothing the sentence hadn't already.
-    let detail = match reason {
-        Some(reason) if !reason.trim().is_empty() => format!("\n<b>具體事由</b>：{}", escape_html(reason.trim())),
-        _ => String::new(),
+fn service_termination_text(reason: &TerminationReason) -> String {
+    // `使用規範` links to the terms as a whole; the specific ground only
+    // appears when a maintainer typed one, and when it's a known code the
+    // detail line links straight to the exact clause. `/leave` defaults its
+    // stored reason to "違反使用規則", which rendered here would just restate
+    // the sentence it hangs off, so the empty case adds no detail line.
+    let label = reason.label.trim();
+    let detail = if label.is_empty() {
+        String::new()
+    } else if let Some(anchor) = reason.anchor {
+        format!("\n<b>具體事由</b>：<a href=\"{TERMS_URL}#{anchor}\">{}</a>", escape_html(label))
+    } else {
+        format!("\n<b>具體事由</b>：{}", escape_html(label))
     };
     format!(
         "<b>❖ 服務終止通知</b>\n\n\
@@ -5902,12 +5937,13 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         }
         ModerationCommand::Leave(reason) => {
             require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用 /leave。");
-            let (target_chat_id, reason) = parse_leave_args(&reason);
-            // Kept as an Option: the notice reads better with no clause at
-            // all than with a placeholder, but the blacklist row and audit
-            // entry still want something written down.
-            let reason = reason.trim().to_string();
-            let stored_reason = if reason.is_empty() { "違反使用規則".to_string() } else { reason.clone() };
+            let (target_chat_id, reason_raw) = parse_leave_args(&reason);
+            // A short code (TnS, private, …) resolves to a labelled clause and
+            // links the notice straight to that ToU section; anything else is
+            // carried through as free text. The blacklist row and audit entry
+            // still want something written down, so fall back to a placeholder.
+            let reason = classify_termination_reason(&reason_raw);
+            let stored_reason = if reason.label.trim().is_empty() { "違反使用規則".to_string() } else { reason.label.clone() };
             let target_chat_id = target_chat_id.unwrap_or(message.chat.id.0);
             // Guard against locking the project out of its own plumbing.
             // A blacklisted chat is refused *before* command handling, so
@@ -5932,7 +5968,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             };
             let button = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::url("前往項目交流群查詢", Url::parse(&project_chat_link(project_chat)).unwrap())]]);
             let _ = bot
-                .send_message(ChatId(target_chat_id), service_termination_text(Some(reason.as_str()).filter(|r| !r.is_empty())))
+                .send_message(ChatId(target_chat_id), service_termination_text(&reason))
                 .parse_mode(ParseMode::Html)
                 .reply_markup(button)
                 .await;
@@ -8756,17 +8792,38 @@ mod tests {
     // specific reason only appears when one was actually given.
     #[test]
     fn termination_notice_links_the_terms_and_drops_the_placeholder_reason() {
-        let bare = service_termination_text(None);
+        let bare = service_termination_text(&classify_termination_reason(""));
         assert!(bare.contains(&format!("<a href=\"{TERMS_URL}\">使用規範</a>")), "the rules reference must link to the published terms");
         assert!(!bare.contains("具體事由"), "no reason given - the notice must not invent a detail line");
 
-        let detailed = service_termination_text(Some("大量濫用檢舉指令"));
+        let detailed = service_termination_text(&classify_termination_reason("大量濫用檢舉指令"));
         assert!(detailed.contains("<b>具體事由</b>：大量濫用檢舉指令"));
 
         // Whitespace-only is the same as nothing.
-        assert!(!service_termination_text(Some("   ")).contains("具體事由"));
+        assert!(!service_termination_text(&classify_termination_reason("   ")).contains("具體事由"));
         // A reason is user-supplied text going into an HTML message.
-        assert!(service_termination_text(Some("<b>x</b>")).contains("&lt;b&gt;x&lt;/b&gt;"));
+        assert!(service_termination_text(&classify_termination_reason("<b>x</b>")).contains("&lt;b&gt;x&lt;/b&gt;"));
+    }
+
+    // Reason codes must resolve loosely (case/punctuation-insensitive) and
+    // link the detail line straight to the matching ToU section, while
+    // unknown input stays free text pointing at no specific clause.
+    #[test]
+    fn leave_reason_codes_map_to_terms_sections() {
+        for code in ["TnS", "T&S", "trust and safety", "TnS/T&S"] {
+            let r = classify_termination_reason(code);
+            assert_eq!(r.anchor, Some("termination"), "{code} should map to the termination section");
+            let text = service_termination_text(&r);
+            assert!(text.contains(&format!("href=\"{TERMS_URL}#termination\"")), "{code} must link the detail line to #termination");
+            assert!(text.contains("信任與安全"), "{code} must render the Trust & Safety label");
+        }
+        assert_eq!(classify_termination_reason("private").anchor, Some("eligibility"));
+        assert_eq!(classify_termination_reason("PG").anchor, Some("eligibility"));
+
+        // Unknown / free text keeps the words and links to no specific clause.
+        let free = classify_termination_reason("大量濫用檢舉指令");
+        assert_eq!(free.anchor, None);
+        assert_eq!(free.label, "大量濫用檢舉指令");
     }
 
     // The invite prompt and the terms link both build a URL button, which
