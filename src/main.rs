@@ -284,6 +284,13 @@ struct Runtime {
     /// only, small fixed cap per chat (see record_recent_message) - this is
     /// short-lived correlation context, not something worth persisting.
     recent_messages: Mutex<HashMap<i64, VecDeque<RecentMessage>>>,
+    /// chat_id -> when its `title`/`last_seen` row was last written. A pure
+    /// write-throttle: the title-recording upsert would otherwise fire on
+    /// every group message, and a group's name changes maybe once in its
+    /// lifetime. In-memory only - losing it on restart just means each group
+    /// gets one fresh write on its next message, which is exactly what we want
+    /// anyway. See `record_group_seen`.
+    group_seen_flush: Mutex<HashMap<i64, Instant>>,
     /// Project-level denial lists (see `migrate_v9_to_v10`), mirrored in
     /// memory because they're consulted on the hot path - every message and
     /// every command - where a SQLite round trip per check would be pure
@@ -458,6 +465,7 @@ impl Runtime {
             flood_tracker: Mutex::new(HashMap::new()),
             pending_captcha: Mutex::new(HashMap::new()),
             recent_messages: Mutex::new(HashMap::new()),
+            group_seen_flush: Mutex::new(HashMap::new()),
             banned_groups: RwLock::new(banned_groups),
             banned_users: RwLock::new(banned_users),
             maintainers: RwLock::new(maintainers),
@@ -626,6 +634,9 @@ impl Runtime {
         }
         if user_version < 14 {
             Self::migrate_v13_to_v14(conn)?;
+        }
+        if user_version < 15 {
+            Self::migrate_v14_to_v15(conn)?;
         }
         Ok(())
     }
@@ -964,6 +975,22 @@ impl Runtime {
             [],
         )?;
         tx.execute("PRAGMA user_version = 14", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Remembers the human-readable title of every group the bot processes a
+    /// message in, plus when it was last seen there. The Bot API has no "list
+    /// the chats I'm in" call, so `/groups` has to be answered from what the
+    /// bot has itself observed - `group_module_settings` already gets a row
+    /// per chat (via `get_group_modules`), these two columns just let that
+    /// listing carry a name and a recency instead of a bare id. Both nullable:
+    /// existing rows have no title until the group's next message fills it in.
+    fn migrate_v14_to_v15(conn: &mut Connection) -> Result<()> {
+        let tx = conn.transaction()?;
+        Self::add_column_if_missing(&tx, "group_module_settings", "title", "TEXT")?;
+        Self::add_column_if_missing(&tx, "group_module_settings", "last_seen", "TEXT")?;
+        tx.execute("PRAGMA user_version = 15", [])?;
         tx.commit()?;
         Ok(())
     }
@@ -2471,6 +2498,69 @@ impl Runtime {
         }
     }
 
+    /// Records that the bot just saw a message in this group, so `/groups`
+    /// can list it by name. Write-throttled to at most once per hour per chat
+    /// (see `group_seen_flush`): a busy group would otherwise rewrite the same
+    /// row on every message for a title that essentially never changes. The
+    /// row itself is created here if absent - this is the same `chat_id` space
+    /// as `get_group_modules`, so an `INSERT ... ON CONFLICT` keeps a single
+    /// row per chat and only touches the two listing columns.
+    async fn record_group_seen(&self, chat_id: i64, title: Option<&str>) {
+        const THROTTLE: Duration = Duration::from_secs(3600);
+        {
+            let mut flush = self.group_seen_flush.lock().await;
+            if let Some(last) = flush.get(&chat_id) {
+                if last.elapsed() < THROTTLE {
+                    return;
+                }
+            }
+            flush.insert(chat_id, Instant::now());
+        }
+        let title = title.map(|s| s.to_string());
+        let now = Utc::now().to_rfc3339();
+        let _ = self
+            .with_conn(move |conn| {
+                conn.execute(
+                    "INSERT INTO group_module_settings (chat_id, title, last_seen) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(chat_id) DO UPDATE SET
+                         title = COALESCE(excluded.title, group_module_settings.title),
+                         last_seen = excluded.last_seen",
+                    params![chat_id, title, now],
+                )?;
+                Ok(())
+            })
+            .await;
+    }
+
+    /// Every group the bot has observed, most recently seen first, for the
+    /// `/groups` listing. Banned groups (`/leave`) are excluded - they're no
+    /// longer served and have their own `/list_banned`. Returns
+    /// (chat_id, title, last_seen_rfc3339); title/last_seen are None for rows
+    /// that predate migrate_v14_to_v15 and haven't seen a message since.
+    async fn list_seen_groups(&self) -> Vec<(i64, Option<String>, Option<String>)> {
+        let banned = self.banned_groups.read().await.clone();
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT chat_id, title, last_seen FROM group_module_settings ORDER BY last_seen DESC NULLS LAST, chat_id",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(id, _, _)| !banned.contains(id))
+        .collect()
+    }
+
     /// Scans this chat's recent human messages (most recent first) for one
     /// that bare-mentions `bot_username` - the literal way guest mode is
     /// invoked - within the last `WINDOW` of real time. "Bare" means what's
@@ -3045,6 +3135,7 @@ enum ModerationCommand {
     Forbid(String),
     Forgive(String),
     ListBanned,
+    ListGroups,
     Reviewer(String, String),
     Maintainer(String, String),
     Whois(String),
@@ -3122,6 +3213,7 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/forbid" => ModerationCommand::Forbid(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
         "/forgive" => ModerationCommand::Forgive(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/list_banned" => ModerationCommand::ListBanned,
+        "/groups" | "/list_groups" => ModerationCommand::ListGroups,
         "/whois" => ModerationCommand::Whois(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/report_reset" => ModerationCommand::ReportReset(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/ml_eval" => ModerationCommand::MlEval(text.split_whitespace().nth(1).unwrap_or("").to_string()),
@@ -3566,6 +3658,7 @@ fn help_op_text(section: &str) -> String {
             "<code>/forgive &lt;id&gt;</code> 解除\n",
             "· 負數＝群組，正數＝用戶\n",
             "<code>/list_banned</code> 列出封禁名單\n",
+            "<code>/groups</code> 匯出服務中的群組清單（txt）\n",
             "\n<b>審核員</b>\n",
             "<code>/reviewer add|del &lt;user_id&gt;</code>\n",
             "<code>/reviewer list</code>\n",
@@ -6158,6 +6251,28 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             }
             bot.send_message(message.chat.id, out).parse_mode(ParseMode::Html).await?;
         }
+        ModerationCommand::ListGroups => {
+            require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用此指令。");
+            let groups = runtime.list_seen_groups().await;
+            if groups.is_empty() {
+                bot.send_message(message.chat.id, "目前沒有已記錄的群組。機器人會在收到群組訊息後開始記錄。").await?;
+            } else {
+                // A plain-text .txt, not an HTML message: the list can run to
+                // hundreds of groups, well past Telegram's 4096-char message
+                // limit, and a file is what a maintainer wants to scroll or
+                // grep anyway. Tab-separated so it opens cleanly in a sheet.
+                let mut body = format!("SPB — 服務中的群組（共 {}）\n匯出時間：{}\n\nchat_id\t最後活動\t群組名稱\n", groups.len(), Utc::now().to_rfc3339());
+                for (id, title, last_seen) in &groups {
+                    let title = title.as_deref().unwrap_or("(未知，尚未收到訊息)");
+                    let last_seen = last_seen.as_deref().unwrap_or("-");
+                    body.push_str(&format!("{id}\t{last_seen}\t{title}\n"));
+                }
+                let filename = format!("spb-groups-{}.txt", Utc::now().format("%Y%m%d-%H%M%S"));
+                bot.send_document(message.chat.id, InputFile::memory(body.into_bytes()).file_name(filename))
+                    .caption(format!("服務中的群組共 {} 個。", groups.len()))
+                    .await?;
+            }
+        }
         ModerationCommand::Maintainer(sub, target) => {
             // Host only. Maintainers grant reviewers; only the host grants
             // maintainers, and the host itself can never be removed.
@@ -8220,6 +8335,12 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
 
+                // Remember this group by name so /groups can list it. Throttled
+                // internally, so this is cheap to call on every message.
+                if message.chat.is_group() || message.chat.is_supergroup() {
+                    runtime.record_group_seen(message.chat.id.0, message.chat.title()).await;
+                }
+
                 unpin_channel_autopin(&bot, &runtime, &message).await;
 
                 // Feeds check_guest_bot_and_act's invoker correlation - has
@@ -9784,6 +9905,33 @@ mod tests {
         assert!(runtime.get_group_modules(100).await.unwrap().pol);
         runtime.set_group_module(100, "warn-pol", false).await.unwrap();
         assert!(!runtime.get_group_modules(100).await.unwrap().pol);
+    }
+
+    // Backs /groups: record_group_seen must create/name a row per chat, the
+    // listing must carry that title, and a group taken out of service with
+    // /leave (set_group_banned) must drop off the list entirely.
+    #[tokio::test]
+    async fn seen_groups_are_listed_by_name_and_exclude_banned() {
+        let runtime = test_runtime().await;
+        assert!(runtime.list_seen_groups().await.is_empty());
+
+        runtime.record_group_seen(-100, Some("Alpha 群")).await;
+        runtime.record_group_seen(-200, Some("Beta 群")).await;
+        runtime.record_group_seen(-300, None).await; // no title yet
+
+        let listed = runtime.list_seen_groups().await;
+        assert_eq!(listed.len(), 3);
+        let alpha = listed.iter().find(|(id, _, _)| *id == -100).unwrap();
+        assert_eq!(alpha.1.as_deref(), Some("Alpha 群"));
+        assert!(alpha.2.is_some(), "last_seen must be recorded");
+        // A group with no observed title lists as an untitled row, not dropped.
+        assert!(listed.iter().any(|(id, title, _)| *id == -300 && title.is_none()));
+
+        // /leave a group -> it must no longer appear in /groups.
+        runtime.set_group_banned(-200, true, "TnS", Some(1)).await.unwrap();
+        let after = runtime.list_seen_groups().await;
+        assert!(!after.iter().any(|(id, _, _)| *id == -200), "a banned group must be excluded");
+        assert_eq!(after.len(), 2);
     }
 
     // Backs check_guest_bot_and_act / /module guestban on|off: unlike every
