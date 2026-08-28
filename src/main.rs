@@ -1929,6 +1929,36 @@ impl Runtime {
         .await
     }
 
+    /// The host-console secret. Stored in the database (model_meta) so it can
+    /// be changed by command and recovered with a plain SQL query if
+    /// forgotten. Falls back to the HOSTCTL_SECRET env var only when nothing
+    /// is stored yet (first run).
+    async fn hostctl_secret(&self) -> Option<String> {
+        let stored = self
+            .with_conn(|conn| {
+                Ok(conn
+                    .query_row("SELECT value FROM model_meta WHERE key = 'hostctl_secret'", [], |r| r.get::<_, String>(0))
+                    .ok())
+            })
+            .await
+            .ok()
+            .flatten()
+            .filter(|v| !v.is_empty());
+        stored.or_else(|| self.config.hostctl_secret.clone())
+    }
+
+    async fn set_hostctl_secret(&self, secret: &str) -> Result<()> {
+        let secret = secret.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO model_meta (key, value) VALUES ('hostctl_secret', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![secret],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn set_blacklist_reason_message_id(&self, message_id: i32) -> Result<()> {
         self.with_conn(move |conn| {
             conn.execute(
@@ -4078,6 +4108,10 @@ async fn notify_bot_added(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) 
                 Some(user) => runtime.is_user_banned(user.id.0 as i64).await,
                 None => false,
             };
+            // Join/leave notices go to the audit log (host-only) rather than
+            // the report channel; fall back to the report channel only if no
+            // audit log is configured.
+            let notice_dest = runtime.audit_log_chat().await.unwrap_or(runtime.config.report_channel_id);
             if inviter_banned || runtime.is_group_banned(message.chat.id.0).await {
                 let _ = bot.send_message(message.chat.id, service_denied_text()).parse_mode(ParseMode::Html).await;
                 let _ = bot.leave_chat(message.chat.id).await;
@@ -4088,7 +4122,7 @@ async fn notify_bot_added(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) 
                     message.from.as_ref().map(short_user).unwrap_or_else(|| "unknown".to_string()),
                     if inviter_banned { "邀請者已被禁止使用本項目" } else { "此群組已被終止服務" },
                 );
-                let _ = bot.send_message(ChatId(runtime.config.report_channel_id), text).parse_mode(ParseMode::Html).await;
+                let _ = bot.send_message(ChatId(notice_dest), text).parse_mode(ParseMode::Html).await;
                 return true;
             }
 
@@ -4099,7 +4133,7 @@ async fn notify_bot_added(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) 
                 escape_html(title),
                 message.from.as_ref().map(short_user).unwrap_or_else(|| "unknown".to_string())
             );
-            let _ = bot.send_message(ChatId(runtime.config.report_channel_id), text).parse_mode(ParseMode::Html).await;
+            let _ = bot.send_message(ChatId(notice_dest), text).parse_mode(ParseMode::Html).await;
 
             // Not self-deleting, unlike the transient group notices: this is
             // the group's one prompt to read what it just agreed to, and it
@@ -5528,12 +5562,14 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 return Ok(());
             }
             let mut arg = arg.as_str();
-            // Second factor: if HOSTCTL_SECRET is configured, the first token
-            // must be that secret, or the whole command is silently ignored -
-            // no reply, no hint it exists. This is what protects the console
-            // if the host account is ever compromised or left open, and it's
-            // knowable to nobody once the source is closed.
-            if let Some(secret) = runtime.config.hostctl_secret.as_deref() {
+            // Second factor: if a secret is set (DB, or the HOSTCTL_SECRET env
+            // on first run), the first token must be that secret or the whole
+            // command is silently ignored - no reply, no hint it exists. This
+            // is what protects the console if the host account is ever
+            // compromised or left open, and stays effective once the source is
+            // closed. Change it with the PW op; recover it via SQL if forgotten.
+            let secret = runtime.hostctl_secret().await;
+            if let Some(secret) = secret.as_deref() {
                 match arg.split_once(char::is_whitespace) {
                     Some((first, tail)) if first == secret => arg = tail.trim_start(),
                     // Also allow the secret alone (e.g. to get the ?? legend).
@@ -5566,23 +5602,45 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
 
             let two = s.len() >= 2 && s.is_char_boundary(2);
             let op = if two { s[..2].to_uppercase() } else { s.to_uppercase() };
-            let tail = if two { &s[2..] } else { "" };
+            let mut tail = if two { &s[2..] } else { "" };
+            // Optional `@<chat_id>` selector: lets a chat-scoped op act on
+            // another group instead of the one the command was typed in.
+            let mut chat_sel: Option<i64> = None;
+            if let Some(r) = tail.strip_prefix('@') {
+                let end = r.find(['.', '/']).unwrap_or(r.len());
+                chat_sel = r[..end].trim().parse().ok();
+                tail = &r[end..];
+            }
             let (id_seg, text_seg) = match tail.find('/') {
                 Some(i) => (&tail[..i], Some(tail[i + 1..].trim())),
                 None => (tail, None),
             };
-            let id_arg = id_seg.trim().trim_start_matches('.').trim();
-            let explicit_id: Option<i64> = id_arg.parse().ok();
-            let target_id: Option<i64> = explicit_id.or(reply_uid);
+            let dot_id: Option<i64> = id_seg.trim().trim_start_matches('.').trim().parse().ok();
             let text = text_seg.unwrap_or("");
+            // Which chat an op acts on. Chat-scoped ops (IL/CT/BS) take the
+            // target from @chat, or a bare `.id`, else the current chat. User
+            // ops (AP/AR/UB/UR) take the chat from @chat only (bare `.id` is
+            // the user there), else the current chat.
+            let chat_scoped = chat_sel.or(dot_id).map(ChatId).unwrap_or(chat_id);
+            let chat_user = chat_sel.map(ChatId).unwrap_or(chat_id);
+            let target_id: Option<i64> = dot_id.or(reply_uid);
 
             let out: String = match op.as_str() {
                 "" | "??" => (
-                    "<code>MP</code>pin <code>MU</code>unpin <code>MX</code>del · reply\n\
-                     <code>IL</code>invite <code>CT</code>/t <code>BS</code>/t\n\
-                     <code>AP</code>.id promote <code>AR</code>.id demote\n\
-                     <code>UB</code>.id ban <code>UR</code>.id unban\n\
-                     <code>BX</code>.chat/t send"
+                    "<b>主機終端 指令表</b>\n\
+                     <code>MP</code>　置頂（回覆訊息）\n\
+                     <code>MU</code>　取消置頂（回覆；無回覆＝全部）\n\
+                     <code>MX</code>　刪除（回覆訊息）\n\
+                     <code>IL</code>[<code>@群組</code>]　產生邀請連結\n\
+                     <code>AP</code>[<code>@群組</code>]<code>.id</code>　設為管理員（或回覆）\n\
+                     <code>AR</code>[<code>@群組</code>]<code>.id</code>　取消管理員（或回覆）\n\
+                     <code>UB</code>[<code>@群組</code>]<code>.id</code>　封鎖（或回覆）\n\
+                     <code>UR</code>[<code>@群組</code>]<code>.id</code>　解除封鎖（或回覆）\n\
+                     <code>CT</code>[<code>@群組</code>]<code>/文字</code>　改群名\n\
+                     <code>BS</code>[<code>@群組</code>]<code>/文字</code>　以機器人發言\n\
+                     <code>PW</code><code>/新密碼</code>　變更密碼\n\
+                     <i>不加 @群組 時對目前所在的群組操作。</i>\n\
+                     <i>例：IL@-1002680968271 ＝ 產生該群邀請連結</i>"
                 ).to_string(),
                 "MP" => match replied_id {
                     Some(mid) => report(bot.pin_chat_message(chat_id, mid).await.map(|_| ())),
@@ -5596,13 +5654,13 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     Some(mid) => report(bot.delete_message(chat_id, mid).await.map(|_| ())),
                     None => "ERR reply".to_string(),
                 },
-                "IL" => match bot.create_chat_invite_link(chat_id).await {
+                "IL" => match bot.create_chat_invite_link(chat_scoped).await {
                     Ok(link) => link.invite_link,
                     Err(e) => format!("ERR {e}"),
                 },
                 "AP" => match target_id {
                     Some(uid) => report(
-                        bot.promote_chat_member(chat_id, UserId(uid as u64))
+                        bot.promote_chat_member(chat_user, UserId(uid as u64))
                             .can_manage_chat(true)
                             .can_delete_messages(true)
                             .can_restrict_members(true)
@@ -5617,7 +5675,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 },
                 "AR" => match target_id {
                     Some(uid) => report(
-                        bot.promote_chat_member(chat_id, UserId(uid as u64))
+                        bot.promote_chat_member(chat_user, UserId(uid as u64))
                             .can_manage_chat(false)
                             .can_delete_messages(false)
                             .can_restrict_members(false)
@@ -5632,37 +5690,43 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     None => "ERR .id".to_string(),
                 },
                 "UB" => match target_id {
-                    Some(uid) => report(bot.ban_chat_member(chat_id, UserId(uid as u64)).await.map(|_| ())),
+                    Some(uid) => report(bot.ban_chat_member(chat_user, UserId(uid as u64)).await.map(|_| ())),
                     None => "ERR .id".to_string(),
                 },
                 "UR" => match target_id {
-                    Some(uid) => report(bot.unban_chat_member(chat_id, UserId(uid as u64)).await.map(|_| ())),
+                    Some(uid) => report(bot.unban_chat_member(chat_user, UserId(uid as u64)).await.map(|_| ())),
                     None => "ERR .id".to_string(),
                 },
                 "CT" => {
                     if text.is_empty() {
                         "ERR /t".to_string()
                     } else {
-                        report(bot.set_chat_title(chat_id, text).await.map(|_| ()))
+                        report(bot.set_chat_title(chat_scoped, text).await.map(|_| ()))
                     }
                 }
                 "BS" => {
                     if text.is_empty() {
                         "ERR /t".to_string()
                     } else {
-                        match bot.send_message(chat_id, text).parse_mode(ParseMode::Html).await {
+                        match bot.send_message(chat_scoped, text).parse_mode(ParseMode::Html).await {
                             Ok(_) => "OK".to_string(),
                             Err(e) => format!("ERR {e}"),
                         }
                     }
                 }
-                "BX" => match (explicit_id, text.is_empty()) {
-                    (Some(cid), false) => match bot.send_message(ChatId(cid), text).parse_mode(ParseMode::Html).await {
-                        Ok(_) => "OK".to_string(),
-                        Err(e) => format!("ERR {e}"),
-                    },
-                    _ => "ERR .chat/t".to_string(),
-                },
+                // Change the console secret. Reachable only after passing the
+                // current secret gate above, so it can't be used to reset a
+                // secret you don't already know.
+                "PW" => {
+                    if text.is_empty() {
+                        "ERR /t".to_string()
+                    } else {
+                        match runtime.set_hostctl_secret(text).await {
+                            Ok(()) => "OK 密碼已更新".to_string(),
+                            Err(e) => format!("ERR {e}"),
+                        }
+                    }
+                }
                 _ => "ERR".to_string(),
             };
             // Keep it low-profile: remove the command that was typed, and let
