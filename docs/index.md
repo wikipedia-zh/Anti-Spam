@@ -12,6 +12,9 @@ description: "Spam Protection Bot（SPB）使用規範"
 本文件同時提供繁體中文與英文版本。若兩者有歧義，以繁體中文版為準。
 This document is provided in Traditional Chinese and English. In case of ambiguity, the Traditional Chinese version prevails.
 
+尋找指令說明與各模組介紹？請見[使用指南](./guide.html)（繁體中文／简体中文）。
+Looking for a command and module reference instead? See the [User Guide](./guide.html) (Traditional/Simplified Chinese).
+
 ---
 
 ## 繁體中文
