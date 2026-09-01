@@ -6,7 +6,8 @@ theme: jekyll-theme-primer
 title: "Spam Protection Bot"
 description: "使用規範 / Terms of Use"
 
-# Only the terms are published. Nothing else in the repository is part of
+# Only these pages are published. Nothing else in the repository is part of
 # the site, so source files can never be served from here by accident.
 include:
   - index.md
+  - guide.md

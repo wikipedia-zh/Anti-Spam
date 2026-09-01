@@ -4234,7 +4234,7 @@ async fn notify_bot_added(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) 
             let _ = bot
                 .send_message(message.chat.id, welcome_text())
                 .parse_mode(ParseMode::Html)
-                .reply_markup(terms_button("閱讀使用規範 / Terms of Use"))
+                .reply_markup(info_buttons())
                 .await;
         }
     }
@@ -4397,11 +4397,20 @@ fn parse_leave_args(args: &str) -> (Option<i64>, String) {
 /// source tree, and the published page is the authoritative wording.
 const TERMS_URL: &str = "https://wikipedia-zh.github.io/Anti-Spam/";
 
-fn terms_button(label: &str) -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::url(
-        label.to_string(),
-        Url::parse(TERMS_URL).expect("TERMS_URL is a valid literal URL"),
-    )]])
+/// Command/module reference and FAQ, published alongside the terms - see
+/// `docs/guide.md`. Same GitHub Pages site as `TERMS_URL`, so this is one
+/// page users being pointed at the terms should also be able to reach.
+const GUIDE_URL: &str = "https://wikipedia-zh.github.io/Anti-Spam/guide.html";
+
+/// Terms-of-Use button plus a second row linking the user guide - shown
+/// wherever a group first encounters the bot or asks for help, so the guide
+/// is actually discoverable rather than only reachable by someone who
+/// already knows the URL.
+fn info_buttons() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::url("閱讀使用規範 / Terms of Use".to_string(), Url::parse(TERMS_URL).expect("TERMS_URL is a valid literal URL"))],
+        vec![InlineKeyboardButton::url("使用指南 / User Guide".to_string(), Url::parse(GUIDE_URL).expect("GUIDE_URL is a valid literal URL"))],
+    ])
 }
 
 /// Posted to a group the moment the bot is added. The terms bind the whole
@@ -5939,7 +5948,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             // appearing on one and not the other would just look like a bug.
             bot.send_message(message.chat.id, help_text())
                 .parse_mode(ParseMode::Html)
-                .reply_markup(terms_button("閱讀使用規範 / Terms of Use"))
+                .reply_markup(info_buttons())
                 .await?;
         }
         ModerationCommand::HelpOp(section) => {
@@ -9031,6 +9040,14 @@ mod tests {
     fn terms_url_is_parseable_and_is_not_the_repository() {
         assert!(Url::parse(TERMS_URL).is_ok());
         assert!(!TERMS_URL.contains("github.com"), "link to the published page, not the source repository");
+    }
+
+    // GUIDE_URL backs info_buttons' second row - same site as the terms, same
+    // failure mode (a typo would take down every welcome/help message).
+    #[test]
+    fn guide_url_is_parseable_and_lives_on_the_same_site_as_the_terms() {
+        assert!(Url::parse(GUIDE_URL).is_ok());
+        assert!(GUIDE_URL.starts_with(TERMS_URL), "the guide must be published alongside the terms, not elsewhere");
     }
 
     // Training one forwarded advert taught the model that "external",
