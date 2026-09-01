@@ -15,7 +15,7 @@ use regex::Regex as StdRegex;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::{collections::{HashMap, VecDeque}, env, path::PathBuf, sync::{Arc, Mutex as StdMutex, OnceLock}, time::Instant};
-use teloxide::{prelude::*, types::{CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, MessageId, ParseMode, UserId}};
+use teloxide::{prelude::*, types::{CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, MessageId, MessageKind, ParseMode, UserId}};
 use url::Url;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Duration};
@@ -4240,88 +4240,142 @@ async fn notify_bot_added(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) 
     }
 
     for user in users {
-        // Never name-guard a bot account - including this one. The name
-        // guard is written for human display names, and "Spam Protection"
-        // itself trips NL13 (two segments, >=13 chars) and NLTAIL, so
-        // joining a group with NoLongName on made the bot ban *itself* -
-        // which Telegram enforces by removing it from the group, so it
-        // looked like the bot spontaneously left. Every other moderation
-        // path here already skips `is_bot`; this loop was the exception.
-        if user.is_bot {
-            continue;
-        }
-        if runtime.is_maintainer(user.id.0 as i64).await || is_platform_pseudo_user(user.id.0 as i64) {
-            continue;
-        }
-        if runtime.is_global_whitelisted(user.id.0 as i64).await.unwrap_or(false) {
-            continue;
-        }
-        if runtime.is_group_whitelisted(message.chat.id.0, user.id.0 as i64).await.unwrap_or(false) {
-            continue;
-        }
-
-        let enabled = runtime.get_group_modules(message.chat.id.0).await.unwrap_or_default();
-        let mut banned = false;
-
-        if enabled.no_halal {
-            let all_reasons = {
-                let profile = runtime.load_user_profile(bot, user.id.0 as i64).await.ok();
-                let bio = profile.as_ref().and_then(|p| p.bio.as_deref());
-                evaluate_module_checks(user, user.username.as_deref(), bio, None)
-            };
-
-            if !all_reasons.is_empty() {
-                banned = true;
-                let _ = bot.delete_message(message.chat.id, message.id).await;
-                let _ = ban_user(bot, message.chat.id, user.id.0 as i64).await;
-                let case = CaseRecord {
-                    id: Uuid::new_v4().to_string(),
-                    action: ActionKind::AutoBan,
-                    chat_id: message.chat.id.0,
-                    target_user_id: user.id.0 as i64,
-                    target_name: short_user(user),
-                    actor_user_id: None,
-                    actor_name: None,
-                    source_message_id: Some(message.id.0),
-                    evidence_text: extract_full_text(message),
-                    model_score: None,
-                    matched_rule_id: None,
-                    matched_rule_pattern: Some(all_reasons.join("；")),
-                    status: "auto_banned".to_string(),
-                    log_message_id: None,
-                    created_at: Utc::now(),
-                };
-                let log_message_id = log_action(bot, runtime, &case).await.unwrap_or_default();
-                let mut updated = case.clone();
-                updated.log_message_id = Some(log_message_id);
-                let _ = store_case(runtime, &updated).await;
-                let _ = notify_group(bot, runtime, &updated, log_message_id, "<b>自動模組封禁</b>").await;
-                propagate_network_ban(bot, runtime, &updated).await;
-                broadcast_ban_status(bot, runtime, updated.target_user_id, true).await;
-            }
-        }
-
-        // Join-time netban catch-up: this group only learns about a network
-        // ban when it's checked (there's no way to scan existing members via
-        // the Bot API to backfill), so check every new joiner. A known-bad
-        // user doesn't need a CAPTCHA challenge, so this takes priority over
-        // that check.
-        if !banned && enabled.netban {
-            if let Ok(Some(prior_case)) = runtime.find_active_network_ban(user.id.0 as i64).await {
-                banned = true;
-                let _ = bot.delete_message(message.chat.id, message.id).await;
-                let _ = bot.ban_chat_member(message.chat.id, user.id).await;
-                let _ = runtime.record_network_ban_target(&prior_case.id, message.chat.id.0).await;
-                notify_netban_sync(bot, message.chat.id, user.id.0 as i64, &prior_case.id).await;
-            }
-        }
-
-        if !banned && enabled.captcha {
-            start_captcha_challenge(bot, runtime, message.chat.id, user).await;
-        }
+        process_new_group_member(bot, runtime, message, user).await;
     }
 
     true
+}
+
+/// Runs every join-time check (no_halal name-guard, netban catch-up, join
+/// CAPTCHA) for one newly-joined human member. Shared by `notify_bot_added`'s
+/// `new_chat_members` loop and `check_community_join_and_act`'s fallback path
+/// for joins Bot API models in a way teloxide-core doesn't recognize yet
+/// (see that function's doc comment) - both need the exact same checks run
+/// against the exact same joiner.
+async fn process_new_group_member(bot: &Bot, runtime: &Arc<Runtime>, message: &Message, user: &teloxide::types::User) {
+    // Never name-guard a bot account - including this one. The name guard is
+    // written for human display names, and "Spam Protection" itself trips
+    // NL13 (two segments, >=13 chars) and NLTAIL, so joining a group with
+    // NoLongName on made the bot ban *itself* - which Telegram enforces by
+    // removing it from the group, so it looked like the bot spontaneously
+    // left. Every other moderation path here already skips `is_bot`; this
+    // loop was the exception.
+    if user.is_bot {
+        return;
+    }
+    if runtime.is_maintainer(user.id.0 as i64).await || is_platform_pseudo_user(user.id.0 as i64) {
+        return;
+    }
+    if runtime.is_global_whitelisted(user.id.0 as i64).await.unwrap_or(false) {
+        return;
+    }
+    if runtime.is_group_whitelisted(message.chat.id.0, user.id.0 as i64).await.unwrap_or(false) {
+        return;
+    }
+
+    let enabled = runtime.get_group_modules(message.chat.id.0).await.unwrap_or_default();
+    let mut banned = false;
+
+    if enabled.no_halal {
+        let all_reasons = {
+            let profile = runtime.load_user_profile(bot, user.id.0 as i64).await.ok();
+            let bio = profile.as_ref().and_then(|p| p.bio.as_deref());
+            evaluate_module_checks(user, user.username.as_deref(), bio, None)
+        };
+
+        if !all_reasons.is_empty() {
+            banned = true;
+            let _ = bot.delete_message(message.chat.id, message.id).await;
+            let _ = ban_user(bot, message.chat.id, user.id.0 as i64).await;
+            let case = CaseRecord {
+                id: Uuid::new_v4().to_string(),
+                action: ActionKind::AutoBan,
+                chat_id: message.chat.id.0,
+                target_user_id: user.id.0 as i64,
+                target_name: short_user(user),
+                actor_user_id: None,
+                actor_name: None,
+                source_message_id: Some(message.id.0),
+                evidence_text: extract_full_text(message),
+                model_score: None,
+                matched_rule_id: None,
+                matched_rule_pattern: Some(all_reasons.join("；")),
+                status: "auto_banned".to_string(),
+                log_message_id: None,
+                created_at: Utc::now(),
+            };
+            let log_message_id = log_action(bot, runtime, &case).await.unwrap_or_default();
+            let mut updated = case.clone();
+            updated.log_message_id = Some(log_message_id);
+            let _ = store_case(runtime, &updated).await;
+            let _ = notify_group(bot, runtime, &updated, log_message_id, "<b>自動模組封禁</b>").await;
+            propagate_network_ban(bot, runtime, &updated).await;
+            broadcast_ban_status(bot, runtime, updated.target_user_id, true).await;
+        }
+    }
+
+    // Join-time netban catch-up: this group only learns about a network
+    // ban when it's checked (there's no way to scan existing members via
+    // the Bot API to backfill), so check every new joiner. A known-bad
+    // user doesn't need a CAPTCHA challenge, so this takes priority over
+    // that check.
+    if !banned && enabled.netban {
+        if let Ok(Some(prior_case)) = runtime.find_active_network_ban(user.id.0 as i64).await {
+            banned = true;
+            let _ = bot.delete_message(message.chat.id, message.id).await;
+            let _ = bot.ban_chat_member(message.chat.id, user.id).await;
+            let _ = runtime.record_network_ban_target(&prior_case.id, message.chat.id.0).await;
+            notify_netban_sync(bot, message.chat.id, user.id.0 as i64, &prior_case.id).await;
+        }
+    }
+
+    if !banned && enabled.captcha {
+        start_captcha_challenge(bot, runtime, message.chat.id, user).await;
+    }
+}
+
+/// Fallback join detector for the Telegram Bot API's Communities feature.
+/// Bot API 10.3 (2026-08-24) added `community_chat_joined` as a new optional
+/// field on `Message`, sent as the service notice when someone joins this
+/// chat "instantly" through a linked Community - Telegram's client renders
+/// it as "X joined the group via the Y community". teloxide-core 0.13.0 (the
+/// latest release at time of writing; no newer one exists yet) predates this
+/// field entirely, and `MessageKind` is a `#[serde(untagged)]` enum with no
+/// variant for it, so deserialization falls through every known variant and
+/// lands on the documented last-resort `MessageKind::Empty {}` catch-all -
+/// which the library's own docs describe as only ever showing up on a stale
+/// message referenced from an old callback query, never on a live incoming
+/// message. In practice that makes a live `Empty` message from a real
+/// (non-bot) sender in a group a reliable proxy for exactly this case today.
+/// `.from` is treated as the joiner, mirroring how a self-initiated
+/// `new_chat_members` join already works (from == the joiner themself).
+///
+/// This is a stopgap: if Telegram adds another new, still-unmapped `Message`
+/// field later, a live message carrying *that* field would also land on
+/// `Empty` and get misread as a join here. Revisit/remove this once
+/// teloxide-core ships proper Community support.
+async fn check_community_join_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) -> bool {
+    let Some(user) = unrecognized_join_sender(message) else { return false; };
+    process_new_group_member(bot, runtime, message, user).await;
+    true
+}
+
+/// Pure half of `check_community_join_and_act`'s detection, split out for
+/// unit testing without a live `Bot`. Returns the presumed joiner when this
+/// message looks like the `Empty`-kind fallback described on
+/// `check_community_join_and_act`, `None` otherwise.
+fn unrecognized_join_sender(message: &Message) -> Option<&teloxide::types::User> {
+    if !message.chat.is_group() && !message.chat.is_supergroup() {
+        return None;
+    }
+    if !matches!(message.kind, MessageKind::Empty {}) {
+        return None;
+    }
+    let user = message.from.as_ref()?;
+    if user.is_bot {
+        return None;
+    }
+    Some(user)
 }
 
 fn parse_leave_args(args: &str) -> (Option<i64>, String) {
@@ -5176,20 +5230,10 @@ async fn unpin_channel_autopin(bot: &Bot, runtime: &Runtime, message: &Message) 
     let _ = bot.unpin_chat_message(message.chat.id).message_id(pinned_msg.id).await;
 }
 
-async fn delete_service_message_if_enabled(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) -> ResponseResult<bool> {
-    // Only apply in groups/supergroups
-    if !message.chat.is_group() && !message.chat.is_supergroup() {
-        return Ok(false);
-    }
-
-    let chat_id = message.chat.id.0;
-    let settings = runtime.get_group_modules(chat_id).await.unwrap_or_default();
-    
-    if !settings.no_service_messages {
-        return Ok(false);
-    }
-
-    let is_service = message.new_chat_members().is_some()
+/// Pure classification, split out from `delete_service_message_if_enabled`
+/// so the fallback case below can be unit-tested without a live `Bot`.
+fn is_service_message(message: &Message) -> bool {
+    message.new_chat_members().is_some()
         || message.left_chat_member().is_some()
         || message.new_chat_title().is_some()
         || message.new_chat_photo().is_some()
@@ -5202,9 +5246,29 @@ async fn delete_service_message_if_enabled(bot: &Bot, runtime: &Arc<Runtime>, me
         || message.message_auto_delete_timer_changed().is_some()
         || message.video_chat_started().is_some()
         || message.video_chat_ended().is_some()
-        || message.video_chat_participants_invited().is_some();
+        || message.video_chat_participants_invited().is_some()
+        // A message kind teloxide-core has no variant for - a new/unmapped
+        // Bot API service field (currently: Communities' `community_chat_joined`,
+        // see check_community_join_and_act). Treated as a service message
+        // like every other kind above, so a NoServiceMessage group still gets
+        // it cleaned up even though the library can't name what it is.
+        || matches!(message.kind, MessageKind::Empty {})
+}
 
-    if is_service {
+async fn delete_service_message_if_enabled(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) -> ResponseResult<bool> {
+    // Only apply in groups/supergroups
+    if !message.chat.is_group() && !message.chat.is_supergroup() {
+        return Ok(false);
+    }
+
+    let chat_id = message.chat.id.0;
+    let settings = runtime.get_group_modules(chat_id).await.unwrap_or_default();
+
+    if !settings.no_service_messages {
+        return Ok(false);
+    }
+
+    if is_service_message(message) {
         let _ = bot.delete_message(message.chat.id, message.id).await;
         return Ok(true);
     }
@@ -8356,8 +8420,25 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // First, check and delete service messages if enabled
+                // Join processing (bot-added notice/refusal, plus per-member
+                // no_halal/netban-catchup/CAPTCHA) must run before the
+                // service-message cleanup below - otherwise a group with
+                // NoServiceMessage enabled would have its join notice deleted
+                // before the bot ever looked at who joined, silently skipping
+                // every join-time check for that group. `notify_bot_added`
+                // covers ordinary `new_chat_members` joins;
+                // `check_community_join_and_act` covers joins via a linked
+                // Community, which arrive as a message kind teloxide-core
+                // doesn't recognize (see its doc comment).
+                let joined = notify_bot_added(&bot, &runtime, &message).await
+                    || check_community_join_and_act(&bot, &runtime, &message).await;
+
+                // Then check and delete service messages if enabled - this
+                // also cleans up the join notice itself, whichever kind it was.
                 if delete_service_message_if_enabled(&bot, &runtime, &message).await? {
+                    return Ok(());
+                }
+                if joined {
                     return Ok(());
                 }
 
@@ -8416,9 +8497,6 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
 
-                if notify_bot_added(&bot, &runtime, &message).await {
-                    return Ok(());
-                }
                 if let Some(text) = message.text() {
                     if text.trim_start().starts_with('/') {
                         if !matches!(parse_command(text), ModerationCommand::Unknown) {
@@ -9086,6 +9164,61 @@ mod tests {
         assert_eq!(attachment_violation(&m(contact), &only_contact), Some("CONTACT"));
         assert_eq!(attachment_violation(&m(voice), &only_contact), None);
         assert_eq!(attachment_violation(&m(exe), &only_contact), None);
+    }
+
+    // Bot API 10.3 (2026-08-24) added `community_chat_joined` as a new
+    // optional field on Message, for the "joined via Community" service
+    // notice - a field teloxide-core 0.13.0 (current release) has no
+    // MessageKind variant for. This test pins down the load-bearing
+    // assumption check_community_join_and_act relies on: such a message
+    // still deserializes successfully (doesn't get dropped), just with
+    // `kind` falling through to the library's documented `Empty {}`
+    // catch-all - see is_service_message and unrecognized_join_sender. If a
+    // future teloxide-core release adds real support, this message would
+    // instead deserialize into a proper variant and this assertion would
+    // start failing, which is exactly the signal to remove the workaround.
+    #[test]
+    fn community_join_message_falls_back_to_empty_kind() {
+        let json = r#"{"message_id":9,"date":1,"chat":{"id":-100,"type":"supergroup","title":"g"},"from":{"id":42,"is_bot":false,"first_name":"YuanLi"},"community_chat_joined":{"community":{"id":-200}}}"#;
+        let msg: Message = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg.kind, MessageKind::Empty {}), "unmapped fields must fall through to Empty, not fail to parse");
+        assert_eq!(msg.chat.id.0, -100);
+        assert_eq!(msg.from.as_ref().map(|u| u.id.0), Some(42));
+    }
+
+    // unrecognized_join_sender backs check_community_join_and_act: it must
+    // fire only for the Empty-kind/real-user/group combination, and stay
+    // silent for every message shape that's either normal content, a
+    // recognized service message, a DM, or bot-authored (which would
+    // otherwise loop the bot's own service notices back through join
+    // processing).
+    #[test]
+    fn unrecognized_join_sender_matches_only_the_fallback_shape() {
+        let community_join = r#"{"message_id":1,"date":1,"chat":{"id":-100,"type":"supergroup","title":"g"},"from":{"id":42,"is_bot":false,"first_name":"YuanLi"},"community_chat_joined":{"community":{"id":-200}}}"#;
+        let ordinary_text = r#"{"message_id":2,"date":1,"chat":{"id":-100,"type":"supergroup","title":"g"},"from":{"id":42,"is_bot":false,"first_name":"YuanLi"},"text":"hello"}"#;
+        let real_join = r#"{"message_id":3,"date":1,"chat":{"id":-100,"type":"supergroup","title":"g"},"from":{"id":42,"is_bot":false,"first_name":"YuanLi"},"new_chat_members":[{"id":42,"is_bot":false,"first_name":"YuanLi"}]}"#;
+        let bot_authored_empty = r#"{"message_id":4,"date":1,"chat":{"id":-100,"type":"supergroup","title":"g"},"from":{"id":9,"is_bot":true,"first_name":"SomeBot"},"community_chat_joined":{"community":{"id":-200}}}"#;
+        let private_chat = r#"{"message_id":5,"date":1,"chat":{"id":42,"type":"private","first_name":"YuanLi"},"from":{"id":42,"is_bot":false,"first_name":"YuanLi"},"community_chat_joined":{"community":{"id":-200}}}"#;
+        let m = |j: &str| serde_json::from_str::<Message>(j).unwrap();
+
+        assert_eq!(unrecognized_join_sender(&m(community_join)).map(|u| u.id.0), Some(42), "the actual fallback shape must match");
+        assert!(unrecognized_join_sender(&m(ordinary_text)).is_none(), "normal content must not be treated as a join");
+        assert!(unrecognized_join_sender(&m(real_join)).is_none(), "a message teloxide already understands must not be double-handled here");
+        assert!(unrecognized_join_sender(&m(bot_authored_empty)).is_none(), "must never treat a bot-authored message as a human join");
+        assert!(unrecognized_join_sender(&m(private_chat)).is_none(), "must only apply in groups/supergroups");
+    }
+
+    // The is_service_message fallback bullet is what makes /module nosm
+    // actually delete a "joined via community" notice instead of leaving it
+    // sitting in the chat forever.
+    #[test]
+    fn service_message_detector_catches_the_empty_kind_fallback() {
+        let community_join = r#"{"message_id":1,"date":1,"chat":{"id":-100,"type":"supergroup","title":"g"},"from":{"id":42,"is_bot":false,"first_name":"YuanLi"},"community_chat_joined":{"community":{"id":-200}}}"#;
+        let ordinary_text = r#"{"message_id":2,"date":1,"chat":{"id":-100,"type":"supergroup","title":"g"},"from":{"id":42,"is_bot":false,"first_name":"YuanLi"},"text":"hello"}"#;
+        let m = |j: &str| serde_json::from_str::<Message>(j).unwrap();
+
+        assert!(is_service_message(&m(community_join)));
+        assert!(!is_service_message(&m(ordinary_text)));
     }
 
     // Extension parsing decides whether a file is treated as executable, so
