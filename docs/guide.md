@@ -51,6 +51,14 @@ Spam Protection Bot（SPB，機器人帳號 [@WikiBlacklistRobot](https://t.me/W
 | `/module` | 查看本群各防護模組的開關狀態 |
 | `/module <名稱> on\|off` | 切換單一模組 |
 | `/module all on\|off` | 一次全開或全關（基礎防護不受影響，見下） |
+| `/warn [原因]`（回覆訊息） | 發出一次警告，達門檻自動處置（預設 2 次，見下） |
+| `/unwarn [n]`（回覆用戶） | 移除最近 n 次警告，預設 1 |
+| `/warns`（回覆或提供 user_id） | 查詢目前警告次數與紀錄 |
+| `/warnconfig [門檻] [mute\|kick\|ban] [時長]` | 查看或設定本群警告門檻與處置方式 |
+| `/ot`（回覆離題訊息） | 刪除該訊息並加警告（預設 1 次，可用 `/ot_warns` 調整） |
+| `/ot_template <文字>` | 自訂 `/ot` 的提及訊息（`{user}`／`{count}` 佔位符） |
+
+警告永不過期，只能用 `/unwarn` 手動移除。
 
 ### 5. 各防護模組
 
@@ -87,6 +95,8 @@ Spam Protection Bot（SPB，機器人帳號 [@WikiBlacklistRobot](https://t.me/W
 | `VOICE` | 傳送語音訊息（NoVoice） |
 | `EXEC_FILE` | 傳送可執行檔案（NoExec） |
 | `BOTSPAM` | 純粹提及機器人帳號的訪客模式廣告 |
+| `WARN` | 累計警告達本群設定的門檻，自動處置 |
+| `PB` | 項目層級封禁（Project Ban），對所有群組強制生效，本群無法解除 |
 
 ### 7. Netban（跨群組共用黑名單）怎麼運作
 
@@ -162,6 +172,14 @@ Spam Protection Bot（SPB，机器人账号 [@WikiBlacklistRobot](https://t.me/W
 | `/module` | 查看本群各防护模块的开关状态 |
 | `/module <名称> on\|off` | 切换单个模块 |
 | `/module all on\|off` | 一次性全开或全关（基础防护不受影响，见下） |
+| `/warn [原因]`（回复消息） | 发出一次警告，达阈值自动处置（默认 2 次，见下） |
+| `/unwarn [n]`（回复用户） | 移除最近 n 次警告，默认 1 |
+| `/warns`（回复或提供 user_id） | 查询目前警告次数与记录 |
+| `/warnconfig [阈值] [mute\|kick\|ban] [时长]` | 查看或设置本群警告阈值与处置方式 |
+| `/ot`（回复离题消息） | 删除该消息并加警告（默认 1 次，可用 `/ot_warns` 调整） |
+| `/ot_template <文字>` | 自定义 `/ot` 的提及消息（`{user}`／`{count}` 占位符） |
+
+警告永不过期，只能用 `/unwarn` 手动移除。
 
 ### 5. 各防护模块
 
@@ -198,6 +216,8 @@ Spam Protection Bot（SPB，机器人账号 [@WikiBlacklistRobot](https://t.me/W
 | `VOICE` | 发送语音消息（NoVoice） |
 | `EXEC_FILE` | 发送可执行文件（NoExec） |
 | `BOTSPAM` | 纯粹提及机器人账号的访客模式广告 |
+| `WARN` | 累计警告达本群设置的阈值，自动处置 |
+| `PB` | 项目级封禁（Project Ban），对所有群组强制生效，本群无法解除 |
 
 ### 7. Netban（跨群组共享黑名单）如何运作
 
