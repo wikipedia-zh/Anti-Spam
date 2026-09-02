@@ -99,6 +99,10 @@ enum ActionKind {
     CmdCleanMute,
     GuestBotBan,
     GuestInvokerBan,
+    /// A maintainer-issued `/pb` (Project Ban, code "PB") - unlike every
+    /// other ban kind here, this is never opt-in on the receiving end. See
+    /// `check_project_ban_and_act` and `find_active_project_ban`.
+    ProjectBan,
 }
 
 impl ActionKind {
@@ -118,6 +122,7 @@ impl ActionKind {
             ActionKind::CmdCleanMute => "cmd_clean_mute",
             ActionKind::GuestBotBan => "guest_bot_ban",
             ActionKind::GuestInvokerBan => "guest_invoker_ban",
+            ActionKind::ProjectBan => "project_ban",
         }
     }
 
@@ -137,6 +142,7 @@ impl ActionKind {
             "cmd_clean_mute" => ActionKind::CmdCleanMute,
             "guest_bot_ban" => ActionKind::GuestBotBan,
             "guest_invoker_ban" => ActionKind::GuestInvokerBan,
+            "project_ban" => ActionKind::ProjectBan,
             _ => ActionKind::AutoBan,
         }
     }
@@ -390,6 +396,34 @@ impl Default for GroupModuleSettings {
     }
 }
 
+/// A group's `/warn` escalation policy - not a `GroupModuleSettings` field
+/// because the warn system isn't a module: every group has it, with no
+/// on/off switch, only these knobs. `action` is "mute" | "kick" | "ban";
+/// `action_duration_secs` only applies to "mute" (`None` = permanent).
+#[derive(Clone)]
+struct WarnSettings {
+    threshold: i64,
+    action: String,
+    action_duration_secs: Option<i64>,
+    ot_warn_count: i64,
+    ot_template: Option<String>,
+}
+
+impl Default for WarnSettings {
+    fn default() -> Self {
+        Self {
+            threshold: 2,
+            action: "mute".to_string(),
+            // 24h: long enough to actually discourage a repeat, short enough
+            // that an admin doesn't have to remember to manually lift it.
+            // Purely a starting default - /warnconfig overrides it per group.
+            action_duration_secs: Some(24 * 3600),
+            ot_warn_count: 1,
+            ot_template: None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ModuleCheckResult {
     reasons: Vec<String>,
@@ -637,6 +671,9 @@ impl Runtime {
         }
         if user_version < 15 {
             Self::migrate_v14_to_v15(conn)?;
+        }
+        if user_version < 16 {
+            Self::migrate_v15_to_v16(conn)?;
         }
         Ok(())
     }
@@ -995,6 +1032,45 @@ impl Runtime {
         Ok(())
     }
 
+    /// Backs the generic, always-on warn system (`/warn`, not a module - see
+    /// `WarnSettings`) and `/ot`'s per-group customization. `warns` keeps one
+    /// row per warning (not just a counter) so a reason survives and
+    /// `/unwarn <n>` can drop exactly the N most recent; warns never expire,
+    /// so there is deliberately no TTL/cleanup here.
+    fn migrate_v15_to_v16(conn: &mut Connection) -> Result<()> {
+        let tx = conn.transaction()?;
+        tx.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS warns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                reason TEXT,
+                warned_by INTEGER,
+                created_at TEXT NOT NULL
+            )
+            "#,
+            [],
+        )?;
+        tx.execute("CREATE INDEX IF NOT EXISTS idx_warns_chat_user ON warns(chat_id, user_id)", [])?;
+        tx.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS group_warn_settings (
+                chat_id INTEGER PRIMARY KEY,
+                threshold INTEGER NOT NULL DEFAULT 2,
+                action TEXT NOT NULL DEFAULT 'mute',
+                action_duration_secs INTEGER,
+                ot_warn_count INTEGER NOT NULL DEFAULT 1,
+                ot_template TEXT
+            )
+            "#,
+            [],
+        )?;
+        tx.execute("PRAGMA user_version = 16", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// A `/set` call with a target very close to 0 or 1 used to compute an
     /// astronomically large raw count for a single token (see
     /// the removed `/set` command) — that count then dominated the shared
@@ -1252,6 +1328,26 @@ impl Runtime {
         .await
     }
 
+    /// Whether `user_id` currently has an active `/pb` (Project Ban). Unlike
+    /// `find_active_network_ban`, this has nothing to do with `netban_eligible`
+    /// or any group's Netban toggle - a Project Ban is never opt-in, so
+    /// `check_project_ban_and_act` and the /unban/white bypass guards call
+    /// this directly. Same reversal shape as every other case kind: /unban
+    /// rewrites `action` to `unbanned` in place, so a lifted PB naturally
+    /// stops matching here.
+    async fn find_active_project_ban(&self, user_id: i64) -> Result<Option<CaseRecord>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, action, chat_id, target_user_id, target_name, actor_user_id, actor_name, source_message_id, evidence_text, model_score, matched_rule_id, matched_rule_pattern, status, log_message_id, created_at
+                 FROM cases WHERE target_user_id = ?1 AND action = 'project_ban'
+                 ORDER BY created_at DESC LIMIT 1",
+            )?;
+            let mut rows = stmt.query(params![user_id])?;
+            rows.next()?.map(case_from_row).transpose()
+        })
+        .await
+    }
+
     /// Adds a case to the shared blacklist. Separate from `persist_case` on
     /// purpose: that one rewrites the whole row from a `CaseRecord`, which
     /// carries no netban field, so leaving this column out of its INSERT and
@@ -1294,7 +1390,7 @@ impl Runtime {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, action, chat_id, target_user_id, target_name, actor_user_id, actor_name, source_message_id, evidence_text, model_score, matched_rule_id, matched_rule_pattern, status, log_message_id, created_at
-                 FROM cases WHERE target_user_id = ?1 AND action IN ('auto_ban', 'spam_ban', 'report_approved', 'guest_bot_ban', 'guest_invoker_ban')
+                 FROM cases WHERE target_user_id = ?1 AND action IN ('auto_ban', 'spam_ban', 'report_approved', 'guest_bot_ban', 'guest_invoker_ban', 'project_ban')
                  ORDER BY created_at DESC",
             )?;
             let mut rows = stmt.query(params![user_id])?;
@@ -2968,6 +3064,125 @@ impl Runtime {
         .await
     }
 
+    /// Records one `/warn` (with an optional reason) and returns the new
+    /// total for this (chat, user). Unlike `pol_warnings`' bare counter, this
+    /// keeps one row per warning - `/warn`'s reason has to survive somewhere,
+    /// and `/unwarn <n>` needs individual rows to drop the N most recent
+    /// from. Warns never expire, so there's deliberately no cleanup here.
+    async fn add_warn(&self, chat_id: i64, user_id: i64, reason: Option<&str>, warned_by: i64) -> Result<i64> {
+        let reason = reason.map(|s| s.to_string());
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO warns (chat_id, user_id, reason, warned_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![chat_id, user_id, reason, warned_by, Utc::now().to_rfc3339()],
+            )?;
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM warns WHERE chat_id = ?1 AND user_id = ?2", params![chat_id, user_id], |r| r.get(0))?;
+            Ok(count)
+        })
+        .await
+    }
+
+    async fn warn_count(&self, chat_id: i64, user_id: i64) -> Result<i64> {
+        self.with_conn(move |conn| {
+            Ok(conn.query_row("SELECT COUNT(*) FROM warns WHERE chat_id = ?1 AND user_id = ?2", params![chat_id, user_id], |r| r.get(0))?)
+        })
+        .await
+    }
+
+    /// Drops the `n` most recent warns for (chat, user) - `/unwarn [n]`,
+    /// default 1. Standard-SQL `DELETE ... WHERE id IN (subquery LIMIT n)`
+    /// rather than `DELETE ... ORDER BY ... LIMIT`, since the latter needs a
+    /// SQLite build flag this project doesn't assume. Returns how many were
+    /// actually removed (fewer than `n` if the user had fewer warns).
+    async fn remove_warns(&self, chat_id: i64, user_id: i64, n: i64) -> Result<i64> {
+        self.with_conn(move |conn| {
+            let removed = conn.execute(
+                "DELETE FROM warns WHERE id IN (SELECT id FROM warns WHERE chat_id = ?1 AND user_id = ?2 ORDER BY created_at DESC, id DESC LIMIT ?3)",
+                params![chat_id, user_id, n],
+            )?;
+            Ok(removed as i64)
+        })
+        .await
+    }
+
+    /// Most recent warns for `/warns`' display, newest first. Capped at 20 -
+    /// this renders into one Telegram message, not a paginated export.
+    async fn list_warns(&self, chat_id: i64, user_id: i64) -> Result<Vec<(Option<String>, String)>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare("SELECT reason, created_at FROM warns WHERE chat_id = ?1 AND user_id = ?2 ORDER BY created_at DESC, id DESC LIMIT 20")?;
+            let rows = stmt.query_map(params![chat_id, user_id], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+        .await
+    }
+
+    /// A group's warn-escalation policy, defaulted in Rust rather than
+    /// eagerly writing a row for every group (like `spam_threshold_override`,
+    /// not like `group_module_settings`'s always-present row) - most groups
+    /// will never touch `/warnconfig`/`/ot_warns`/`/ot_template`, so there's
+    /// no reason to materialize a row until one of them does.
+    async fn get_warn_settings(&self, chat_id: i64) -> Result<WarnSettings> {
+        self.with_conn(move |conn| {
+            let row = conn.query_row(
+                "SELECT threshold, action, action_duration_secs, ot_warn_count, ot_template FROM group_warn_settings WHERE chat_id = ?1",
+                params![chat_id],
+                |r| {
+                    Ok(WarnSettings {
+                        threshold: r.get(0)?,
+                        action: r.get(1)?,
+                        action_duration_secs: r.get(2)?,
+                        ot_warn_count: r.get(3)?,
+                        ot_template: r.get(4)?,
+                    })
+                },
+            );
+            match row {
+                Ok(settings) => Ok(settings),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(WarnSettings::default()),
+                Err(err) => Err(err.into()),
+            }
+        })
+        .await
+    }
+
+    async fn set_warn_config(&self, chat_id: i64, threshold: i64, action: &str, duration_secs: Option<i64>) -> Result<()> {
+        let action = action.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO group_warn_settings (chat_id, threshold, action, action_duration_secs) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(chat_id) DO UPDATE SET threshold = excluded.threshold, action = excluded.action, action_duration_secs = excluded.action_duration_secs",
+                params![chat_id, threshold, action, duration_secs],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn set_ot_warn_count(&self, chat_id: i64, count: i64) -> Result<()> {
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO group_warn_settings (chat_id, ot_warn_count) VALUES (?1, ?2)
+                 ON CONFLICT(chat_id) DO UPDATE SET ot_warn_count = excluded.ot_warn_count",
+                params![chat_id, count],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn set_ot_template(&self, chat_id: i64, template: Option<&str>) -> Result<()> {
+        let template = template.map(|s| s.to_string());
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO group_warn_settings (chat_id, ot_template) VALUES (?1, ?2)
+                 ON CONFLICT(chat_id) DO UPDATE SET ot_template = excluded.ot_template",
+                params![chat_id, template],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn is_global_whitelisted(&self, user_id: i64) -> Result<bool> {
         self.with_conn(move |conn| {
             let count: i64 = conn.query_row(
@@ -3159,6 +3374,14 @@ enum ModerationCommand {
     SetExchangeChannel(String),
     Magic(String, String, String),
     Pol(String),
+    ProjectBan(String),
+    Warn(String),
+    Unwarn(String),
+    Warns(String),
+    WarnConfig(String),
+    Ot,
+    OtWarns(String),
+    OtTemplate(String),
     Unknown,
 }
 
@@ -3272,6 +3495,17 @@ fn parse_command(text: &str) -> ModerationCommand {
             ModerationCommand::Magic(module, chat_id, action)
         }
         "/pol" => ModerationCommand::Pol(text.split_whitespace().nth(1).unwrap_or("").to_string()),
+        "/pb" => ModerationCommand::ProjectBan(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
+        "/warn" => ModerationCommand::Warn(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
+        "/unwarn" => ModerationCommand::Unwarn(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
+        "/warns" => ModerationCommand::Warns(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
+        "/warnconfig" => ModerationCommand::WarnConfig(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
+        "/ot" => ModerationCommand::Ot,
+        "/ot_warns" => ModerationCommand::OtWarns(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
+        // Preserves internal whitespace/newlines (unlike the word-rejoin
+        // forms above) - this holds a formatted message template, not a
+        // one-line reason.
+        "/ot_template" => ModerationCommand::OtTemplate(text.split_once(char::is_whitespace).map(|x| x.1.trim().to_string()).unwrap_or_default()),
         _ => ModerationCommand::Unknown,
     }
 }
@@ -3570,6 +3804,16 @@ fn help_text() -> String {
         "<code>/module</code> 查看模組開關狀態\n",
         "<code>/module 名稱 on|off</code> 切換\n",
         "<code>/module all on|off</code> 全開／全關\n",
+        "\n<b>━━ 警告系統（非模組，常駐）━━</b>\n",
+        "<code>/warn [原因]</code> 回覆訊息發出警告\n",
+        "<code>/unwarn [n]</code> 回覆用戶，移除最近 n 次\n",
+        "<code>/warns</code> 回覆或提供 user_id 查詢\n",
+        "<code>/warnconfig</code> 查看／設定門檻與動作\n",
+        "· 預設 2 次警告觸發 mute，可調整\n",
+        "<code>/ot</code> 回覆離題訊息：刪除並警告\n",
+        "<code>/ot_warns &lt;n&gt;</code> 設定 /ot 每次加幾次警告\n",
+        "<code>/ot_template &lt;文字&gt;</code> 自訂提及訊息\n",
+        "· 用 {user} {count} 代表提及與目前次數\n",
         "\n<b>━━ 模組 ━━</b>\n",
         "<b>預設開啟</b>\n",
         "· Flood 洗版偵測\n",
@@ -3659,6 +3903,11 @@ fn help_op_text(section: &str) -> String {
             "· 負數＝群組，正數＝用戶\n",
             "<code>/list_banned</code> 列出封禁名單\n",
             "<code>/groups</code> 匯出服務中的群組清單（txt）\n",
+            "<code>/pb &lt;user_id&gt; [原因]</code>\n",
+            "· 項目層級封禁（PB）\n",
+            "· 對所有群組強制生效，本群無法解除\n",
+            "· /unban、/white 皆拒絕並通知維護組\n",
+            "· 解除：/unban &lt;user_id&gt;（維護組）\n",
             "\n<b>審核員</b>\n",
             "<code>/reviewer add|del &lt;user_id&gt;</code>\n",
             "<code>/reviewer list</code>\n",
@@ -3906,6 +4155,41 @@ fn mention_link(user_id: i64, name: &str) -> String {
     format!("<a href=\"tg://user?id={user_id}\">{}</a>", escape_html(name))
 }
 
+/// Parses a `/warnconfig` duration argument: plain digits are seconds,
+/// `<n>h`/`<n>d` are hours/days, and "0"/empty/"永久"/"permanent" mean no
+/// expiry (`None`) - only meaningful for the "mute" action.
+fn parse_duration_zh(raw: &str) -> Option<i64> {
+    let raw = raw.trim().to_lowercase();
+    if raw.is_empty() || raw == "0" || raw == "永久" || raw == "permanent" {
+        return None;
+    }
+    if let Some(digits) = raw.strip_suffix('h') {
+        return digits.parse::<i64>().ok().map(|h| h * 3600);
+    }
+    if let Some(digits) = raw.strip_suffix('d') {
+        return digits.parse::<i64>().ok().map(|d| d * 86400);
+    }
+    raw.parse::<i64>().ok()
+}
+
+/// Inverse of `parse_duration_zh`, for `/warnconfig`'s status display.
+fn format_duration_zh(secs: i64) -> String {
+    if secs > 0 && secs % 86400 == 0 {
+        format!("{} 天", secs / 86400)
+    } else if secs > 0 && secs % 3600 == 0 {
+        format!("{} 小時", secs / 3600)
+    } else {
+        format!("{secs} 秒")
+    }
+}
+
+/// `/ot`'s built-in mention template, used whenever a group hasn't set its
+/// own via `/ot_template`. `{user}` and `{count}` are substituted by the
+/// `/ot` handler.
+fn default_ot_template() -> String {
+    "{user} 你的訊息因為離題已被刪除，目前警告 {count} 次，請留意群組主題。".to_string()
+}
+
 fn utc8_display(dt: DateTime<Utc>) -> String {
     (dt + chrono::TimeDelta::hours(8)).format("%Y-%m-%d %H:%M:%S UTC+8").to_string()
 }
@@ -3929,6 +4213,7 @@ fn chinese_case_action(case: &CaseRecord) -> String {
             ActionKind::CmdCleanMute => "指令濫用禁言".to_string(),
             ActionKind::GuestBotBan => "訪客模式機器人封禁".to_string(),
             ActionKind::GuestInvokerBan => "訪客模式召喚者封禁".to_string(),
+            ActionKind::ProjectBan => "項目層級封禁".to_string(),
         }
     }
 }
@@ -3962,7 +4247,7 @@ fn global_whitelist_check_text() -> String {
 }
 
 fn build_blacklist_reason_text(_runtime: &Runtime) -> String {
-    "<b>❖ 封禁代號說明</b>\n\n- <code>ARABIC</code>: 偵測到清真\n- <code>REGEX</code>: 觸發正則規則\n- <code>FLOOD</code>: 洗版偵測（5 秒內傳送 5 條以上訊息）\n- <code>PERM_REPEAT</code>: 24 小時內重複嘗試使用無權限的指令\n- <code>GUEST_MODE</code>: 訪客模式機器人（未加入本群卻發文）\n- <code>GUEST_MODE_INVOKER</code>: 召喚訪客模式機器人的人\n- <code>CONTACT</code>: 在群組分享聯絡人\n- <code>VOICE</code>: 傳送語音訊息\n- <code>EXEC_FILE</code>: 傳送可執行檔案\n- <code>ML</code>: 機器學習模型判定為垃圾訊息\n- <code>BOTSPAM</code>: 純機器人提及（訪客模式召喚廣告）\n\n申訴找 @SEELE_01_BOT".to_string()
+    "<b>❖ 封禁代號說明</b>\n\n- <code>ARABIC</code>: 偵測到清真\n- <code>REGEX</code>: 觸發正則規則\n- <code>FLOOD</code>: 洗版偵測（5 秒內傳送 5 條以上訊息）\n- <code>PERM_REPEAT</code>: 24 小時內重複嘗試使用無權限的指令\n- <code>GUEST_MODE</code>: 訪客模式機器人（未加入本群卻發文）\n- <code>GUEST_MODE_INVOKER</code>: 召喚訪客模式機器人的人\n- <code>CONTACT</code>: 在群組分享聯絡人\n- <code>VOICE</code>: 傳送語音訊息\n- <code>EXEC_FILE</code>: 傳送可執行檔案\n- <code>ML</code>: 機器學習模型判定為垃圾訊息\n- <code>BOTSPAM</code>: 純機器人提及（訪客模式召喚廣告）\n- <code>WARN</code>: 累計警告達門檻自動處置\n- <code>PB</code>: 項目層級封禁，對所有群組強制生效，本群無法解除\n\n申訴找 @SEELE_01_BOT".to_string()
 }
 
 fn format_case_lookup(case: &CaseRecord, link: &str, reason_link: &str) -> String {
@@ -4091,8 +4376,8 @@ async fn start_captcha_challenge(bot: &Bot, runtime: &Arc<Runtime>, chat_id: Cha
     }
 
     let text = format!(
-        "{} 你好，為了防止機器人/廣告帳號，請在 {} 秒內直接回覆下面問題的答案（純數字），逾時將被移出群組：\n\n<b>{a} + {b} = ?</b>",
-        escape_html(&short_user(user)),
+        "{}（<code>{user_id}</code>）你好，為了防止機器人/廣告帳號，請在 {} 秒內直接回覆下面問題的答案（純數字），逾時將被移出群組：\n\n<b>{a} + {b} = ?</b>",
+        mention_link(user_id, &short_user(user)),
         CAPTCHA_TIMEOUT.as_secs(),
     );
     let Ok(sent) = bot.send_message(chat_id, text).parse_mode(ParseMode::Html).await else { return; };
@@ -4158,17 +4443,17 @@ async fn check_captcha_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Mess
         // sitting in the chat with nothing telling anyone it got resolved.
         let _ = bot.delete_message(message.chat.id, challenge_message_id).await;
         if let Ok(sent) = bot
-            .send_message(message.chat.id, format!("✅ {} 驗證通過，歡迎！", escape_html(&short_user(user))))
+            .send_message(message.chat.id, format!("✅ {}（<code>{}</code>）驗證通過，歡迎！", mention_link(user.id.0 as i64, &short_user(user)), user.id.0))
             .parse_mode(ParseMode::Html)
             .await
         {
-            // Clear the welcome after 30s, same self-delete pattern as
+            // Clear the welcome after 60s, same self-delete pattern as
             // notify_group - it's a transient confirmation, not chat history.
             let bot = bot.clone();
             let chat_id = message.chat.id;
             let sent_id = sent.id;
             tokio::spawn(async move {
-                sleep(Duration::from_secs(30)).await;
+                sleep(Duration::from_secs(60)).await;
                 let _ = bot.delete_message(chat_id, sent_id).await;
             });
         }
@@ -4266,6 +4551,18 @@ async fn process_new_group_member(bot: &Bot, runtime: &Arc<Runtime>, message: &M
     if runtime.is_maintainer(user.id.0 as i64).await || is_platform_pseudo_user(user.id.0 as i64) {
         return;
     }
+
+    // Project Ban catch-up: checked before the whitelist exemptions below on
+    // purpose - a local or global whitelist entry must not let a PB'd user
+    // back in through the front door of a join. See check_project_ban_and_act.
+    if let Ok(Some(case)) = runtime.find_active_project_ban(user.id.0 as i64).await {
+        let _ = bot.delete_message(message.chat.id, message.id).await;
+        let _ = bot.ban_chat_member(message.chat.id, user.id).await;
+        let _ = runtime.record_network_ban_target(&case.id, message.chat.id.0).await;
+        notify_project_ban_sync(bot, message.chat.id, user.id.0 as i64, &case.id).await;
+        return;
+    }
+
     if runtime.is_global_whitelisted(user.id.0 as i64).await.unwrap_or(false) {
         return;
     }
@@ -4586,6 +4883,91 @@ async fn notify_netban_sync(bot: &Bot, chat_id: ChatId, target_user_id: i64, cas
         sleep(Duration::from_secs(180)).await;
         let _ = bot.delete_message(chat_id, message_id).await;
     });
+}
+
+/// Same shape as `notify_netban_sync`, but worded for Project Ban (see
+/// `check_project_ban_and_act`) - explicitly says this can't be bypassed
+/// locally, since that's the whole point of the distinction from a routine
+/// netban sync.
+async fn notify_project_ban_sync(bot: &Bot, chat_id: ChatId, target_user_id: i64, case_id: &str) {
+    let text = format!(
+        "<b>項目層級封禁（PB）同步執行</b>\n用戶 <code>{target_user_id}</code> 已因項目層級封禁自動封禁。此封禁對所有群組強制生效，無法透過白名單或本群解封繞過，僅維護組可解除。\n原始案例: <code>{case_id}</code>"
+    );
+    let Ok(sent) = bot.send_message(chat_id, text).parse_mode(ParseMode::Html).await else { return };
+    let bot = bot.clone();
+    let message_id = sent.id;
+    tokio::spawn(async move {
+        sleep(Duration::from_secs(180)).await;
+        let _ = bot.delete_message(chat_id, message_id).await;
+    });
+}
+
+/// Fired whenever a group admin or maintainer tries to undo an active
+/// Project Ban through the ordinary local channels - `/unban` (group-admin
+/// path), `/white`, or `/white -global` - which are all refused for a PB'd
+/// target (see the guards in those handlers). The maintainer team is meant
+/// to actually see these, hence the audit log rather than a message the
+/// attempting admin could just delete.
+async fn alert_project_ban_bypass_attempt(bot: &Bot, runtime: &Runtime, actor_id: i64, actor_name: &str, chat_id: i64, target_id: i64, attempted: &str) {
+    let dest = runtime.audit_log_chat().await.unwrap_or(runtime.config.report_channel_id);
+    let text = format!(
+        "<b>⚠ 嘗試繞過項目層級封禁（PB）</b>\n<b>對象</b>: <code>{target_id}</code>\n<b>嘗試操作</b>: {}\n<b>操作者</b>: {} (<code>{actor_id}</code>)\n<b>群組</b>: <code>{chat_id}</code>",
+        escape_html(attempted),
+        escape_html(actor_name),
+    );
+    let _ = bot.send_message(ChatId(dest), text).parse_mode(ParseMode::Html).await;
+}
+
+/// Applies a group's configured warn-threshold action (mute/kick/ban) once
+/// `/warn` (or `/ot`) pushes someone's count to `settings.threshold`, and
+/// records it as a real `CaseRecord` tagged "WARN" - unlike `/pol`'s
+/// deliberately uncased escalation, the generic warn system is a public,
+/// every-group feature and its consequences should show up in `/case` and
+/// the moderation log like anything else an admin does. Does nothing (no
+/// case, no log) if the underlying Telegram action itself fails.
+async fn apply_warn_threshold_action(bot: &Bot, runtime: &Runtime, chat_id: ChatId, target_id: i64, target_name: &str, settings: &WarnSettings, warn_count: i64) {
+    let action_kind = match settings.action.as_str() {
+        "kick" => ActionKind::Kick,
+        "ban" => ActionKind::SpamBan,
+        _ => ActionKind::Mute,
+    };
+    let result = match action_kind {
+        ActionKind::Kick => kick_user(bot, chat_id, target_id).await,
+        ActionKind::SpamBan => ban_user(bot, chat_id, target_id).await,
+        _ => match settings.action_duration_secs {
+            Some(secs) if secs > 0 => mute_user_until(bot, chat_id, target_id, Utc::now() + chrono::TimeDelta::seconds(secs)).await,
+            _ => mute_user(bot, chat_id, target_id).await,
+        },
+    };
+    if result.is_err() {
+        return;
+    }
+
+    let case = CaseRecord {
+        id: Uuid::new_v4().to_string(),
+        action: action_kind.clone(),
+        chat_id: chat_id.0,
+        target_user_id: target_id,
+        target_name: target_name.to_string(),
+        actor_user_id: None,
+        actor_name: None,
+        source_message_id: None,
+        evidence_text: format!("累計警告達 {warn_count} 次（門檻 {}）", settings.threshold),
+        model_score: None,
+        matched_rule_id: None,
+        matched_rule_pattern: Some("WARN".to_string()),
+        status: "done".to_string(),
+        log_message_id: None,
+        created_at: Utc::now(),
+    };
+    let log_message_id = log_action(bot, runtime, &case).await.unwrap_or_default();
+    let mut updated = case.clone();
+    updated.log_message_id = Some(log_message_id);
+    let _ = store_case(runtime, &updated).await;
+    let _ = notify_group(bot, runtime, &updated, log_message_id, "<b>警告達門檻，已自動處置</b>").await;
+    if action_kind == ActionKind::SpamBan {
+        broadcast_ban_status(bot, runtime, target_id, true).await;
+    }
 }
 
 /// Same shape as `notify_netban_sync`, but for check_reban_and_act's
@@ -5349,6 +5731,42 @@ async fn check_flood_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Messag
     let _ = store_case(runtime, &updated).await;
     let _ = notify_group(bot, runtime, &updated, log_message_id, "<b>自動洗版偵測禁言</b>").await;
     Ok(true)
+}
+
+/// Message-time enforcement of a maintainer-issued `/pb` (Project Ban).
+/// Deliberately has none of `check_netban_and_act`'s opt-in gating (no
+/// module check, no whitelist check, no group-admin exemption) - a Project
+/// Ban is meant to be inescapable: every group enforces it on every message,
+/// a local admin's whitelist or ban-status can't shield the target, and even
+/// a target who happens to be that group's own admin still gets caught (see
+/// `/pb`'s own refusal to target a maintainer, which is the only exemption
+/// that matters here). The only sanctioned way out is a maintainer's
+/// `/unban`, which already reverses arbitrary case kinds including this one.
+async fn check_project_ban_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) -> bool {
+    if !message.chat.is_group() && !message.chat.is_supergroup() {
+        return false;
+    }
+    let Some(user) = message.from.as_ref() else { return false; };
+    if user.is_bot {
+        return false;
+    }
+    let user_id = user.id.0 as i64;
+    // Not an exemption from PB - /pb already refuses to target a
+    // maintainer or platform pseudo-account, so this can never actually
+    // fire for one. Kept for the same defense-in-depth reason every other
+    // enforcement check here has it.
+    if runtime.is_maintainer(user_id).await || is_platform_pseudo_user(user_id) {
+        return false;
+    }
+    let Ok(Some(case)) = runtime.find_active_project_ban(user_id).await else {
+        return false;
+    };
+    let chat_id = message.chat.id.0;
+    let _ = bot.delete_message(message.chat.id, message.id).await;
+    let _ = bot.ban_chat_member(message.chat.id, user.id).await;
+    let _ = runtime.record_network_ban_target(&case.id, chat_id).await;
+    notify_project_ban_sync(bot, message.chat.id, user_id, &case.id).await;
+    true
 }
 
 /// Message-time safety net for netban: catches members who were already in
@@ -6636,6 +7054,306 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 }
             }
         }
+        ModerationCommand::ProjectBan(args) => {
+            require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用 /pb。");
+            let (target_id, reason) = parse_leave_args(&args);
+            let target_id = target_id.or_else(|| real_reply(&message).and_then(|r| r.from.as_ref()).map(|u| u.id.0 as i64));
+            let Some(target_id) = target_id else {
+                bot.send_message(message.chat.id, "請提供 user_id 或回覆該用戶，例如 /pb 12345 濫用服務。").await?;
+                return Ok(());
+            };
+            if target_id <= 0 {
+                bot.send_message(message.chat.id, "/pb 只接受 user_id。").await?;
+                return Ok(());
+            }
+            if runtime.is_maintainer(target_id).await || is_platform_pseudo_user(target_id) {
+                bot.send_message(message.chat.id, "不能對項目維護人員或 Telegram 系統帳號執行此指令。").await?;
+                return Ok(());
+            }
+            if runtime.find_active_project_ban(target_id).await.unwrap_or(None).is_some() {
+                bot.send_message(message.chat.id, format!("<code>{target_id}</code> 已經是項目層級封禁狀態，無需重複執行。")).parse_mode(ParseMode::Html).await?;
+                return Ok(());
+            }
+            let reason = if reason.trim().is_empty() { "項目層級封禁".to_string() } else { reason };
+            let target_name = real_reply(&message).and_then(|r| r.from.as_ref()).map(short_user).unwrap_or_else(|| format!("User{target_id}"));
+
+            let case_id = Uuid::new_v4().to_string();
+            let mut case = CaseRecord {
+                id: case_id.clone(),
+                action: ActionKind::ProjectBan,
+                chat_id: message.chat.id.0,
+                target_user_id: target_id,
+                target_name: target_name.clone(),
+                actor_user_id: Some(from_id),
+                actor_name: Some(short_user(from)),
+                source_message_id: None,
+                evidence_text: reason.clone(),
+                model_score: None,
+                matched_rule_id: None,
+                matched_rule_pattern: Some("PB".to_string()),
+                status: "done".to_string(),
+                log_message_id: None,
+                created_at: Utc::now(),
+            };
+
+            // If issued via reply in a live group, ban them there right away -
+            // check_project_ban_and_act/process_new_group_member already
+            // handle every other group reactively (next join/message), so
+            // there's no reason to make this one wait for that too.
+            if message.chat.is_group() || message.chat.is_supergroup() {
+                let _ = bot.ban_chat_member(message.chat.id, UserId(target_id as u64)).await;
+                let _ = runtime.record_network_ban_target(&case_id, message.chat.id.0).await;
+            }
+
+            let log_message_id = log_action(&bot, &runtime, &case).await.unwrap_or_default();
+            case.log_message_id = Some(log_message_id);
+            store_case(&runtime, &case).await.ok();
+            broadcast_ban_status(&bot, &runtime, target_id, true).await;
+
+            log_maintainer_action(
+                &bot,
+                &runtime,
+                from_id,
+                &short_user(from),
+                None,
+                "/pb",
+                &format!("項目層級封禁 user_id={target_id}：{reason}"),
+                UndoData::Case { case_id: case_id.clone(), kind: CaseKind::Ban },
+            )
+            .await;
+
+            bot.send_message(
+                message.chat.id,
+                format!(
+                    "已對 <code>{target_id}</code> 執行項目層級封禁（PB）。此封禁對所有群組強制生效：無法被本群 /unban 或 /white 解除，全域白名單申請也會被拒絕，任何嘗試都會通知維護組。解除請由維護組使用 <code>/unban {target_id}</code>。"
+                ),
+            )
+            .parse_mode(ParseMode::Html)
+            .await?;
+        }
+        ModerationCommand::Warn(reason) => {
+            let Some((target_id, target_name, _, _)) = extract_reply_context(&message).await else {
+                reply_ephemeral(&bot, &message, "請回覆一條訊息後再使用 /warn。").await?;
+                return Ok(());
+            };
+            if !is_group_admin(&bot, message.chat.id, from_id).await {
+                handle_permission_denied(&bot, &runtime, &message, from, "只有群組管理員可以執行此指令。").await?;
+                return Ok(());
+            }
+            if is_group_admin(&bot, message.chat.id, target_id).await || runtime.is_maintainer(target_id).await || is_platform_pseudo_user(target_id) {
+                reply_ephemeral(&bot, &message, "不能對群組管理員或項目維護人員執行此指令。").await?;
+                return Ok(());
+            }
+            let chat_id = message.chat.id.0;
+            let reason = reason.trim();
+            let reason_opt = if reason.is_empty() { None } else { Some(reason) };
+            let count = runtime.add_warn(chat_id, target_id, reason_opt, from_id).await.unwrap_or(1);
+            let settings = runtime.get_warn_settings(chat_id).await.unwrap_or_default();
+
+            let reason_line = reason_opt.map(|r| format!("\n原因：{}", escape_html(r))).unwrap_or_default();
+            let text = format!("{} 已被警告，目前累計 {count} 次（門檻 {}）。{reason_line}", mention_link(target_id, &target_name), settings.threshold);
+            bot.send_message(message.chat.id, text).parse_mode(ParseMode::Html).await?;
+
+            if count >= settings.threshold {
+                apply_warn_threshold_action(&bot, &runtime, message.chat.id, target_id, &target_name, &settings, count).await;
+            }
+            let _ = bot.delete_message(message.chat.id, message.id).await;
+        }
+        ModerationCommand::Unwarn(arg) => {
+            let Some((target_id, target_name, _, _)) = extract_reply_context(&message).await else {
+                reply_ephemeral(&bot, &message, "請回覆一位用戶的訊息後再使用 /unwarn。").await?;
+                return Ok(());
+            };
+            if !is_group_admin(&bot, message.chat.id, from_id).await {
+                handle_permission_denied(&bot, &runtime, &message, from, "只有群組管理員可以執行此指令。").await?;
+                return Ok(());
+            }
+            let n = arg.trim().parse::<i64>().unwrap_or(1).max(1);
+            let chat_id = message.chat.id.0;
+            let removed = runtime.remove_warns(chat_id, target_id, n).await.unwrap_or(0);
+            let remaining = runtime.warn_count(chat_id, target_id).await.unwrap_or(0);
+            bot.send_message(message.chat.id, format!("已移除 {} 的 {removed} 次警告，剩餘 {remaining} 次。", mention_link(target_id, &target_name))).parse_mode(ParseMode::Html).await?;
+            let _ = bot.delete_message(message.chat.id, message.id).await;
+        }
+        ModerationCommand::Warns(arg) => {
+            if !message.chat.is_group() && !message.chat.is_supergroup() {
+                reply_ephemeral(&bot, &message, "請在群組中使用 /warns。").await?;
+                return Ok(());
+            }
+            if !is_group_admin(&bot, message.chat.id, from_id).await {
+                handle_permission_denied(&bot, &runtime, &message, from, "只有群組管理員可以執行此指令。").await?;
+                return Ok(());
+            }
+            let target = if let Some((id, name, _, _)) = extract_reply_context(&message).await {
+                Some((id, name))
+            } else {
+                arg.trim().parse::<i64>().ok().map(|id| (id, format!("User{id}")))
+            };
+            let Some((target_id, target_name)) = target else {
+                reply_ephemeral(&bot, &message, "請提供 user_id 或回覆一位用戶。").await?;
+                return Ok(());
+            };
+            let chat_id = message.chat.id.0;
+            let count = runtime.warn_count(chat_id, target_id).await.unwrap_or(0);
+            let entries = runtime.list_warns(chat_id, target_id).await.unwrap_or_default();
+            let mut out = format!("{} 在本群目前有 {count} 次警告。", mention_link(target_id, &target_name));
+            if !entries.is_empty() {
+                out.push_str("\n\n最近記錄：");
+                for (reason, created_at) in &entries {
+                    out.push_str(&format!("\n· {} <i>{}</i>", escape_html(reason.as_deref().unwrap_or("（無說明）")), escape_html(created_at)));
+                }
+            }
+            bot.send_message(message.chat.id, out).parse_mode(ParseMode::Html).await?;
+        }
+        ModerationCommand::WarnConfig(args) => {
+            if !message.chat.is_group() && !message.chat.is_supergroup() {
+                reply_ephemeral(&bot, &message, "請在群組中使用 /warnconfig。").await?;
+                return Ok(());
+            }
+            if !is_group_admin(&bot, message.chat.id, from_id).await {
+                handle_permission_denied(&bot, &runtime, &message, from, "只有群組管理員可以執行此指令。").await?;
+                return Ok(());
+            }
+            let chat_id = message.chat.id.0;
+            let parts: Vec<&str> = args.split_whitespace().collect();
+            if parts.is_empty() {
+                let settings = runtime.get_warn_settings(chat_id).await.unwrap_or_default();
+                let duration_text = match (settings.action.as_str(), settings.action_duration_secs) {
+                    ("mute", Some(secs)) if secs > 0 => format_duration_zh(secs),
+                    ("mute", _) => "永久".to_string(),
+                    _ => "-".to_string(),
+                };
+                bot.send_message(
+                    message.chat.id,
+                    format!(
+                        "<b>本群警告設定</b>\n門檻：{} 次\n動作：{}\n禁言時長：{duration_text}\n\n用法：/warnconfig &lt;閾值&gt; mute|kick|ban [時長，例如 24h、3d，留空或 0 為永久（僅 mute 適用）]",
+                        settings.threshold, settings.action,
+                    ),
+                )
+                .parse_mode(ParseMode::Html)
+                .await?;
+                return Ok(());
+            }
+            let Ok(threshold) = parts[0].parse::<i64>() else {
+                reply_ephemeral(&bot, &message, "閾值需為正整數，例如 /warnconfig 3 mute 24h。").await?;
+                return Ok(());
+            };
+            if threshold < 1 {
+                reply_ephemeral(&bot, &message, "閾值至少為 1。").await?;
+                return Ok(());
+            }
+            let action = parts.get(1).map(|s| s.to_lowercase()).unwrap_or_else(|| "mute".to_string());
+            if !["mute", "kick", "ban"].contains(&action.as_str()) {
+                reply_ephemeral(&bot, &message, "動作僅支援 mute、kick、ban。").await?;
+                return Ok(());
+            }
+            let duration_secs = if action == "mute" { parts.get(2).and_then(|raw| parse_duration_zh(raw)) } else { None };
+            runtime.set_warn_config(chat_id, threshold, &action, duration_secs).await.ok();
+            log_maintainer_action(
+                &bot,
+                &runtime,
+                from_id,
+                &short_user(from),
+                Some(chat_id),
+                "/warnconfig",
+                &format!("警告設定 門檻={threshold} 動作={action} 時長={duration_secs:?}"),
+                UndoData::NotRevertible,
+            )
+            .await;
+            bot.send_message(message.chat.id, "已更新本群警告設定。").await?;
+        }
+        ModerationCommand::Ot => {
+            let Some((target_id, target_name, source_id, _)) = extract_reply_context(&message).await else {
+                reply_ephemeral(&bot, &message, "請回覆一條訊息後再使用 /ot。").await?;
+                return Ok(());
+            };
+            if !is_group_admin(&bot, message.chat.id, from_id).await {
+                handle_permission_denied(&bot, &runtime, &message, from, "只有群組管理員可以執行此指令。").await?;
+                return Ok(());
+            }
+            if is_group_admin(&bot, message.chat.id, target_id).await || runtime.is_maintainer(target_id).await || is_platform_pseudo_user(target_id) {
+                reply_ephemeral(&bot, &message, "不能對群組管理員或項目維護人員執行此指令。").await?;
+                return Ok(());
+            }
+            let chat_id = message.chat.id.0;
+            let settings = runtime.get_warn_settings(chat_id).await.unwrap_or_default();
+            let _ = bot.delete_message(message.chat.id, MessageId(source_id)).await;
+
+            let mut count = runtime.warn_count(chat_id, target_id).await.unwrap_or(0);
+            for _ in 0..settings.ot_warn_count.max(1) {
+                count = runtime.add_warn(chat_id, target_id, Some("離題（/ot）"), from_id).await.unwrap_or(count + 1);
+            }
+
+            let template = settings.ot_template.clone().unwrap_or_else(default_ot_template);
+            let text = template.replace("{user}", &mention_link(target_id, &target_name)).replace("{count}", &count.to_string());
+            if let Ok(sent) = bot.send_message(message.chat.id, text).parse_mode(ParseMode::Html).await {
+                let bot2 = bot.clone();
+                let notice_chat = message.chat.id;
+                let sent_id = sent.id;
+                tokio::spawn(async move {
+                    sleep(Duration::from_secs(180)).await;
+                    let _ = bot2.delete_message(notice_chat, sent_id).await;
+                });
+            }
+
+            if count >= settings.threshold {
+                apply_warn_threshold_action(&bot, &runtime, message.chat.id, target_id, &target_name, &settings, count).await;
+            }
+            let _ = bot.delete_message(message.chat.id, message.id).await;
+        }
+        ModerationCommand::OtWarns(arg) => {
+            if !message.chat.is_group() && !message.chat.is_supergroup() {
+                reply_ephemeral(&bot, &message, "請在群組中使用 /ot_warns。").await?;
+                return Ok(());
+            }
+            if !is_group_admin(&bot, message.chat.id, from_id).await {
+                handle_permission_denied(&bot, &runtime, &message, from, "只有群組管理員可以執行此指令。").await?;
+                return Ok(());
+            }
+            let chat_id = message.chat.id.0;
+            let Ok(n) = arg.trim().parse::<i64>() else {
+                let current = runtime.get_warn_settings(chat_id).await.unwrap_or_default().ot_warn_count;
+                bot.send_message(message.chat.id, format!("目前 /ot 每次加 {current} 次警告。用法：/ot_warns <數字>")).await?;
+                return Ok(());
+            };
+            if n < 1 {
+                reply_ephemeral(&bot, &message, "數字至少為 1。").await?;
+                return Ok(());
+            }
+            runtime.set_ot_warn_count(chat_id, n).await.ok();
+            bot.send_message(message.chat.id, format!("已設定 /ot 每次加 {n} 次警告。")).await?;
+        }
+        ModerationCommand::OtTemplate(text_arg) => {
+            if !message.chat.is_group() && !message.chat.is_supergroup() {
+                reply_ephemeral(&bot, &message, "請在群組中使用 /ot_template。").await?;
+                return Ok(());
+            }
+            if !is_group_admin(&bot, message.chat.id, from_id).await {
+                handle_permission_denied(&bot, &runtime, &message, from, "只有群組管理員可以執行此指令。").await?;
+                return Ok(());
+            }
+            let chat_id = message.chat.id.0;
+            if text_arg.trim().is_empty() {
+                let current = runtime.get_warn_settings(chat_id).await.unwrap_or_default().ot_template.unwrap_or_else(default_ot_template);
+                bot.send_message(
+                    message.chat.id,
+                    format!(
+                        "<b>目前 /ot 範本</b>\n{}\n\n用法：/ot_template &lt;文字，用 {{user}} 代表提及、{{count}} 代表目前警告數&gt;\n傳送 /ot_template reset 可還原預設範本。",
+                        escape_html(&current),
+                    ),
+                )
+                .parse_mode(ParseMode::Html)
+                .await?;
+                return Ok(());
+            }
+            if text_arg.trim().eq_ignore_ascii_case("reset") {
+                runtime.set_ot_template(chat_id, None).await.ok();
+                bot.send_message(message.chat.id, "已還原為預設範本。").await?;
+                return Ok(());
+            }
+            runtime.set_ot_template(chat_id, Some(text_arg.trim())).await.ok();
+            bot.send_message(message.chat.id, "已更新本群 /ot 範本。").await?;
+        }
         ModerationCommand::SpamReport => {
             // Three rejected reports and the command is gone. Maintainers are
             // exempt so a bad streak can't lock out the people who clear it.
@@ -7113,6 +7831,12 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 reply_ephemeral(&bot, &message, "請提供 userid 或回覆一位用戶。").await?;
                 return Ok(());
             };
+            if runtime.find_active_project_ban(user_id).await.unwrap_or(None).is_some() {
+                reply_ephemeral(&bot, &message, format!("{user_id} 為項目層級封禁（PB），本群無法將其加入白名單，請聯絡維護組。")).await?;
+                alert_project_ban_bypass_attempt(&bot, &runtime, from_id, &short_user(from), message.chat.id.0, user_id, "/white（本群白名單）").await;
+                let _ = bot.delete_message(message.chat.id, message.id).await;
+                return Ok(());
+            }
             let old_enabled = runtime.is_group_whitelisted(message.chat.id.0, user_id).await.unwrap_or(false);
             runtime.set_group_whitelist(message.chat.id.0, user_id, true, Some(from_id)).await.ok();
             log_maintainer_action(&bot, &runtime, from_id, &short_user(from), Some(message.chat.id.0), "/white", &format!("本群白名單 user_id={user_id} {old_enabled}→true"), UndoData::GroupWhitelist { chat_id: message.chat.id.0, user_id, old_enabled }).await;
@@ -7145,6 +7869,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(message.chat.id, "請提供 userid 或回覆一位用戶。") .await?;
                 return Ok(());
             };
+            if runtime.find_active_project_ban(user_id).await.unwrap_or(None).is_some() {
+                bot.send_message(message.chat.id, format!("{user_id} 為項目層級封禁（PB），無法加入全域白名單，請先由維護組使用 /unban 解除。")).await?;
+                alert_project_ban_bypass_attempt(&bot, &runtime, from_id, &short_user(from), message.chat.id.0, user_id, "/white -global（全域白名單）").await;
+                return Ok(());
+            }
             let old_enabled = runtime.is_global_whitelisted(user_id).await.unwrap_or(false);
             runtime.set_global_whitelist(user_id, true, Some(from_id)).await.ok();
             log_maintainer_action(&bot, &runtime, from_id, &short_user(from), None, "/white -global", &format!("全域白名單 user_id={user_id} {old_enabled}→true"), UndoData::GlobalWhitelist { user_id, old_enabled }).await;
@@ -7480,6 +8209,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     reply_ephemeral(&bot, &message, "請回覆要解封的用戶，或提供 user_id。").await?;
                     return Ok(());
                 };
+                if runtime.find_active_project_ban(target_user_id).await.unwrap_or(None).is_some() {
+                    reply_ephemeral(&bot, &message, format!("{target_user_id} 為項目層級封禁（PB），本群無法解除，請聯絡維護組。")).await?;
+                    alert_project_ban_bypass_attempt(&bot, &runtime, from_id, &short_user(from), message.chat.id.0, target_user_id, "/unban（群組管理員）").await;
+                    return Ok(());
+                }
                 if let Err(err) = bot.unban_chat_member(message.chat.id, UserId(target_user_id as u64)).await {
                     let Some(reason) = unban_noop_reason(&err) else {
                         bot.send_message(message.chat.id, format!("解封失敗：{err}")).await?;
@@ -8465,6 +9199,14 @@ async fn main() -> Result<()> {
                 // otherwise waste a lookup on every one.
                 if runtime.config.test_group_id != Some(message.chat.id.0)
                     && check_guest_bot_and_act(&bot, &runtime, &message).await
+                {
+                    return Ok(());
+                }
+
+                // Project Ban enforcement: always on, never opt-in - runs
+                // before Netban since it's the stronger of the two.
+                if runtime.config.test_group_id != Some(message.chat.id.0)
+                    && check_project_ban_and_act(&bot, &runtime, &message).await
                 {
                     return Ok(());
                 }
@@ -10043,6 +10785,107 @@ mod tests {
 
         runtime.clear_pol_warns(100, 200).await.unwrap();
         assert_eq!(runtime.pol_warn_count(100, 200).await.unwrap(), 0);
+    }
+
+    // Backs the generic /warn system: unlike pol_warnings' bare counter,
+    // each warn keeps its own reason, and /unwarn <n> must drop exactly the
+    // N most recent rows (not the oldest, and not an arbitrary N of them) -
+    // added in the same test run, so created_at alone can tie; the id DESC
+    // tiebreaker in remove_warns' query is what this actually exercises.
+    #[tokio::test]
+    async fn warn_add_and_remove_drops_the_most_recent() {
+        let runtime = test_runtime().await;
+        assert_eq!(runtime.warn_count(100, 200).await.unwrap(), 0);
+
+        assert_eq!(runtime.add_warn(100, 200, Some("first"), 1).await.unwrap(), 1);
+        assert_eq!(runtime.add_warn(100, 200, Some("second"), 1).await.unwrap(), 2);
+        assert_eq!(runtime.add_warn(100, 200, Some("third"), 1).await.unwrap(), 3);
+        assert_eq!(runtime.warn_count(100, 200).await.unwrap(), 3);
+
+        // A different chat is independent - warns are per-group.
+        assert_eq!(runtime.warn_count(999, 200).await.unwrap(), 0);
+
+        let removed = runtime.remove_warns(100, 200, 1).await.unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(runtime.warn_count(100, 200).await.unwrap(), 2);
+        let remaining: Vec<Option<String>> = runtime.list_warns(100, 200).await.unwrap().into_iter().map(|(reason, _)| reason).collect();
+        assert_eq!(remaining, vec![Some("second".to_string()), Some("first".to_string())], "must drop the most recent (\"third\"), not an arbitrary one");
+
+        // Removing more than remain is fine - just removes what's there.
+        let removed_all = runtime.remove_warns(100, 200, 10).await.unwrap();
+        assert_eq!(removed_all, 2);
+        assert_eq!(runtime.warn_count(100, 200).await.unwrap(), 0);
+    }
+
+    // Backs /warnconfig and /ot_warns/ot_template: an untouched group gets
+    // WarnSettings::default() without a row ever being written, and each
+    // setter round-trips independently without clobbering the others.
+    #[tokio::test]
+    async fn warn_settings_default_then_round_trip_independently() {
+        let runtime = test_runtime().await;
+        let defaults = runtime.get_warn_settings(100).await.unwrap();
+        assert_eq!(defaults.threshold, 2);
+        assert_eq!(defaults.action, "mute");
+        assert_eq!(defaults.action_duration_secs, Some(24 * 3600));
+        assert_eq!(defaults.ot_warn_count, 1);
+        assert!(defaults.ot_template.is_none());
+
+        runtime.set_warn_config(100, 3, "kick", None).await.unwrap();
+        let after_config = runtime.get_warn_settings(100).await.unwrap();
+        assert_eq!(after_config.threshold, 3);
+        assert_eq!(after_config.action, "kick");
+        assert_eq!(after_config.action_duration_secs, None);
+        // Setting warn config must not disturb the still-default ot fields.
+        assert_eq!(after_config.ot_warn_count, 1);
+
+        runtime.set_ot_warn_count(100, 2).await.unwrap();
+        runtime.set_ot_template(100, Some("{user} custom {count}")).await.unwrap();
+        let after_ot = runtime.get_warn_settings(100).await.unwrap();
+        assert_eq!(after_ot.ot_warn_count, 2);
+        assert_eq!(after_ot.ot_template.as_deref(), Some("{user} custom {count}"));
+        // ...and setting the ot fields must not disturb warnconfig's fields.
+        assert_eq!(after_ot.threshold, 3);
+        assert_eq!(after_ot.action, "kick");
+
+        // A different group is untouched.
+        assert_eq!(runtime.get_warn_settings(999).await.unwrap().threshold, 2);
+    }
+
+    #[test]
+    fn duration_parser_handles_hours_days_and_permanent() {
+        assert_eq!(parse_duration_zh("24h"), Some(24 * 3600));
+        assert_eq!(parse_duration_zh("3d"), Some(3 * 86400));
+        assert_eq!(parse_duration_zh("90"), Some(90));
+        assert_eq!(parse_duration_zh("0"), None);
+        assert_eq!(parse_duration_zh(""), None);
+        assert_eq!(parse_duration_zh("永久"), None);
+        assert_eq!(format_duration_zh(2 * 86400), "2 天");
+        assert_eq!(format_duration_zh(6 * 3600), "6 小時");
+        assert_eq!(format_duration_zh(90), "90 秒");
+    }
+
+    // Backs /pb: an active Project Ban must be found by both
+    // find_active_project_ban and the generic find_active_bans_for_user
+    // (so a maintainer's ordinary /unban picks it up), and must stop
+    // matching once /unban rewrites its action to Unbanned in place - the
+    // same reversal shape every other ban case already uses.
+    #[tokio::test]
+    async fn project_ban_is_found_and_reversal_clears_it() {
+        let runtime = test_runtime().await;
+        assert!(runtime.find_active_project_ban(200).await.unwrap().is_none());
+
+        let mut case = dummy_case(ActionKind::ProjectBan, 100, 200, Utc::now());
+        runtime.persist_case(&case).await.unwrap();
+
+        let found = runtime.find_active_project_ban(200).await.unwrap();
+        assert_eq!(found.map(|c| c.id.clone()), Some(case.id.clone()));
+
+        let all_active = runtime.find_active_bans_for_user(200).await.unwrap();
+        assert!(all_active.iter().any(|c| c.id == case.id), "the generic maintainer /unban lookup must also see a Project Ban");
+
+        case.action = ActionKind::Unbanned;
+        runtime.persist_case(&case).await.unwrap();
+        assert!(runtime.find_active_project_ban(200).await.unwrap().is_none(), "a reversed PB must stop being enforced");
     }
 
     // Backs /module warn-pol on|off: the pol flag round-trips through
