@@ -4714,15 +4714,17 @@ fn parse_leave_args(args: &str) -> (Option<i64>, String) {
     (None, trimmed.to_string())
 }
 
-/// Public Terms of Use. Points at the GitHub Pages site rather than the
-/// repository: users being told the rules have no reason to be handed the
-/// source tree, and the published page is the authoritative wording.
-const TERMS_URL: &str = "https://wikipedia-zh.github.io/Anti-Spam/";
+/// Public Terms of Use. Hosted on the tool's own Toolforge domain rather
+/// than the source repository or GitHub Pages: users being told the rules
+/// have no reason to be handed the source tree, and this is the
+/// authoritative wording. The old GitHub Pages URL now just redirects here
+/// (see `docs/index.md`) so existing links elsewhere keep working.
+const TERMS_URL: &str = "https://wikipedia-zh-antispam.toolforge.org/terms/";
 
-/// Command/module reference and FAQ, published alongside the terms - see
-/// `docs/guide.md`. Same GitHub Pages site as `TERMS_URL`, so this is one
-/// page users being pointed at the terms should also be able to reach.
-const GUIDE_URL: &str = "https://wikipedia-zh.github.io/Anti-Spam/guide.html";
+/// Command/module reference and FAQ, published alongside the terms on the
+/// same Toolforge domain as `TERMS_URL`, so this is one page users being
+/// pointed at the terms should also be able to reach.
+const GUIDE_URL: &str = "https://wikipedia-zh-antispam.toolforge.org/guide/";
 
 /// Terms-of-Use button plus a second row linking the user guide - shown
 /// wherever a group first encounters the bot or asks for help, so the guide
@@ -9818,8 +9820,9 @@ mod tests {
     // failure mode (a typo would take down every welcome/help message).
     #[test]
     fn guide_url_is_parseable_and_lives_on_the_same_site_as_the_terms() {
-        assert!(Url::parse(GUIDE_URL).is_ok());
-        assert!(GUIDE_URL.starts_with(TERMS_URL), "the guide must be published alongside the terms, not elsewhere");
+        let guide = Url::parse(GUIDE_URL).expect("GUIDE_URL must be a valid URL");
+        let terms = Url::parse(TERMS_URL).expect("TERMS_URL must be a valid URL");
+        assert_eq!(guide.host_str(), terms.host_str(), "the guide must be published on the same domain as the terms, not elsewhere");
     }
 
     // Training one forwarded advert taught the model that "external",
