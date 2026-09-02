@@ -3814,6 +3814,7 @@ fn help_text() -> String {
         "<code>/ot_warns &lt;n&gt;</code> 設定 /ot 每次加幾次警告\n",
         "<code>/ot_template &lt;文字&gt;</code> 自訂提及訊息\n",
         "· 用 {user} {count} 代表提及與目前次數\n",
+        "· 可加 {button}[網址] 顯示按鈕\n",
         "\n<b>━━ 模組 ━━</b>\n",
         "<b>預設開啟</b>\n",
         "· Flood 洗版偵測\n",
@@ -4188,6 +4189,30 @@ fn format_duration_zh(secs: i64) -> String {
 /// `/ot` handler.
 fn default_ot_template() -> String {
     "{user} 你的訊息因為離題已被刪除，目前警告 {count} 次，請留意群組主題。".to_string()
+}
+
+/// Pulls `{button}[url]` (or `{button:標籤}[url]`) markers out of a rendered
+/// `/ot_template`, returning the text with every marker removed and, for
+/// each one whose URL actually parses, an inline keyboard row - in the
+/// order they appeared, so a group can stack several. A marker is always
+/// stripped from the text even if its URL doesn't parse (leaving the raw
+/// `{button}[...]` syntax visible in the sent message would be worse than
+/// just dropping a broken button silently).
+fn extract_template_buttons(text: &str) -> (String, Option<InlineKeyboardMarkup>) {
+    static BUTTON_RE: OnceLock<StdRegex> = OnceLock::new();
+    let re = BUTTON_RE.get_or_init(|| StdRegex::new(r"\{button(?::([^}\[]*))?\}\[([^\]]+)\]").expect("valid button marker regex"));
+
+    let mut rows = Vec::new();
+    for caps in re.captures_iter(text) {
+        let label = caps.get(1).map(|m| m.as_str().trim()).filter(|s| !s.is_empty()).unwrap_or("查看").to_string();
+        if let Ok(url) = Url::parse(caps[2].trim()) {
+            rows.push(vec![InlineKeyboardButton::url(label, url)]);
+        }
+    }
+
+    let stripped = re.replace_all(text, "").trim().to_string();
+    let markup = if rows.is_empty() { None } else { Some(InlineKeyboardMarkup::new(rows)) };
+    (stripped, markup)
 }
 
 fn utc8_display(dt: DateTime<Utc>) -> String {
@@ -7286,7 +7311,12 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
 
             let template = settings.ot_template.clone().unwrap_or_else(default_ot_template);
             let text = template.replace("{user}", &mention_link(target_id, &target_name)).replace("{count}", &count.to_string());
-            if let Ok(sent) = bot.send_message(message.chat.id, text).parse_mode(ParseMode::Html).await {
+            let (text, buttons) = extract_template_buttons(&text);
+            let mut req = bot.send_message(message.chat.id, text).parse_mode(ParseMode::Html);
+            if let Some(markup) = buttons {
+                req = req.reply_markup(markup);
+            }
+            if let Ok(sent) = req.await {
                 let bot2 = bot.clone();
                 let notice_chat = message.chat.id;
                 let sent_id = sent.id;
@@ -7338,7 +7368,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 bot.send_message(
                     message.chat.id,
                     format!(
-                        "<b>目前 /ot 範本</b>\n{}\n\n用法：/ot_template &lt;文字，用 {{user}} 代表提及、{{count}} 代表目前警告數&gt;\n傳送 /ot_template reset 可還原預設範本。",
+                        "<b>目前 /ot 範本</b>\n{}\n\n用法：/ot_template &lt;文字，用 {{user}} 代表提及、{{count}} 代表目前警告數&gt;\n可加入 <code>{{button}}[網址]</code> 或 <code>{{button:標籤}}[網址]</code> 顯示一個按鈕，可重複加入多個。\n傳送 /ot_template reset 可還原預設範本。",
                         escape_html(&current),
                     ),
                 )
@@ -10849,6 +10879,42 @@ mod tests {
 
         // A different group is untouched.
         assert_eq!(runtime.get_warn_settings(999).await.unwrap().threshold, 2);
+    }
+
+    // Backs /ot_template's {button}[url] syntax: the marker must disappear
+    // from the sent text either way, a valid URL becomes a real button (with
+    // the given label, or a sensible default), an invalid URL is dropped
+    // silently rather than producing a broken button, and multiple markers
+    // stack as separate rows in the order they appeared.
+    #[test]
+    fn template_buttons_are_extracted_and_stripped() {
+        let (text, buttons) = extract_template_buttons("hello {button}[https://t.me/SpamProtectionChat/3] world");
+        assert_eq!(text, "hello  world");
+        let markup = buttons.expect("a valid URL must produce a keyboard");
+        assert_eq!(markup.inline_keyboard.len(), 1);
+        assert_eq!(markup.inline_keyboard[0][0].text, "查看");
+
+        let (text, buttons) = extract_template_buttons("{button:群規}[https://t.me/SpamProtectionChat/3]");
+        assert_eq!(text, "");
+        assert_eq!(buttons.unwrap().inline_keyboard[0][0].text, "群規");
+
+        // No marker at all - untouched text, no keyboard.
+        let (text, buttons) = extract_template_buttons("plain text, no button here");
+        assert_eq!(text, "plain text, no button here");
+        assert!(buttons.is_none());
+
+        // An unparseable URL: the marker still vanishes from the text, but
+        // contributes no button rather than a broken one.
+        let (text, buttons) = extract_template_buttons("hi {button}[not a url]");
+        assert_eq!(text, "hi");
+        assert!(buttons.is_none());
+
+        // Two markers stack as two rows, in order.
+        let (_, buttons) = extract_template_buttons("{button:一}[https://t.me/a] {button:二}[https://t.me/b]");
+        let markup = buttons.unwrap();
+        assert_eq!(markup.inline_keyboard.len(), 2);
+        assert_eq!(markup.inline_keyboard[0][0].text, "一");
+        assert_eq!(markup.inline_keyboard[1][0].text, "二");
     }
 
     #[test]
