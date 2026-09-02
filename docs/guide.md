@@ -56,7 +56,7 @@ Spam Protection Bot（SPB，機器人帳號 [@WikiBlacklistRobot](https://t.me/W
 | `/warns`（回覆或提供 user_id） | 查詢目前警告次數與紀錄 |
 | `/warnconfig [門檻] [mute\|kick\|ban] [時長]` | 查看或設定本群警告門檻與處置方式 |
 | `/ot`（回覆離題訊息） | 刪除該訊息並加警告（預設 1 次，可用 `/ot_warns` 調整） |
-| `/ot_template <文字>` | 自訂 `/ot` 的提及訊息（`{user}`／`{count}` 佔位符） |
+| `/ot_template <文字>` | 自訂 `/ot` 的提及訊息（`{user}`／`{count}` 佔位符，可加 `{button}[網址]` 或 `{button:標籤}[網址]` 顯示按鈕，可重複加入多個） |
 
 警告永不過期，只能用 `/unwarn` 手動移除。
 
@@ -177,7 +177,7 @@ Spam Protection Bot（SPB，机器人账号 [@WikiBlacklistRobot](https://t.me/W
 | `/warns`（回复或提供 user_id） | 查询目前警告次数与记录 |
 | `/warnconfig [阈值] [mute\|kick\|ban] [时长]` | 查看或设置本群警告阈值与处置方式 |
 | `/ot`（回复离题消息） | 删除该消息并加警告（默认 1 次，可用 `/ot_warns` 调整） |
-| `/ot_template <文字>` | 自定义 `/ot` 的提及消息（`{user}`／`{count}` 占位符） |
+| `/ot_template <文字>` | 自定义 `/ot` 的提及消息（`{user}`／`{count}` 占位符，可加 `{button}[网址]` 或 `{button:标签}[网址]` 显示按钮，可重复加入多个） |
 
 警告永不过期，只能用 `/unwarn` 手动移除。
 
