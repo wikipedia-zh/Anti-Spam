@@ -2082,6 +2082,35 @@ impl Runtime {
         .await
     }
 
+    /// Password gating the maintainer onboarding page - see
+    /// `ModerationCommand::MaintainerDoc`. Same storage shape as
+    /// `hostctl_secret`, but bot-generated rather than typed by a human, and
+    /// meant to be shared among the whole maintainer team rather than being
+    /// the host's own personal secret.
+    async fn maintainer_doc_secret(&self) -> Option<String> {
+        self.with_conn(|conn| {
+            Ok(conn
+                .query_row("SELECT value FROM model_meta WHERE key = 'maintainer_doc_secret'", [], |r| r.get::<_, String>(0))
+                .ok())
+        })
+        .await
+        .ok()
+        .flatten()
+        .filter(|v| !v.is_empty())
+    }
+
+    async fn set_maintainer_doc_secret(&self, secret: &str) -> Result<()> {
+        let secret = secret.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO model_meta (key, value) VALUES ('maintainer_doc_secret', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![secret],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn set_blacklist_reason_message_id(&self, message_id: i32) -> Result<()> {
         self.with_conn(move |conn| {
             conn.execute(
@@ -3382,6 +3411,7 @@ enum ModerationCommand {
     Ot,
     OtWarns(String),
     OtTemplate(String),
+    MaintainerDoc(String),
     Unknown,
 }
 
@@ -3506,6 +3536,7 @@ fn parse_command(text: &str) -> ModerationCommand {
         // forms above) - this holds a formatted message template, not a
         // one-line reason.
         "/ot_template" => ModerationCommand::OtTemplate(text.split_once(char::is_whitespace).map(|x| x.1.trim().to_string()).unwrap_or_default()),
+        "/maintainerdoc" => ModerationCommand::MaintainerDoc(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         _ => ModerationCommand::Unknown,
     }
 }
@@ -3929,6 +3960,8 @@ fn help_op_text(section: &str) -> String {
             "<code>/pol show</code> 查詢本群警告次數\n",
             "<code>/pol clear</code> 清除警告\n",
             "<code>/ping</code> 版本與 commit\n",
+            "<code>/maintainerdoc</code> 取得上手文件密碼\n",
+            "· 加 <code>new</code> 更換，舊密碼失效\n",
             "\n<b>日誌與橋接</b>\n",
             "<code>/set_audit_log [chat_id]</code>\n",
             "· 記錄每個改變狀態的維護指令\n",
@@ -4189,6 +4222,17 @@ fn format_duration_zh(secs: i64) -> String {
 /// `/ot` handler.
 fn default_ot_template() -> String {
     "{user} 你的訊息因為離題已被刪除，目前警告 {count} 次，請留意群組主題。".to_string()
+}
+
+/// A bot-generated password for `/maintainerdoc` - deliberately not typed by
+/// a human (unlike `/hostctl`'s `PW` op), since the whole point is nobody
+/// gets to pick something guessable. `Uuid::new_v4` is backed by the OS CSPRNG
+/// (see the `uuid`/`getrandom` crates), which is more entropy than this
+/// really needs, but it's already a dependency and there's no reason to add
+/// a dedicated RNG crate just to generate a short string. Hyphens stripped
+/// and uppercased purely for legibility when typed into a web form.
+fn generate_maintainer_doc_password() -> String {
+    Uuid::new_v4().simple().to_string()[..12].to_uppercase()
 }
 
 /// Pulls `{button}[url]` (or `{button:標籤}[url]`) markers out of a rendered
@@ -7385,6 +7429,47 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             }
             runtime.set_ot_template(chat_id, Some(text_arg.trim())).await.ok();
             bot.send_message(message.chat.id, "已更新本群 /ot 範本。").await?;
+        }
+        ModerationCommand::MaintainerDoc(sub) => {
+            require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用此指令。");
+            // "new"/"regen" forces a fresh password (invalidates the old one -
+            // e.g. after a maintainer leaves); anything else just reveals the
+            // current one, generating it on first use. Either way the
+            // password itself is always bot-generated, never typed by a
+            // human - see generate_maintainer_doc_password.
+            let force_new = matches!(sub.trim().to_lowercase().as_str(), "new" | "regen" | "regenerate");
+            let secret = if force_new {
+                None
+            } else {
+                runtime.maintainer_doc_secret().await
+            };
+            let secret = match secret {
+                Some(existing) => existing,
+                None => {
+                    let generated = generate_maintainer_doc_password();
+                    runtime.set_maintainer_doc_secret(&generated).await.ok();
+                    generated
+                }
+            };
+            let sent = bot
+                .send_message(
+                    message.chat.id,
+                    format!(
+                        "維護組上手文件密碼：<code>{secret}</code>\nhttps://wikipedia-zh-antispam.toolforge.org/\n\n此密碼由所有維護組共用；需要更換請用 <code>/maintainerdoc new</code>（會讓舊密碼立即失效）。"
+                    ),
+                )
+                .parse_mode(ParseMode::Html)
+                .await?;
+            let _ = bot.delete_message(message.chat.id, message.id).await;
+            if message.chat.is_group() || message.chat.is_supergroup() {
+                let bot2 = bot.clone();
+                let chat_id2 = message.chat.id;
+                let sent_id = sent.id;
+                tokio::spawn(async move {
+                    sleep(Duration::from_secs(60)).await;
+                    let _ = bot2.delete_message(chat_id2, sent_id).await;
+                });
+            }
         }
         ModerationCommand::SpamReport => {
             // Three rejected reports and the command is gone. Maintainers are
@@ -10955,6 +11040,33 @@ mod tests {
         case.action = ActionKind::Unbanned;
         runtime.persist_case(&case).await.unwrap();
         assert!(runtime.find_active_project_ban(200).await.unwrap().is_none(), "a reversed PB must stop being enforced");
+    }
+
+    // Backs /maintainerdoc: unset until first requested, then round-trips
+    // through the same model_meta storage hostctl_secret already uses.
+    #[tokio::test]
+    async fn maintainer_doc_secret_is_unset_then_round_trips() {
+        let runtime = test_runtime().await;
+        assert!(runtime.maintainer_doc_secret().await.is_none());
+
+        runtime.set_maintainer_doc_secret("ABCD1234EFGH").await.unwrap();
+        assert_eq!(runtime.maintainer_doc_secret().await.as_deref(), Some("ABCD1234EFGH"));
+
+        // /maintainerdoc new overwrites it outright, invalidating the old one.
+        runtime.set_maintainer_doc_secret("WXYZ9876").await.unwrap();
+        assert_eq!(runtime.maintainer_doc_secret().await.as_deref(), Some("WXYZ9876"));
+    }
+
+    // Backs the "bot-generated, not human-typed" property /maintainerdoc
+    // relies on: fixed length, uppercase hex, and not trivially predictable
+    // (two calls must differ).
+    #[test]
+    fn maintainer_doc_password_is_well_formed_and_not_constant() {
+        let a = generate_maintainer_doc_password();
+        let b = generate_maintainer_doc_password();
+        assert_eq!(a.len(), 12);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()), "must be uppercase hex: {a}");
+        assert_ne!(a, b, "two generated passwords must not collide in practice");
     }
 
     // Backs /module warn-pol on|off: the pol flag round-trips through
