@@ -7367,7 +7367,12 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 let notice_chat = message.chat.id;
                 let sent_id = sent.id;
                 tokio::spawn(async move {
-                    sleep(Duration::from_secs(180)).await;
+                    // Kept much longer than the bot's other transient notices
+                    // (those are 180s) - this one names the offending user
+                    // and their warning count, so it's worth leaving visible
+                    // for the group to actually see rather than cleaning it
+                    // up almost immediately.
+                    sleep(Duration::from_secs(24 * 60 * 60)).await;
                     let _ = bot2.delete_message(notice_chat, sent_id).await;
                 });
             }
