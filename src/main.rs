@@ -15,7 +15,7 @@ use regex::Regex as StdRegex;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::{collections::{HashMap, VecDeque}, env, path::PathBuf, sync::{Arc, Mutex as StdMutex, OnceLock}, time::Instant};
-use teloxide::{prelude::*, types::{CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, MessageId, MessageKind, ParseMode, UserId}};
+use teloxide::{prelude::*, types::{CallbackQuery, ChatId, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, MessageId, MessageKind, ParseMode, UserId}};
 use url::Url;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Duration};
@@ -3348,9 +3348,9 @@ enum ModerationCommand {
     ScoreTest(String),
     SetChat(String),
     Leave(String),
-    SpamBan,
-    Mute,
-    Kick,
+    SpamBan(String),
+    Mute(String),
+    Kick(String),
     SpamReport,
     CaseLookup(String),
     MlTrainSpam,
@@ -3419,9 +3419,9 @@ fn parse_command(text: &str) -> ModerationCommand {
     let head = text.split_whitespace().next().unwrap_or("");
     let base = head.split('@').next().unwrap_or(head).to_lowercase();
     match base.as_str() {
-        "/spamban" | "/sb" => ModerationCommand::SpamBan,
-        "/mute" | "/m" => ModerationCommand::Mute,
-        "/kick" | "/k" => ModerationCommand::Kick,
+        "/spamban" | "/sb" => ModerationCommand::SpamBan(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
+        "/mute" | "/m" => ModerationCommand::Mute(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
+        "/kick" | "/k" => ModerationCommand::Kick(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
         "/start" => ModerationCommand::Start,
         "/help" => ModerationCommand::Help,
         "/myid" | "/id" => ModerationCommand::MyId,
@@ -3524,7 +3524,7 @@ fn parse_command(text: &str) -> ModerationCommand {
             let action = parts.next().unwrap_or("").to_string();
             ModerationCommand::Magic(module, chat_id, action)
         }
-        "/pol" => ModerationCommand::Pol(text.split_whitespace().nth(1).unwrap_or("").to_string()),
+        "/pol" => ModerationCommand::Pol(text.split_once(char::is_whitespace).map(|x| x.1.trim().to_string()).unwrap_or_default()),
         "/pb" => ModerationCommand::ProjectBan(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
         "/warn" => ModerationCommand::Warn(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
         "/unwarn" => ModerationCommand::Unwarn(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
@@ -3826,6 +3826,7 @@ fn help_text() -> String {
         "<code>/id</code> 取得自己的 User ID\n",
         "· 舉報累計 3 次被拒將暫停使用\n",
         "\n<b>━━ 群組管理員 ━━</b>\n",
+        "· 以下指令皆可用 user_id 代替回覆\n",
         "<code>/sb</code> 刪除訊息並封禁\n",
         "<code>/mute</code> 禁言\n",
         "<code>/kick</code> 踢出\n",
@@ -5840,6 +5841,57 @@ async fn check_project_ban_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &
     true
 }
 
+/// Pure half of `check_project_ban_promotion_bypass`'s detection, split out
+/// for unit testing without a live `Bot`: true if this update's subject just
+/// gained admin/owner status they didn't have before, and isn't a bot
+/// (promoting another bot is never a way to shield a human from a ban).
+fn is_promotion_event(update: &ChatMemberUpdated) -> bool {
+    !update.old_chat_member.kind.is_privileged() && update.new_chat_member.kind.is_privileged() && !update.new_chat_member.user.is_bot
+}
+
+/// The specific circumvention the ToU's Project Ban clause calls out:
+/// promoting a PB'd user to admin so this bot's own enforcement (which bans
+/// on sight - see `check_project_ban_and_act`) can't remove them, since a
+/// message from an admin never reaches that check the same way. Fires on
+/// every `chat_member` update where the subject's privilege level rises;
+/// if that subject has an active Project Ban, this makes a best-effort
+/// attempt to ban them anyway (Telegram sometimes still allows it depending
+/// on the group's admin hierarchy, sometimes doesn't) and always alerts the
+/// maintainer team regardless of whether that attempt worked - per the ToU,
+/// a human then decides whether to `/leave` the group and/or `/pb` whoever
+/// did the promoting. Deliberately does not auto-`/leave` or auto-`/pb`
+/// itself: those are more severe, harder-to-reverse actions than anything
+/// else this bot does unattended.
+async fn check_project_ban_promotion_bypass(bot: &Bot, runtime: &Arc<Runtime>, update: &ChatMemberUpdated) {
+    if !is_promotion_event(update) {
+        return;
+    }
+    let target = &update.new_chat_member.user;
+    let target_id = target.id.0 as i64;
+    let Ok(Some(case)) = runtime.find_active_project_ban(target_id).await else {
+        return;
+    };
+
+    let chat_id = update.chat.id;
+    let ban_ok = bot.ban_chat_member(chat_id, target.id).await.is_ok();
+    let ban_note = if ban_ok {
+        "已嘗試立即封禁，狀態：成功。"
+    } else {
+        "已嘗試立即封禁，狀態：失敗（可能受群組管理員層級限制），需要人工處理。"
+    };
+
+    let dest = runtime.audit_log_chat().await.unwrap_or(runtime.config.report_channel_id);
+    let text = format!(
+        "<b>⚠ 疑似規避項目層級封禁（PB）</b>\n<b>對象</b>: {} (<code>{target_id}</code>)\n<b>原始 PB 案例</b>: <code>{}</code>\n<b>群組</b>: <code>{}</code>\n<b>操作者</b>: {} (<code>{}</code>)\n\n該用戶剛在此群組被設為管理員，疑似意圖阻止機器人將其移出。{ban_note}\n請依使用規範第 7 條處理：可考慮對該群組使用 /leave 終止服務，並視情節對操作者使用 /pb。",
+        mention_link(target_id, &short_user(target)),
+        case.id,
+        chat_id.0,
+        escape_html(&short_user(&update.from)),
+        update.from.id.0,
+    );
+    let _ = bot.send_message(ChatId(dest), text).parse_mode(ParseMode::Html).await;
+}
+
 /// Message-time safety net for netban: catches members who were already in
 /// a group before it turned netban on, or who joined between propagation
 /// events - cases the join-time check in `notify_bot_added` can't reach,
@@ -6932,9 +6984,26 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 }
             }
         }
-        ModerationCommand::SpamBan | ModerationCommand::Mute | ModerationCommand::Kick => {
-            let Some((target_id, target_name, source_id, evidence_text)) = extract_reply_context(&message).await else {
-                reply_ephemeral(&bot, &message, "請回覆一條訊息後再使用此指令。").await?;
+        ModerationCommand::SpamBan(ref arg) | ModerationCommand::Mute(ref arg) | ModerationCommand::Kick(ref arg) => {
+            let arg = arg.clone();
+            let action = match &cmd {
+                ModerationCommand::SpamBan(_) => ActionKind::SpamBan,
+                ModerationCommand::Mute(_) => ActionKind::Mute,
+                ModerationCommand::Kick(_) => ActionKind::Kick,
+                _ => unreachable!(),
+            };
+
+            // A reply works as before (and is still how the message itself
+            // gets deleted/trained on); a bare user_id also works when
+            // there's nothing to reply to - e.g. banning someone who already
+            // left, or acting pre-emptively. In that case there's simply no
+            // message to delete and no evidence to queue for training.
+            let resolved = match extract_reply_context(&message).await {
+                Some((target_id, target_name, source_id, evidence_text)) => Some((target_id, target_name, Some(source_id), evidence_text)),
+                None => arg.trim().parse::<i64>().ok().map(|target_id| (target_id, format!("User{target_id}"), None, String::new())),
+            };
+            let Some((target_id, target_name, source_id, evidence_text)) = resolved else {
+                reply_ephemeral(&bot, &message, "請回覆一條訊息，或提供 user_id，再使用此指令。").await?;
                 return Ok(());
             };
 
@@ -6948,12 +7017,6 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 return Ok(());
             }
 
-            let action = match cmd {
-                ModerationCommand::SpamBan => ActionKind::SpamBan,
-                ModerationCommand::Mute => ActionKind::Mute,
-                ModerationCommand::Kick => ActionKind::Kick,
-                _ => unreachable!(),
-            };
             // A /sb on a message that is nothing but bot @-mentions is
             // guest-mode summon spam. Storing that as an ML sample would just
             // teach the model a username token; a regex rule catches the bot
@@ -6974,7 +7037,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 target_name: target_name.clone(),
                 actor_user_id: Some(from_id),
                 actor_name: Some(short_user(from)),
-                source_message_id: Some(source_id),
+                source_message_id: source_id,
                 evidence_text: evidence_text.clone(),
                 model_score: None,
                 matched_rule_id: None,
@@ -6986,7 +7049,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
 
             match action {
                 ActionKind::SpamBan => {
-                    let _ = bot.delete_message(message.chat.id, MessageId(source_id)).await;
+                    if let Some(sid) = source_id {
+                        let _ = bot.delete_message(message.chat.id, MessageId(sid)).await;
+                    }
                     ban_user(&bot, message.chat.id, target_id).await.ok();
                     // Deliberately does NOT train here. A group admin's /sb
                     // is a decision about their own room, and taking it as
@@ -7015,7 +7080,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     // A bare username is not useful ML signal; the rule does
                     // the work, so skip the training-review queue.
                     capture_bot_spam_rules(&bot, &runtime, message.chat.id.0, &evidence_text).await;
-                } else {
+                } else if !evidence_text.trim().is_empty() {
+                    // A /sb by bare user_id (no reply) has no message text at
+                    // all - nothing to queue for training review.
                     queue_training_review(&bot, &runtime, &case).await;
                 }
             }
@@ -7053,18 +7120,30 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 return Ok(());
             }
 
-            match sub.trim().to_lowercase().as_str() {
+            let mut sub_parts = sub.trim().splitn(2, char::is_whitespace);
+            let subverb = sub_parts.next().unwrap_or("").to_lowercase();
+            let id_arg = sub_parts.next().unwrap_or("").trim();
+
+            match subverb.as_str() {
                 "show" => {
-                    let Some((target_id, target_name, _, _)) = extract_reply_context(&message).await else {
-                        reply_ephemeral(&bot, &message, "請回覆一位用戶的訊息。").await?;
+                    let target = match extract_reply_context(&message).await {
+                        Some((id, name, _, _)) => Some((id, name)),
+                        None => id_arg.parse::<i64>().ok().map(|id| (id, format!("User{id}"))),
+                    };
+                    let Some((target_id, target_name)) = target else {
+                        reply_ephemeral(&bot, &message, "請回覆一位用戶的訊息，或提供 user_id。").await?;
                         return Ok(());
                     };
                     let count = runtime.pol_warn_count(chat_id, target_id).await.unwrap_or(0);
                     bot.send_message(message.chat.id, format!("{} 目前在本群有 {count} 次警告。", escape_html(&target_name))).parse_mode(ParseMode::Html).await?;
                 }
                 "clear" => {
-                    let Some((target_id, target_name, _, _)) = extract_reply_context(&message).await else {
-                        reply_ephemeral(&bot, &message, "請回覆一位用戶的訊息。").await?;
+                    let target = match extract_reply_context(&message).await {
+                        Some((id, name, _, _)) => Some((id, name)),
+                        None => id_arg.parse::<i64>().ok().map(|id| (id, format!("User{id}"))),
+                    };
+                    let Some((target_id, target_name)) = target else {
+                        reply_ephemeral(&bot, &message, "請回覆一位用戶的訊息，或提供 user_id。").await?;
                         return Ok(());
                     };
                     runtime.clear_pol_warns(chat_id, target_id).await.ok();
@@ -7121,7 +7200,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     let _ = bot.delete_message(message.chat.id, message.id).await;
                 }
                 _ => {
-                    reply_ephemeral(&bot, &message, "用法：/pol（回覆訊息）、/pol show（回覆訊息）、/pol clear（回覆訊息）。").await?;
+                    reply_ephemeral(&bot, &message, "用法：/pol（回覆訊息）、/pol show（回覆或 user_id）、/pol clear（回覆或 user_id）。").await?;
                 }
             }
         }
@@ -7202,10 +7281,20 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             .parse_mode(ParseMode::Html)
             .await?;
         }
-        ModerationCommand::Warn(reason) => {
-            let Some((target_id, target_name, _, _)) = extract_reply_context(&message).await else {
-                reply_ephemeral(&bot, &message, "請回覆一條訊息後再使用 /warn。").await?;
-                return Ok(());
+        ModerationCommand::Warn(reason_arg) => {
+            // Reply targets the message's author, reason is the whole arg
+            // string; without a reply, the first token must be a user_id and
+            // the rest (if any) is the reason - same shape as /forbid/pb.
+            let (target_id, target_name, reason) = match extract_reply_context(&message).await {
+                Some((id, name, _, _)) => (id, name, reason_arg.trim().to_string()),
+                None => {
+                    let (parsed_id, rest) = parse_leave_args(&reason_arg);
+                    let Some(id) = parsed_id else {
+                        reply_ephemeral(&bot, &message, "請回覆一條訊息，或提供 user_id [原因]，再使用 /warn。").await?;
+                        return Ok(());
+                    };
+                    (id, format!("User{id}"), rest.trim().to_string())
+                }
             };
             if !is_group_admin(&bot, message.chat.id, from_id).await {
                 handle_permission_denied(&bot, &runtime, &message, from, "只有群組管理員可以執行此指令。").await?;
@@ -7216,7 +7305,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 return Ok(());
             }
             let chat_id = message.chat.id.0;
-            let reason = reason.trim();
+            let reason = reason.as_str();
             let reason_opt = if reason.is_empty() { None } else { Some(reason) };
             let count = runtime.add_warn(chat_id, target_id, reason_opt, from_id).await.unwrap_or(1);
             let settings = runtime.get_warn_settings(chat_id).await.unwrap_or_default();
@@ -7231,15 +7320,25 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let _ = bot.delete_message(message.chat.id, message.id).await;
         }
         ModerationCommand::Unwarn(arg) => {
-            let Some((target_id, target_name, _, _)) = extract_reply_context(&message).await else {
-                reply_ephemeral(&bot, &message, "請回覆一位用戶的訊息後再使用 /unwarn。").await?;
-                return Ok(());
+            // Reply targets the message's author and the whole arg is the
+            // count; without a reply, the first token must be a user_id and
+            // the rest (if any) is the count - same shape as /warn.
+            let (target_id, target_name, count_arg) = match extract_reply_context(&message).await {
+                Some((id, name, _, _)) => (id, name, arg.clone()),
+                None => {
+                    let mut parts = arg.trim().splitn(2, char::is_whitespace);
+                    let Some(id) = parts.next().and_then(|s| s.parse::<i64>().ok()) else {
+                        reply_ephemeral(&bot, &message, "請回覆一位用戶的訊息，或提供 user_id [n]，再使用 /unwarn。").await?;
+                        return Ok(());
+                    };
+                    (id, format!("User{id}"), parts.next().unwrap_or("").to_string())
+                }
             };
             if !is_group_admin(&bot, message.chat.id, from_id).await {
                 handle_permission_denied(&bot, &runtime, &message, from, "只有群組管理員可以執行此指令。").await?;
                 return Ok(());
             }
-            let n = arg.trim().parse::<i64>().unwrap_or(1).max(1);
+            let n = count_arg.trim().parse::<i64>().unwrap_or(1).max(1);
             let chat_id = message.chat.id.0;
             let removed = runtime.remove_warns(chat_id, target_id, n).await.unwrap_or(0);
             let remaining = runtime.warn_count(chat_id, target_id).await.unwrap_or(0);
@@ -9424,10 +9523,28 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Telegram only sends `chat_member` updates when a handler asks for them
+    // (teloxide computes `allowed_updates` from the branches actually
+    // registered here, so adding this branch is what turns the stream on -
+    // no separate config needed). Backs check_project_ban_promotion_bypass:
+    // promotions are the one moderation-relevant event that never shows up
+    // as a `Message`.
+    let chat_member_handler = Update::filter_chat_member().endpoint({
+        let runtime = runtime.clone();
+        move |bot: Bot, update: ChatMemberUpdated| {
+            let runtime = runtime.clone();
+            async move {
+                check_project_ban_promotion_bypass(&bot, &runtime, &update).await;
+                Ok(())
+            }
+        }
+    });
+
     let handler = dptree::entry()
         .branch(message_handler)
         .branch(callback_handler)
-        .branch(exchange_handler);
+        .branch(exchange_handler)
+        .branch(chat_member_handler);
 
     let mut dispatcher = Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![runtime.clone(), runtime.config.clone()])
@@ -11045,6 +11162,28 @@ mod tests {
         case.action = ActionKind::Unbanned;
         runtime.persist_case(&case).await.unwrap();
         assert!(runtime.find_active_project_ban(200).await.unwrap().is_none(), "a reversed PB must stop being enforced");
+    }
+
+    // Backs check_project_ban_promotion_bypass's trigger condition: it must
+    // fire only on an actual privilege *increase*, never for someone already
+    // privileged, a demotion, or a promoted bot (which can't shield a human
+    // from anything).
+    #[test]
+    fn promotion_event_detects_privilege_increase_only() {
+        let admin_fields = r#""is_anonymous":false,"can_be_edited":true,"can_manage_chat":true,"can_change_info":true,"can_delete_messages":true,"can_manage_video_chats":true,"can_invite_users":true,"can_restrict_members":true,"can_promote_members":false"#;
+        let member = |id: i64, is_bot: bool| format!(r#"{{"user":{{"id":{id},"is_bot":{is_bot},"first_name":"U"}},"status":"member"}}"#);
+        let admin = |id: i64, is_bot: bool| format!(r#"{{"user":{{"id":{id},"is_bot":{is_bot},"first_name":"U"}},"status":"administrator",{admin_fields}}}"#);
+        let event = |old: String, new: String| {
+            serde_json::from_str::<ChatMemberUpdated>(&format!(
+                r#"{{"chat":{{"id":-100,"type":"supergroup","title":"g"}},"from":{{"id":5,"is_bot":false,"first_name":"Admin"}},"date":1,"old_chat_member":{old},"new_chat_member":{new}}}"#
+            ))
+            .unwrap()
+        };
+
+        assert!(is_promotion_event(&event(member(42, false), admin(42, false))), "member -> admin must count as a promotion");
+        assert!(!is_promotion_event(&event(admin(42, false), admin(42, false))), "already privileged - not a fresh promotion");
+        assert!(!is_promotion_event(&event(admin(42, false), member(42, false))), "a demotion must not count as a promotion");
+        assert!(!is_promotion_event(&event(member(9, true), admin(9, true))), "promoting a bot must never count");
     }
 
     // Backs /maintainerdoc: unset until first requested, then round-trips
