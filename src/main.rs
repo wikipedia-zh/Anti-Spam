@@ -4963,7 +4963,7 @@ async fn notify_netban_sync(bot: &Bot, chat_id: ChatId, target_user_id: i64, cas
 /// netban sync.
 async fn notify_project_ban_sync(bot: &Bot, chat_id: ChatId, target_user_id: i64, case_id: &str) {
     let text = format!(
-        "<b>項目層級封禁（PB）同步執行</b>\n用戶 <code>{target_user_id}</code> 已因項目層級封禁自動封禁。此封禁對所有群組強制生效，無法透過白名單或本群解封繞過，僅維護組可解除。\n原始案例: <code>{case_id}</code>"
+        "<b>項目層級封禁（PB）同步執行</b>\n用戶 <code>{target_user_id}</code> 已因項目層級封禁自動封禁。此封禁對所有群組強制生效，無法透過白名單或本群解封繞過，僅維護組可解除（見<a href=\"{TERMS_URL}#project-ban\">使用規範第 7 條</a>）。\n原始案例: <code>{case_id}</code>"
     );
     let Ok(sent) = bot.send_message(chat_id, text).parse_mode(ParseMode::Html).await else { return };
     let bot = bot.clone();
@@ -5882,7 +5882,7 @@ async fn check_project_ban_promotion_bypass(bot: &Bot, runtime: &Arc<Runtime>, u
 
     let dest = runtime.audit_log_chat().await.unwrap_or(runtime.config.report_channel_id);
     let text = format!(
-        "<b>⚠ 疑似規避項目層級封禁（PB）</b>\n<b>對象</b>: {} (<code>{target_id}</code>)\n<b>原始 PB 案例</b>: <code>{}</code>\n<b>群組</b>: <code>{}</code>\n<b>操作者</b>: {} (<code>{}</code>)\n\n該用戶剛在此群組被設為管理員，疑似意圖阻止機器人將其移出。{ban_note}\n請依使用規範第 7 條處理：可考慮對該群組使用 /leave 終止服務，並視情節對操作者使用 /pb。",
+        "<b>⚠ 疑似規避項目層級封禁（PB）</b>\n<b>對象</b>: {} (<code>{target_id}</code>)\n<b>原始 PB 案例</b>: <code>{}</code>\n<b>群組</b>: <code>{}</code>\n<b>操作者</b>: {} (<code>{}</code>)\n\n該用戶剛在此群組被設為管理員，疑似意圖阻止機器人將其移出。{ban_note}\n請依<a href=\"{TERMS_URL}#project-ban\">使用規範第 7 條</a>處理：可考慮對該群組使用 /leave 終止服務，並視情節對操作者使用 /pb。",
         mention_link(target_id, &short_user(target)),
         case.id,
         chat_id.0,
@@ -7275,7 +7275,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             bot.send_message(
                 message.chat.id,
                 format!(
-                    "已對 <code>{target_id}</code> 執行項目層級封禁（PB）。此封禁對所有群組強制生效：無法被本群 /unban 或 /white 解除，全域白名單申請也會被拒絕，任何嘗試都會通知維護組。解除請由維護組使用 <code>/unban {target_id}</code>。"
+                    "已對 <code>{target_id}</code> 執行項目層級封禁（PB，見<a href=\"{TERMS_URL}#project-ban\">使用規範第 7 條</a>）。此封禁對所有群組強制生效：無法被本群 /unban 或 /white 解除，全域白名單申請也會被拒絕，任何嘗試都會通知維護組。解除請由維護組使用 <code>/unban {target_id}</code>。"
                 ),
             )
             .parse_mode(ParseMode::Html)
