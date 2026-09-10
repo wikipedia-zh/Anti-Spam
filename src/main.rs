@@ -3940,6 +3940,7 @@ fn help_op_text(section: &str) -> String {
             "· 項目層級封禁（PB）\n",
             "· 對所有群組強制生效，本群無法解除\n",
             "· /unban、/white 皆拒絕並通知維護組\n",
+            "· 對象若在某群為管理員→自動終止該群\n",
             "· 解除：/unban &lt;user_id&gt;（維護組）\n",
             "\n<b>審核員</b>\n",
             "<code>/reviewer add|del &lt;user_id&gt;</code>\n",
@@ -4627,9 +4628,11 @@ async fn process_new_group_member(bot: &Bot, runtime: &Arc<Runtime>, message: &M
     // back in through the front door of a join. See check_project_ban_and_act.
     if let Ok(Some(case)) = runtime.find_active_project_ban(user.id.0 as i64).await {
         let _ = bot.delete_message(message.chat.id, message.id).await;
-        let _ = bot.ban_chat_member(message.chat.id, user.id).await;
-        let _ = runtime.record_network_ban_target(&case.id, message.chat.id.0).await;
-        notify_project_ban_sync(bot, message.chat.id, user.id.0 as i64, &case.id).await;
+        let target_id = user.id.0 as i64;
+        if enforce_project_ban_or_terminate_group(bot, runtime, message.chat.id, target_id, &case.id).await {
+            let _ = runtime.record_network_ban_target(&case.id, message.chat.id.0).await;
+            notify_project_ban_sync(bot, message.chat.id, target_id, &case.id).await;
+        }
         return;
     }
 
@@ -4972,6 +4975,58 @@ async fn notify_project_ban_sync(bot: &Bot, chat_id: ChatId, target_user_id: i64
         sleep(Duration::from_secs(180)).await;
         let _ = bot.delete_message(chat_id, message_id).await;
     });
+}
+
+/// Attempts a Project Ban's actual `ban_chat_member` call and, if it fails
+/// because the target currently holds admin/owner status in that chat - the
+/// one way Telegram lets a privileged member dodge a ban a lower-ranked bot
+/// issues - immediately terminates service to the group rather than leaving
+/// it shielding a Project-Banned account with nobody the wiser. This is the
+/// automatic half of the ToU's Project Ban clause: unlike a mere *bypass
+/// attempt* that still gets stopped (see `check_project_ban_promotion_bypass`,
+/// which only alerts when the ban itself still succeeds), an actual failed
+/// ban is unambiguous, so this reacts immediately instead of waiting on a
+/// human. Called from every site that ever attempts a PB ban - message-time,
+/// join-time, the promotion-event handler, and `/pb`'s own immediate
+/// attempt - so the same consequence follows no matter which one catches it
+/// first. Returns whether the ban succeeded.
+async fn enforce_project_ban_or_terminate_group(bot: &Bot, runtime: &Arc<Runtime>, chat_id: ChatId, target_id: i64, case_id: &str) -> bool {
+    if bot.ban_chat_member(chat_id, UserId(target_id as u64)).await.is_ok() {
+        return true;
+    }
+    // The ban failed - only escalate if that's because the target is (still)
+    // privileged in this chat, which is exactly the shielding scenario.
+    // Anything else (network hiccup, bot lacking ban rights entirely, etc.)
+    // isn't the group's fault and isn't ours to act on here.
+    let is_admin = bot
+        .get_chat_member(chat_id, UserId(target_id as u64))
+        .await
+        .map(|m| m.kind.is_privileged())
+        .unwrap_or(false);
+    if is_admin {
+        terminate_group_for_project_ban_evasion(bot, runtime, chat_id, target_id, case_id).await;
+    }
+    false
+}
+
+/// Fully automatic consequence of `enforce_project_ban_or_terminate_group`
+/// failing: terminates service to the group exactly like `/leave` does
+/// (notice, blacklist, leave) but with no maintainer behind it - the ToU's
+/// Project Ban clause commits to reacting immediately when a group is, in
+/// effect, shielding a Project-Banned account by keeping them an admin.
+async fn terminate_group_for_project_ban_evasion(bot: &Bot, runtime: &Arc<Runtime>, chat_id: ChatId, target_id: i64, case_id: &str) {
+    let reason = TerminationReason { label: "項目層級封禁遭規避（對象具管理員身分，機器人無法封禁）".to_string(), anchor: Some("project-ban") };
+    let stored_reason = reason.label.clone();
+    let _ = bot.send_message(chat_id, service_termination_text(&reason)).parse_mode(ParseMode::Html).await;
+    let _ = runtime.set_group_banned(chat_id.0, true, &stored_reason, None).await;
+    let _ = bot.leave_chat(chat_id).await;
+
+    let dest = runtime.audit_log_chat().await.unwrap_or(runtime.config.report_channel_id);
+    let text = format!(
+        "<b>🚫 已自動終止服務並封禁群組</b>\n<b>群組</b>: <code>{}</code>\n<b>原因</b>: 項目層級封禁 <code>{case_id}</code> 的對象 <code>{target_id}</code> 在此群組具有管理員權限，機器人無法將其封禁，已依<a href=\"{TERMS_URL}#project-ban\">使用規範第 7 條</a>自動終止服務、退出並列入封禁名單。\n解除請用 <code>/forgive {}</code>。",
+        chat_id.0, chat_id.0,
+    );
+    let _ = bot.send_message(ChatId(dest), text).parse_mode(ParseMode::Html).await;
 }
 
 /// Fired whenever a group admin or maintainer tries to undo an active
@@ -5835,9 +5890,13 @@ async fn check_project_ban_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &
     };
     let chat_id = message.chat.id.0;
     let _ = bot.delete_message(message.chat.id, message.id).await;
-    let _ = bot.ban_chat_member(message.chat.id, user.id).await;
-    let _ = runtime.record_network_ban_target(&case.id, chat_id).await;
-    notify_project_ban_sync(bot, message.chat.id, user_id, &case.id).await;
+    if enforce_project_ban_or_terminate_group(bot, runtime, message.chat.id, user_id, &case.id).await {
+        let _ = runtime.record_network_ban_target(&case.id, chat_id).await;
+        notify_project_ban_sync(bot, message.chat.id, user_id, &case.id).await;
+    }
+    // Handled either way - a failed ban already terminated the group via
+    // enforce_project_ban_or_terminate_group, so there's nothing left in
+    // this chat for the rest of the dispatcher to do with this message.
     true
 }
 
@@ -5854,14 +5913,12 @@ fn is_promotion_event(update: &ChatMemberUpdated) -> bool {
 /// on sight - see `check_project_ban_and_act`) can't remove them, since a
 /// message from an admin never reaches that check the same way. Fires on
 /// every `chat_member` update where the subject's privilege level rises;
-/// if that subject has an active Project Ban, this makes a best-effort
-/// attempt to ban them anyway (Telegram sometimes still allows it depending
-/// on the group's admin hierarchy, sometimes doesn't) and always alerts the
-/// maintainer team regardless of whether that attempt worked - per the ToU,
-/// a human then decides whether to `/leave` the group and/or `/pb` whoever
-/// did the promoting. Deliberately does not auto-`/leave` or auto-`/pb`
-/// itself: those are more severe, harder-to-reverse actions than anything
-/// else this bot does unattended.
+/// if that subject has an active Project Ban, this attempts a ban via
+/// `enforce_project_ban_or_terminate_group` - if Telegram still allows it
+/// despite the promotion, this posts a lightweight FYI (the attempt was
+/// still worth flagging even though it failed to shield anyone); if it
+/// doesn't, that shared helper has already terminated the group
+/// automatically, and there's nothing left to do here.
 async fn check_project_ban_promotion_bypass(bot: &Bot, runtime: &Arc<Runtime>, update: &ChatMemberUpdated) {
     if !is_promotion_event(update) {
         return;
@@ -5873,16 +5930,13 @@ async fn check_project_ban_promotion_bypass(bot: &Bot, runtime: &Arc<Runtime>, u
     };
 
     let chat_id = update.chat.id;
-    let ban_ok = bot.ban_chat_member(chat_id, target.id).await.is_ok();
-    let ban_note = if ban_ok {
-        "已嘗試立即封禁，狀態：成功。"
-    } else {
-        "已嘗試立即封禁，狀態：失敗（可能受群組管理員層級限制），需要人工處理。"
-    };
+    if !enforce_project_ban_or_terminate_group(bot, runtime, chat_id, target_id, &case.id).await {
+        return;
+    }
 
     let dest = runtime.audit_log_chat().await.unwrap_or(runtime.config.report_channel_id);
     let text = format!(
-        "<b>⚠ 疑似規避項目層級封禁（PB）</b>\n<b>對象</b>: {} (<code>{target_id}</code>)\n<b>原始 PB 案例</b>: <code>{}</code>\n<b>群組</b>: <code>{}</code>\n<b>操作者</b>: {} (<code>{}</code>)\n\n該用戶剛在此群組被設為管理員，疑似意圖阻止機器人將其移出。{ban_note}\n請依<a href=\"{TERMS_URL}#project-ban\">使用規範第 7 條</a>處理：可考慮對該群組使用 /leave 終止服務，並視情節對操作者使用 /pb。",
+        "<b>⚠ 項目層級封禁（PB）規避嘗試（已封禁）</b>\n<b>對象</b>: {} (<code>{target_id}</code>)\n<b>原始 PB 案例</b>: <code>{}</code>\n<b>群組</b>: <code>{}</code>\n<b>操作者</b>: {} (<code>{}</code>)\n\n該用戶剛在此群組被設為管理員，疑似意圖阻止機器人將其移出，但封禁已成功執行，威脅已排除。視情節可依<a href=\"{TERMS_URL}#project-ban\">使用規範第 7 條</a>對操作者使用 /pb。",
         mention_link(target_id, &short_user(target)),
         case.id,
         chat_id.0,
@@ -7249,9 +7303,14 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             // If issued via reply in a live group, ban them there right away -
             // check_project_ban_and_act/process_new_group_member already
             // handle every other group reactively (next join/message), so
-            // there's no reason to make this one wait for that too.
-            if message.chat.is_group() || message.chat.is_supergroup() {
-                let _ = bot.ban_chat_member(message.chat.id, UserId(target_id as u64)).await;
+            // there's no reason to make this one wait for that too. Routed
+            // through the same escalation helper as every other PB
+            // enforcement site: if the target is already an admin here and
+            // can't actually be banned, this group gets auto-terminated on
+            // the spot rather than silently staying unenforced.
+            if (message.chat.is_group() || message.chat.is_supergroup())
+                && enforce_project_ban_or_terminate_group(&bot, &runtime, message.chat.id, target_id, &case_id).await
+            {
                 let _ = runtime.record_network_ban_target(&case_id, message.chat.id.0).await;
             }
 
@@ -7272,14 +7331,19 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             )
             .await;
 
-            bot.send_message(
-                message.chat.id,
-                format!(
-                    "已對 <code>{target_id}</code> 執行項目層級封禁（PB，見<a href=\"{TERMS_URL}#project-ban\">使用規範第 7 條</a>）。此封禁對所有群組強制生效：無法被本群 /unban 或 /white 解除，全域白名單申請也會被拒絕，任何嘗試都會通知維護組。解除請由維護組使用 <code>/unban {target_id}</code>。"
-                ),
-            )
-            .parse_mode(ParseMode::Html)
-            .await?;
+            // Best-effort, not `?`-propagated: if the target was already an
+            // admin in this very chat, the block above may have just
+            // terminated and left it, in which case this send is expected
+            // to fail - that's not a real error worth surfacing.
+            let _ = bot
+                .send_message(
+                    message.chat.id,
+                    format!(
+                        "已對 <code>{target_id}</code> 執行項目層級封禁（PB，見<a href=\"{TERMS_URL}#project-ban\">使用規範第 7 條</a>）。此封禁對所有群組強制生效：無法被本群 /unban 或 /white 解除，全域白名單申請也會被拒絕，任何嘗試都會通知維護組。若對象在某群組具有管理員身分導致無法封禁，該群組會被自動終止服務。解除請由維護組使用 <code>/unban {target_id}</code>。"
+                    ),
+                )
+                .parse_mode(ParseMode::Html)
+                .await;
         }
         ModerationCommand::Warn(reason_arg) => {
             // Reply targets the message's author, reason is the whole arg
@@ -10013,6 +10077,18 @@ mod tests {
         let free = classify_termination_reason("大量濫用檢舉指令");
         assert_eq!(free.anchor, None);
         assert_eq!(free.label, "大量濫用檢舉指令");
+    }
+
+    // terminate_group_for_project_ban_evasion hand-builds a TerminationReason
+    // rather than going through classify_termination_reason - this pins down
+    // that its anchor/label actually render a working #project-ban link, the
+    // same way every /leave-driven reason is verified above.
+    #[test]
+    fn project_ban_evasion_reason_links_to_terms() {
+        let reason = TerminationReason { label: "項目層級封禁遭規避（對象具管理員身分，機器人無法封禁）".to_string(), anchor: Some("project-ban") };
+        let text = service_termination_text(&reason);
+        assert!(text.contains(&format!("href=\"{TERMS_URL}#project-ban\"")), "must link straight to the Project Ban section");
+        assert!(text.contains("項目層級封禁遭規避"));
     }
 
     // The invite prompt and the terms link both build a URL button, which
