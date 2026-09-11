@@ -371,7 +371,11 @@ struct GroupModuleSettings {
     guest_ban: bool,
     // Attachment-policy modules (see migrate_v11_to_v12). Each bans on the
     // message carrying a particular kind of attachment, independent of any
-    // text it has. All opt-in.
+    // text it has. NoVoice/NoExec are opinionated per-group choices and stay
+    // opt-in; NoContact defaults on (see migrate_v16_to_v17) - a shared
+    // contact card is almost never legitimate group chatter and blocking it
+    // is baseline hygiene, the same rationale flood_control/guest_ban
+    // already have, not something a group needs to specifically opt into.
     no_contact: bool,
     no_voice: bool,
     no_exec: bool,
@@ -389,7 +393,7 @@ impl Default for GroupModuleSettings {
             cmd_clean: false,
             pol: false,
             guest_ban: true,
-            no_contact: false,
+            no_contact: true,
             no_voice: false,
             no_exec: false,
         }
@@ -674,6 +678,9 @@ impl Runtime {
         }
         if user_version < 16 {
             Self::migrate_v15_to_v16(conn)?;
+        }
+        if user_version < 17 {
+            Self::migrate_v16_to_v17(conn)?;
         }
         Ok(())
     }
@@ -1067,6 +1074,27 @@ impl Runtime {
             [],
         )?;
         tx.execute("PRAGMA user_version = 16", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Flips NoContact from opt-in to default-on (see `GroupModuleSettings`'
+    /// own doc comment on the field). SQLite has no `ALTER COLUMN ... SET
+    /// DEFAULT`, so the column's original `DEFAULT 0` (from
+    /// `migrate_v11_to_v12`) stays baked into the schema forever - this
+    /// one-time `UPDATE` backfills every group that already has a row here,
+    /// and `get_group_modules`/`set_group_module`'s `INSERT OR IGNORE`
+    /// statements were changed alongside this migration to explicitly write
+    /// `no_contact = 1` so a brand-new chat's first-ever row also comes in
+    /// enabled rather than falling through to the stale column default.
+    /// Unconditional, not conditioned on "never touched" vs "explicitly
+    /// turned off" - the column can't tell those apart, and NoContact is
+    /// narrow enough (blocking shared contact cards) that resetting every
+    /// group to the new default is the correct one-time call here.
+    fn migrate_v16_to_v17(conn: &mut Connection) -> Result<()> {
+        let tx = conn.transaction()?;
+        tx.execute("UPDATE group_module_settings SET no_contact = 1", [])?;
+        tx.execute("PRAGMA user_version = 17", [])?;
         tx.commit()?;
         Ok(())
     }
@@ -2442,7 +2470,7 @@ impl Runtime {
         let settings = self
             .with_conn(move |conn| {
                 conn.execute(
-                    "INSERT OR IGNORE INTO group_module_settings (chat_id) VALUES (?1)",
+                    "INSERT OR IGNORE INTO group_module_settings (chat_id, no_contact) VALUES (?1, 1)",
                     params![chat_id],
                 )?;
                 // no_long_name column intentionally not selected: the module
@@ -2478,7 +2506,7 @@ impl Runtime {
         let module = module.to_string();
         self.with_conn(move |conn| {
             conn.execute(
-                "INSERT OR IGNORE INTO group_module_settings (chat_id) VALUES (?1)",
+                "INSERT OR IGNORE INTO group_module_settings (chat_id, no_contact) VALUES (?1, 1)",
                 params![chat_id],
             )?;
             match module.as_str() {
@@ -2560,7 +2588,7 @@ impl Runtime {
     async fn set_group_threshold(&self, chat_id: i64, value: Option<f64>) -> Result<()> {
         self.with_conn(move |conn| {
             conn.execute(
-                "INSERT OR IGNORE INTO group_module_settings (chat_id) VALUES (?1)",
+                "INSERT OR IGNORE INTO group_module_settings (chat_id, no_contact) VALUES (?1, 1)",
                 params![chat_id],
             )?;
             conn.execute(
@@ -3851,16 +3879,16 @@ fn help_text() -> String {
         "<b>預設開啟</b>\n",
         "· Flood 洗版偵測\n",
         "· GuestBan 訪客機器人廣告\n",
+        "· NoContact 禁止分享聯絡人\n",
         "<b>需自行開啟</b>\n",
         "· NoHalal 清真內容檢查\n",
         "· NoSM 自動刪除服務訊息\n",
         "· Captcha 入群驗證\n",
         "· Netban 訂閱專案黑名單\n",
         "· CmdClean 指令濫用防護\n",
-        "· NoContact 禁止分享聯絡人\n",
         "· NoVoice 禁止語音訊息\n",
         "· NoExec 禁止可執行檔\n",
-        "\n基礎防護（Flood、GuestBan）不會被 <code>/module all off</code> 關閉。\n",
+        "\n基礎防護（Flood、GuestBan、NoContact）不會被 <code>/module all off</code> 關閉。\n",
         "\n<b>━━ 被封禁後 ━━</b>\n",
         "用 <code>/id</code> 取得 User ID，到 @SpamProtectionLogging 搜尋，或向 @SEELE_01_BOT 申訴。\n",
         "\n交流群 @SpamProtectionChat\n",
@@ -4051,7 +4079,7 @@ const PUBLIC_MODULES: &[(&str, &str, bool)] = &[
     ("netban", "Netban", false),
     ("cmdclean", "CmdClean", false),
     ("guestban", "GuestBan", true),
-    ("nocontact", "NoContact", false),
+    ("nocontact", "NoContact", true),
     ("novoice", "NoVoice", false),
     ("noexec", "NoExec", false),
 ];
@@ -10222,9 +10250,12 @@ mod tests {
         let text = r#"{"message_id":5,"date":1,"chat":{"id":-100,"type":"supergroup","title":"g"},"from":{"id":5,"is_bot":false,"first_name":"a"},"text":"hello"}"#;
         let m = |j: &str| serde_json::from_str::<Message>(j).unwrap();
 
+        // NoContact defaults on (baseline hygiene, like Flood/GuestBan);
+        // NoVoice/NoExec stay opt-in.
         let off = GroupModuleSettings::default();
-        for j in [contact, voice, exe, pdf, text] {
-            assert_eq!(attachment_violation(&m(j), &off), None, "modules default off - nothing should trip");
+        assert_eq!(attachment_violation(&m(contact), &off), Some("CONTACT"), "NoContact defaults on");
+        for j in [voice, exe, pdf, text] {
+            assert_eq!(attachment_violation(&m(j), &off), None, "NoVoice/NoExec default off, and ordinary content never trips either");
         }
 
         let all_on = GroupModuleSettings { no_contact: true, no_voice: true, no_exec: true, ..Default::default() };
@@ -11342,6 +11373,69 @@ mod tests {
         assert!(!runtime.get_group_modules(100).await.unwrap().guest_ban);
         runtime.set_group_module(100, "guestban", true).await.unwrap();
         assert!(runtime.get_group_modules(100).await.unwrap().guest_ban);
+    }
+
+    // NoContact defaults on for a brand-new chat (see migrate_v16_to_v17 and
+    // the explicit no_contact=1 in every INSERT OR IGNORE that creates a
+    // group_module_settings row), and still round-trips like any other flag.
+    #[tokio::test]
+    async fn no_contact_module_flag_defaults_on_and_toggles() {
+        let runtime = test_runtime().await;
+        assert!(runtime.get_group_modules(100).await.unwrap().no_contact);
+        runtime.set_group_module(100, "nocontact", false).await.unwrap();
+        assert!(!runtime.get_group_modules(100).await.unwrap().no_contact);
+        runtime.set_group_module(100, "nocontact", true).await.unwrap();
+        assert!(runtime.get_group_modules(100).await.unwrap().no_contact);
+    }
+
+    // migrate_v16_to_v17 backfills every *existing* group's row too, not
+    // just new ones. Seeds a v1-shaped DB (same minimal shape as
+    // migration_clamps_outlier_and_drops_dead_table above - the full chain
+    // from v1 through v17 is self-healing regardless of starting shape,
+    // adding no_contact itself via migrate_v11_to_v12's add_column_if_missing
+    // partway through) with one pre-existing group, then loads a real
+    // Runtime against it and confirms that group comes out with NoContact
+    // on rather than stuck at the old pre-migration default.
+    #[tokio::test]
+    async fn migrate_v16_to_v17_backfills_existing_groups_to_no_contact_on() {
+        let dir = std::env::temp_dir().join(format!("spb_test_{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let db_path = dir.join("bot.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE token_counts (token TEXT NOT NULL, label TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY (token, label));
+                CREATE TABLE word_frequencies (word TEXT PRIMARY KEY, spam_count INTEGER NOT NULL DEFAULT 0, ham_count INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE group_module_settings (chat_id INTEGER PRIMARY KEY, no_long_name INTEGER NOT NULL DEFAULT 0, no_halal INTEGER NOT NULL DEFAULT 0, no_service_messages INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE model_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO group_module_settings (chat_id) VALUES (100);
+                PRAGMA user_version = 1;
+                "#,
+            )
+            .unwrap();
+        }
+
+        let config = Config {
+            bot_token: "test".to_string(),
+            log_channel_id: -1,
+            report_channel_id: -1,
+            test_group_id: None,
+            data_dir: dir.clone(),
+            sqlite_path: db_path.clone(),
+            spam_threshold: 0.85,
+            owner_id: None,
+            hostctl_secret: None,
+            hostctl_cmd: "/hostctl".to_string(),
+        };
+        let runtime = Runtime::load(config).await.unwrap();
+
+        let value: i64 = runtime
+            .with_conn(|conn| Ok(conn.query_row("SELECT no_contact FROM group_module_settings WHERE chat_id = 100", [], |r| r.get(0))?))
+            .await
+            .unwrap();
+        assert_eq!(value, 1, "a group that predates NoContact's default flip must be backfilled to on, not left at 0");
     }
 
     // PUBLIC_MODULES drives both the status listing and `/module all`, so
