@@ -3851,6 +3851,8 @@ fn help_text() -> String {
         "\n<b>━━ 所有人 ━━</b>\n",
         "<code>/spam</code> 回覆可疑訊息提交舉報\n",
         "<code>/case &lt;ID&gt;</code> 查詢封禁記錄\n",
+        "<code>/whois &lt;user_id&gt;</code> 查詢某人的完整紀錄\n",
+        "· 身分、封禁次數、跨群組黑名單等\n",
         "<code>/id</code> 取得自己的 User ID\n",
         "· 舉報累計 3 次被拒將暫停使用\n",
         "\n<b>━━ 群組管理員 ━━</b>\n",
@@ -3947,10 +3949,7 @@ fn help_op_text(section: &str) -> String {
         "user" | "access" | "權限" => concat!(
             "<b>━━ 用戶與權限 ━━</b>\n",
             "\n<b>查詢與解除</b>\n",
-            "<code>/whois &lt;user_id&gt;</code> 完整紀錄\n",
-            "· 身分、歷史封禁次數\n",
-            "· 目前所有生效中的封禁\n",
-            "· 跨群組黑名單、舉報被拒次數\n",
+            "· /whois 現在所有人都能用，見 /help\n",
             "<code>/unban</code> 維護組完整版\n",
             "· 回覆／user_id／case_id 皆可\n",
             "· 一併移除誤訓練樣本並重建模型\n",
@@ -6842,7 +6841,6 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             }
         }
         ModerationCommand::Whois(target) => {
-            require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用 /whois。");
             let target_id = target
                 .trim()
                 .parse::<i64>()
