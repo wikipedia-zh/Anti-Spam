@@ -4792,14 +4792,18 @@ fn parse_leave_args(args: &str) -> (Option<i64>, String) {
 /// Public Terms of Use. Hosted on the tool's own Toolforge domain rather
 /// than the source repository or GitHub Pages: users being told the rules
 /// have no reason to be handed the source tree, and this is the
-/// authoritative wording. The old GitHub Pages URL now just redirects here
-/// (see `docs/index.md`) so existing links elsewhere keep working.
-const TERMS_URL: &str = "https://wikipedia-zh-antispam.toolforge.org/terms/";
+/// authoritative wording. Points at the Traditional Chinese edition of the
+/// full branded site (bare `/terms/` is the English edition; this bot's own
+/// text is entirely Traditional Chinese, so its own links should land
+/// readers on the matching language rather than switching on them). The old
+/// GitHub Pages URL still redirects to the site (see `docs/index.md`) so
+/// links from before this migration keep working.
+const TERMS_URL: &str = "https://wikipedia-zh-antispam.toolforge.org/zh-hant/terms/";
 
 /// Command/module reference and FAQ, published alongside the terms on the
-/// same Toolforge domain as `TERMS_URL`, so this is one page users being
-/// pointed at the terms should also be able to reach.
-const GUIDE_URL: &str = "https://wikipedia-zh-antispam.toolforge.org/guide/";
+/// same site as `TERMS_URL` - see that constant's doc comment for why this
+/// points at the zh-hant edition specifically.
+const GUIDE_URL: &str = "https://wikipedia-zh-antispam.toolforge.org/zh-hant/guide/";
 
 /// Terms-of-Use button plus a second row linking the user guide - shown
 /// wherever a group first encounters the bot or asks for help, so the guide
@@ -7649,7 +7653,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 .send_message(
                     message.chat.id,
                     format!(
-                        "維護組上手文件密碼：<code>{secret}</code>\nhttps://wikipedia-zh-antispam.toolforge.org/\n\n此密碼由所有維護組共用；需要更換請用 <code>/maintainerdoc new</code>（會讓舊密碼立即失效）。"
+                        "維護組上手文件密碼：<code>{secret}</code>\nhttps://wikipedia-zh-antispam.toolforge.org/maintainers/\n\n此密碼由所有維護組共用；需要更換請用 <code>/maintainerdoc new</code>（會讓舊密碼立即失效）。"
                     ),
                 )
                 .parse_mode(ParseMode::Html)
