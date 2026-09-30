@@ -2950,8 +2950,8 @@ impl Runtime {
     }
 
     /// Reviewer-role checks. Read straight from SQLite rather than cached
-    /// like the denial lists: these are only consulted when someone presses
-    /// a button in the report channel, not on every message, so there's no
+    /// like the denial lists: these are only consulted for review actions
+    /// (report-channel buttons and `/sb -f`), not on every message, so there's no
     /// hot path to protect and no cache to keep in sync.
     async fn is_reviewer(&self, user_id: i64) -> bool {
         self.with_conn(move |conn| {
@@ -2960,6 +2960,10 @@ impl Runtime {
         })
         .await
         .unwrap_or(false)
+    }
+
+    async fn can_review(&self, user_id: i64) -> bool {
+        self.is_maintainer(user_id).await || self.is_reviewer(user_id).await
     }
 
     async fn set_reviewer(&self, user_id: i64, enabled: bool, added_by: Option<i64>) -> Result<()> {
@@ -3443,6 +3447,21 @@ enum ModerationCommand {
     Unknown,
 }
 
+/// Only an exact flag token enables direct approval; strip it before
+/// resolving a bare user ID, regardless of which order they were supplied.
+fn spam_ban_args(arg: &str) -> (bool, String) {
+    let mut force = false;
+    let target = arg.split_whitespace().filter(|part| {
+        if *part == "-f" {
+            force = true;
+            false
+        } else {
+            true
+        }
+    }).collect::<Vec<_>>().join(" ");
+    (force, target)
+}
+
 fn parse_command(text: &str) -> ModerationCommand {
     let head = text.split_whitespace().next().unwrap_or("");
     let base = head.split('@').next().unwrap_or(head).to_lowercase();
@@ -3855,6 +3874,10 @@ fn help_text() -> String {
         "· 身分、封禁次數、跨群組黑名單等\n",
         "<code>/id</code> 取得自己的 User ID\n",
         "· 舉報累計 3 次被拒將暫停使用\n",
+        "\n<b>━━ 審核員及以上 ━━</b>\n",
+        "<code>/sb -f</code> 直接訓練並加入 netban\n",
+        "· 回覆訊息；僅提供 user_id 則不訓練\n",
+        "· 無需本群管理員權限，略過審核佇列\n",
         "\n<b>━━ 群組管理員 ━━</b>\n",
         "· 以下指令皆可用 user_id 代替回覆\n",
         "<code>/sb</code> 刪除訊息並封禁\n",
@@ -5330,9 +5353,8 @@ async fn broadcast_unban_if_fully_clear(bot: &Bot, runtime: &Runtime, user_id: i
 ///   *policy* opt-ins rather than spam determinations - a group choosing to
 ///   ban Arabic script or long names is making a house rule, not finding
 ///   something everyone else should ban too.
-/// - `SpamBan` (`/sb`) - excluded. It's one group admin's judgment about
-///   their own room; there's no project review behind it, so it must not
-///   become a project-wide ban. Send it through `/spam` if it deserves one.
+/// - `SpamBan` (`/sb`) - excluded here. Reviewer approval (including
+///   `/sb -f`) promotes it explicitly through `commit_network_ban`.
 ///
 /// Note the origin group's netban setting plays no part: it governs what a
 /// group *receives*, never what it can impose on everyone else.
@@ -6338,6 +6360,168 @@ async fn check_guest_bot_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Me
     true
 }
 
+/// Shared moderation handler, kept separate so permission and training paths
+/// can be exercised against a local Telegram stub without the full dispatcher.
+async fn handle_ban_mute_kick(bot: Bot, runtime: Arc<Runtime>, message: Message, cmd: ModerationCommand) -> ResponseResult<()> {
+    let Some(from) = message.from.as_ref() else { return Ok(()); };
+    let from_id = from.id.0 as i64;
+    match cmd {
+        ModerationCommand::SpamBan(ref arg) | ModerationCommand::Mute(ref arg) | ModerationCommand::Kick(ref arg) => {
+            let (force, arg) = if matches!(cmd, ModerationCommand::SpamBan(_)) {
+                spam_ban_args(arg)
+            } else {
+                (false, arg.clone())
+            };
+            let action = match &cmd {
+                ModerationCommand::SpamBan(_) => ActionKind::SpamBan,
+                ModerationCommand::Mute(_) => ActionKind::Mute,
+                ModerationCommand::Kick(_) => ActionKind::Kick,
+                _ => unreachable!(),
+            };
+
+            // Direct approval has the same project-level authority as the
+            // review buttons, including for reviewers who aren't local admins.
+            // Check before any deletion, ban, training, or blacklist write.
+            if force {
+                if !runtime.can_review(from_id).await {
+                    handle_permission_denied(&bot, &runtime, &message, from, "只有審核員或維護組可以使用 /sb -f。").await?;
+                    return Ok(());
+                }
+            } else if !is_group_admin(&bot, message.chat.id, from_id).await {
+                handle_permission_denied(&bot, &runtime, &message, from, "只有群組管理員可以執行此指令。").await?;
+                return Ok(());
+            }
+
+            // A reply works as before (and is still how the message itself
+            // gets deleted/trained on); a bare user_id also works when
+            // there's nothing to reply to - e.g. banning someone who already
+            // left, or acting pre-emptively. In that case there's simply no
+            // message to delete and no evidence to queue for training.
+            let resolved = match extract_reply_context(&message).await {
+                Some((target_id, target_name, source_id, evidence_text)) => Some((target_id, target_name, Some(source_id), evidence_text)),
+                None => arg.trim().parse::<i64>().ok().map(|target_id| (target_id, format!("User{target_id}"), None, String::new())),
+            };
+            let Some((target_id, target_name, source_id, evidence_text)) = resolved else {
+                reply_ephemeral(&bot, &message, "請回覆一條訊息，或提供 user_id，再使用此指令。").await?;
+                return Ok(());
+            };
+
+            if is_group_admin(&bot, message.chat.id, target_id).await || runtime.is_maintainer(target_id).await || is_platform_pseudo_user(target_id) {
+                reply_ephemeral(&bot, &message, "不能對群組管理員或項目維護人員執行此指令。").await?;
+                return Ok(());
+            }
+
+            // A /sb on a message that is nothing but bot @-mentions is
+            // guest-mode summon spam. Storing that as an ML sample would just
+            // teach the model a username token; a regex rule catches the bot
+            // handle deterministically instead. Detected here so the case
+            // reason reflects it.
+            let bot_spam = if matches!(action, ActionKind::SpamBan) {
+                bot_mentions_only(&evidence_text)
+            } else {
+                None
+            };
+
+            let case_id = Uuid::new_v4().to_string();
+            let mut case = CaseRecord {
+                id: case_id.clone(),
+                action: action.clone(),
+                chat_id: message.chat.id.0,
+                target_user_id: target_id,
+                target_name: target_name.clone(),
+                actor_user_id: Some(from_id),
+                actor_name: Some(short_user(from)),
+                source_message_id: source_id,
+                evidence_text: evidence_text.clone(),
+                model_score: None,
+                matched_rule_id: None,
+                matched_rule_pattern: bot_spam.as_ref().map(|_| "BOTSPAM".to_string()),
+                status: if force { "force_approved" } else { "done" }.to_string(),
+                log_message_id: None,
+                created_at: Utc::now(),
+            };
+
+            match action {
+                ActionKind::SpamBan => {
+                    if force {
+                        if let Err(err) = ban_user(&bot, message.chat.id, target_id).await {
+                            reply_ephemeral(&bot, &message, format!("封禁失敗，未執行訓練或 netban 同步：{err}")).await?;
+                            return Ok(());
+                        }
+                    }
+                    if let Some(sid) = source_id {
+                        let _ = bot.delete_message(message.chat.id, MessageId(sid)).await;
+                    }
+                    if !force {
+                        ban_user(&bot, message.chat.id, target_id).await.ok();
+                    }
+                    // Training happens after the case is saved, so the
+                    // sample is linked to the case for appeals and /revert.
+                }
+                ActionKind::Mute => {
+                    mute_user(&bot, message.chat.id, target_id).await.ok();
+                }
+                ActionKind::Kick => {
+                    kick_user(&bot, message.chat.id, target_id).await.ok();
+                }
+                _ => {}
+            }
+
+            let log_message_id = log_action(&bot, &runtime, &case).await.unwrap_or_default();
+            case.log_message_id = Some(log_message_id);
+            if let Err(err) = store_case(&runtime, &case).await {
+                log::error!("Failed to save moderation case {}: {err}", case.id);
+                reply_ephemeral(&bot, &message, "案例儲存失敗，未執行訓練或 netban 同步。").await?;
+                return Ok(());
+            }
+            notify_group(&bot, &runtime, &case, log_message_id, "<b>已執行管理操作</b>").await.ok();
+            if action == ActionKind::SpamBan {
+                if force {
+                    // Empty/media-only evidence and bare bot handles keep
+                    // their existing treatment: no empty/username ML samples.
+                    if bot_spam.is_none() && !is_empty_ml_text(&evidence_text) {
+                        if let Err(err) = train_spam(&runtime, &evidence_text, Some(&case.id)).await {
+                            log_callback_error(&bot, &runtime, &case, "train_spam", &err.to_string()).await;
+                            reply_ephemeral(&bot, &message, "直接訓練失敗；本群封禁已執行，尚未加入 netban。").await?;
+                            return Ok(());
+                        }
+                    }
+                    commit_network_ban(&bot, &runtime, &case).await;
+                } else {
+                    propagate_network_ban(&bot, &runtime, &case).await;
+                }
+                broadcast_ban_status(&bot, &runtime, case.target_user_id, true).await;
+                if bot_spam.is_some() {
+                    // A bare username is not useful ML signal; the rule does
+                    // the work, so skip the training-review queue.
+                    capture_bot_spam_rules(&bot, &runtime, message.chat.id.0, &evidence_text).await;
+                } else if !force && !evidence_text.trim().is_empty() {
+                    // A /sb by bare user_id (no reply) has no message text at
+                    // all - nothing to queue for training review.
+                    queue_training_review(&bot, &runtime, &case).await;
+                }
+            }
+
+            // Reuses the case's own case_id as the revert handle - no new ID
+            // needed, /revert for a Case just calls the same
+            // reverse_ban_case/reverse_mute_case the case_id form of
+            // /unban and /unmute already use. A kick has nothing persistent
+            // to undo (it's just a ban immediately followed by an unban).
+            let (command_name, undo) = match action {
+                ActionKind::SpamBan => (if force { "/sb -f" } else { "/sb" }, UndoData::Case { case_id: case_id.clone(), kind: CaseKind::Ban }),
+                ActionKind::Mute => ("/mute", UndoData::Case { case_id: case_id.clone(), kind: CaseKind::Mute }),
+                _ => ("/kick", UndoData::NotRevertible),
+            };
+            log_maintainer_action(&bot, &runtime, from_id, &short_user(from), Some(message.chat.id.0), command_name, &format!("{} 對象={target_id}", chinese_case_action(&case)), undo).await;
+
+            // Delete the command message to minimize group disruption
+            let _ = bot.delete_message(message.chat.id, message.id).await;
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
 async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> ResponseResult<()> {
     let Some(text) = message.text() else { return Ok(()); };
     let Some(from) = message.from.as_ref() else { return Ok(()); };
@@ -7068,123 +7252,8 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 }
             }
         }
-        ModerationCommand::SpamBan(ref arg) | ModerationCommand::Mute(ref arg) | ModerationCommand::Kick(ref arg) => {
-            let arg = arg.clone();
-            let action = match &cmd {
-                ModerationCommand::SpamBan(_) => ActionKind::SpamBan,
-                ModerationCommand::Mute(_) => ActionKind::Mute,
-                ModerationCommand::Kick(_) => ActionKind::Kick,
-                _ => unreachable!(),
-            };
-
-            // A reply works as before (and is still how the message itself
-            // gets deleted/trained on); a bare user_id also works when
-            // there's nothing to reply to - e.g. banning someone who already
-            // left, or acting pre-emptively. In that case there's simply no
-            // message to delete and no evidence to queue for training.
-            let resolved = match extract_reply_context(&message).await {
-                Some((target_id, target_name, source_id, evidence_text)) => Some((target_id, target_name, Some(source_id), evidence_text)),
-                None => arg.trim().parse::<i64>().ok().map(|target_id| (target_id, format!("User{target_id}"), None, String::new())),
-            };
-            let Some((target_id, target_name, source_id, evidence_text)) = resolved else {
-                reply_ephemeral(&bot, &message, "請回覆一條訊息，或提供 user_id，再使用此指令。").await?;
-                return Ok(());
-            };
-
-            if !is_group_admin(&bot, message.chat.id, from_id).await {
-                handle_permission_denied(&bot, &runtime, &message, from, "只有群組管理員可以執行此指令。").await?;
-                return Ok(());
-            }
-
-            if is_group_admin(&bot, message.chat.id, target_id).await || runtime.is_maintainer(target_id).await || is_platform_pseudo_user(target_id) {
-                reply_ephemeral(&bot, &message, "不能對群組管理員或項目維護人員執行此指令。").await?;
-                return Ok(());
-            }
-
-            // A /sb on a message that is nothing but bot @-mentions is
-            // guest-mode summon spam. Storing that as an ML sample would just
-            // teach the model a username token; a regex rule catches the bot
-            // handle deterministically instead. Detected here so the case
-            // reason reflects it.
-            let bot_spam = if matches!(action, ActionKind::SpamBan) {
-                bot_mentions_only(&evidence_text)
-            } else {
-                None
-            };
-
-            let case_id = Uuid::new_v4().to_string();
-            let mut case = CaseRecord {
-                id: case_id.clone(),
-                action: action.clone(),
-                chat_id: message.chat.id.0,
-                target_user_id: target_id,
-                target_name: target_name.clone(),
-                actor_user_id: Some(from_id),
-                actor_name: Some(short_user(from)),
-                source_message_id: source_id,
-                evidence_text: evidence_text.clone(),
-                model_score: None,
-                matched_rule_id: None,
-                matched_rule_pattern: bot_spam.as_ref().map(|_| "BOTSPAM".to_string()),
-                status: "done".to_string(),
-                log_message_id: None,
-                created_at: Utc::now(),
-            };
-
-            match action {
-                ActionKind::SpamBan => {
-                    if let Some(sid) = source_id {
-                        let _ = bot.delete_message(message.chat.id, MessageId(sid)).await;
-                    }
-                    ban_user(&bot, message.chat.id, target_id).await.ok();
-                    // Deliberately does NOT train here. A group admin's /sb
-                    // is a decision about their own room, and taking it as
-                    // ground truth let anyone with admin rights anywhere
-                    // write directly into the shared model. The text goes to
-                    // the report channel instead and only trains once a
-                    // maintainer approves it.
-                }
-                ActionKind::Mute => {
-                    mute_user(&bot, message.chat.id, target_id).await.ok();
-                }
-                ActionKind::Kick => {
-                    kick_user(&bot, message.chat.id, target_id).await.ok();
-                }
-                _ => {}
-            }
-
-            let log_message_id = log_action(&bot, &runtime, &case).await.unwrap_or_default();
-            case.log_message_id = Some(log_message_id);
-            store_case(&runtime, &case).await.ok();
-            notify_group(&bot, &runtime, &case, log_message_id, "<b>已執行管理操作</b>").await.ok();
-            if action == ActionKind::SpamBan {
-                propagate_network_ban(&bot, &runtime, &case).await;
-                broadcast_ban_status(&bot, &runtime, case.target_user_id, true).await;
-                if bot_spam.is_some() {
-                    // A bare username is not useful ML signal; the rule does
-                    // the work, so skip the training-review queue.
-                    capture_bot_spam_rules(&bot, &runtime, message.chat.id.0, &evidence_text).await;
-                } else if !evidence_text.trim().is_empty() {
-                    // A /sb by bare user_id (no reply) has no message text at
-                    // all - nothing to queue for training review.
-                    queue_training_review(&bot, &runtime, &case).await;
-                }
-            }
-
-            // Reuses the case's own case_id as the revert handle - no new ID
-            // needed, /revert for a Case just calls the same
-            // reverse_ban_case/reverse_mute_case the case_id form of
-            // /unban and /unmute already use. A kick has nothing persistent
-            // to undo (it's just a ban immediately followed by an unban).
-            let (command_name, undo) = match action {
-                ActionKind::SpamBan => ("/sb", UndoData::Case { case_id: case_id.clone(), kind: CaseKind::Ban }),
-                ActionKind::Mute => ("/mute", UndoData::Case { case_id: case_id.clone(), kind: CaseKind::Mute }),
-                _ => ("/kick", UndoData::NotRevertible),
-            };
-            log_maintainer_action(&bot, &runtime, from_id, &short_user(from), Some(message.chat.id.0), command_name, &format!("{} 對象={target_id}", chinese_case_action(&case)), undo).await;
-
-            // Delete the command message to minimize group disruption
-            let _ = bot.delete_message(message.chat.id, message.id).await;
+        ModerationCommand::SpamBan(_) | ModerationCommand::Mute(_) | ModerationCommand::Kick(_) => {
+            return handle_ban_mute_kick(bot, runtime, message, cmd).await;
         }
         ModerationCommand::Pol(sub) => {
             if !message.chat.is_group() && !message.chat.is_supergroup() {
@@ -8886,7 +8955,7 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
     // into the shared model, so it takes an explicit reviewer grant (or
     // maintainer). Checked once, before any decision branch, so no button
     // added later can miss it.
-    if !runtime.is_maintainer(from_id).await && !runtime.is_reviewer(from_id).await {
+    if !runtime.can_review(from_id).await {
         bot.answer_callback_query(q.id).text("只有審核員或維護組可以處理此項目").await?;
         return Ok(());
     }
@@ -9653,6 +9722,177 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exercise the real command handler without contacting Telegram.
+    struct TelegramStub {
+        bot: Bot,
+        requests: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+        address: std::net::SocketAddr,
+    }
+
+    impl TelegramStub {
+        fn new(admin_ids: Vec<i64>) -> Self {
+            use std::io::{BufRead, Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = requests.clone();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stopped = stop.clone();
+            let thread = std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if stopped.load(std::sync::atomic::Ordering::Relaxed) { break; }
+                    let mut stream = stream.unwrap();
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let mut reader = std::io::BufReader::new(&mut stream);
+                    let mut first = String::new();
+                    reader.read_line(&mut first).unwrap();
+                    let method = first.split_whitespace().nth(1).unwrap().rsplit('/').next().unwrap().to_ascii_lowercase();
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        if line == "\r\n" { break; }
+                        if let Some((key, value)) = line.split_once(':') {
+                            if key.eq_ignore_ascii_case("content-length") {
+                                length = value.trim().parse::<usize>().unwrap();
+                            }
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body).unwrap();
+                    let args: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    captured.lock().unwrap().push((method.clone(), args.clone()));
+                    let result = match method.as_str() {
+                        "getchatmember" => serde_json::json!({
+                            "status": if admin_ids.contains(&args["user_id"].as_i64().unwrap()) { "creator" } else { "member" },
+                            "is_anonymous": false,
+                            "user": {"id": args["user_id"], "is_bot": false, "first_name": "Test"}
+                        }),
+                        "sendmessage" => serde_json::json!({
+                            "message_id": 100, "date": 0,
+                            "chat": {"id": args["chat_id"], "type": "supergroup", "title": "Test"},
+                            "text": args["text"]
+                        }),
+                        _ => serde_json::json!(true),
+                    };
+                    let response = serde_json::json!({"ok": true, "result": result}).to_string();
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+                }
+            });
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let bot = Bot::with_client("test", client).set_api_url(format!("http://{address}").parse().unwrap());
+            Self { bot, requests, stop, thread: Some(thread), address }
+        }
+    }
+
+    impl Drop for TelegramStub {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = std::net::TcpStream::connect(self.address);
+            self.thread.take().unwrap().join().unwrap();
+        }
+    }
+
+    fn spam_ban_message(actor: i64, command: &str, evidence: Option<&str>) -> Message {
+        let mut message = serde_json::json!({
+            "message_id": 2, "date": 0, "text": command,
+            "chat": {"id": -100, "type": "supergroup", "title": "Test"},
+            "from": {"id": actor, "is_bot": false, "first_name": "Operator"}
+        });
+        if let Some(text) = evidence {
+            message["reply_to_message"] = serde_json::json!({
+                "message_id": 1, "date": 0, "text": text,
+                "chat": {"id": -100, "type": "supergroup", "title": "Test"},
+                "from": {"id": 200, "is_bot": false, "first_name": "Spammer"}
+            });
+        }
+        serde_json::from_value(message).unwrap()
+    }
+
+    #[test]
+    fn spam_ban_force_flag_supports_aliases_mentions_and_target_order() {
+        for command in ["/sb -f", "/spamban -f", "/sb@OurBot -f", "/SB -f"] {
+            let ModerationCommand::SpamBan(arg) = parse_command(command) else { panic!("not /sb"); };
+            assert_eq!(spam_ban_args(&arg), (true, String::new()));
+        }
+        for arg in ["-f 200", "200 -f", "  -f\t200\n"] {
+            assert_eq!(spam_ban_args(arg), (true, "200".to_string()));
+        }
+        assert_eq!(spam_ban_args("200"), (false, "200".to_string()));
+        assert!(!spam_ban_args("-force").0);
+    }
+
+    #[tokio::test]
+    async fn force_spam_ban_trains_and_netbans_without_review_and_can_be_reversed() {
+        // Neither reviewer nor maintainer needs to be a local group admin.
+        for actor in [555, 666, HOST_ID] {
+            let runtime = Arc::new(test_runtime().await);
+            runtime.set_reviewer(555, true, Some(HOST_ID)).await.unwrap();
+            runtime.set_maintainer(666, true, Some(HOST_ID)).await.unwrap();
+            runtime.set_group_module(-300, "netban", true).await.unwrap();
+            runtime.set_group_module(-400, "netban", false).await.unwrap();
+            let telegram = TelegramStub::new(vec![]);
+            handle_ban_mute_kick(telegram.bot.clone(), runtime.clone(), spam_ban_message(actor, "/sb -f", Some("Buy cheap crypto spam now")), parse_command("/sb -f")).await.unwrap();
+
+            let case = runtime.find_active_network_ban(200).await.unwrap().expect("forced ban must enter netban");
+            assert_eq!(case.actor_user_id, Some(actor));
+            assert_eq!(case.status, "force_approved");
+            assert_eq!(runtime.rebuild_model().await.unwrap().spam_docs, 1);
+            assert!(runtime.export_training_data().await.unwrap().contains(&case.id));
+            assert_eq!(runtime.list_network_ban_targets(&case.id).await.unwrap(), vec![-300]);
+            {
+                let requests = telegram.requests.lock().unwrap();
+                assert!(requests.iter().any(|(method, args)| method == "deletemessage" && args["message_id"] == 1));
+                assert!(!requests.iter().any(|(_, args)| args.to_string().contains("train:approve:")), "force must bypass the review queue");
+                assert!(!requests.iter().any(|(method, args)| method == "banchatmember" && args["chat_id"] == -400));
+            }
+            reverse_ban_case(&telegram.bot, &runtime, case, HOST_ID, "Host").await.unwrap();
+            assert!(runtime.find_active_network_ban(200).await.unwrap().is_none());
+            assert_eq!(runtime.rebuild_model().await.unwrap().spam_docs, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn force_spam_ban_rejects_members_admins_and_revoked_reviewers() {
+        for is_admin in [false, true] {
+            let runtime = Arc::new(test_runtime().await);
+            runtime.set_group_module(-100, "cmd_clean", false).await.unwrap();
+            runtime.set_reviewer(555, true, Some(HOST_ID)).await.unwrap();
+            runtime.set_reviewer(555, false, Some(HOST_ID)).await.unwrap();
+            let telegram = TelegramStub::new(if is_admin { vec![555] } else { vec![] });
+            handle_ban_mute_kick(telegram.bot.clone(), runtime.clone(), spam_ban_message(555, "/sb -f", Some("Buy cheap crypto spam now")), parse_command("/sb -f")).await.unwrap();
+            assert!(runtime.find_active_bans_for_user(200).await.unwrap().is_empty());
+            assert_eq!(runtime.rebuild_model().await.unwrap().spam_docs, 0);
+            assert!(telegram.requests.lock().unwrap().iter().all(|(method, _)| method == "sendmessage"));
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_spam_ban_still_queues_even_for_a_reviewer() {
+        let runtime = Arc::new(test_runtime().await);
+        runtime.set_reviewer(555, true, Some(HOST_ID)).await.unwrap();
+        let telegram = TelegramStub::new(vec![555]);
+        handle_ban_mute_kick(telegram.bot.clone(), runtime.clone(), spam_ban_message(555, "/sb", Some("Buy cheap crypto spam now")), parse_command("/sb")).await.unwrap();
+        assert!(runtime.find_active_ban_in_chat(-100, 200).await.unwrap().is_some());
+        assert!(runtime.find_active_network_ban(200).await.unwrap().is_none());
+        assert_eq!(runtime.rebuild_model().await.unwrap().spam_docs, 0);
+        assert!(telegram.requests.lock().unwrap().iter().any(|(_, args)| args.to_string().contains("train:approve:")));
+    }
+
+    #[tokio::test]
+    async fn force_spam_ban_without_trainable_text_does_not_create_empty_samples() {
+        for (command, evidence) in [("/sb -f 200", None), ("/sb -f", Some("🎉🎉")), ("/sb -f", Some("@SpamBot"))] {
+            let runtime = Arc::new(test_runtime().await);
+            let telegram = TelegramStub::new(vec![]);
+            handle_ban_mute_kick(telegram.bot.clone(), runtime.clone(), spam_ban_message(HOST_ID, command, evidence), parse_command(command)).await.unwrap();
+            assert!(runtime.find_active_network_ban(200).await.unwrap().is_some());
+            assert_eq!(runtime.rebuild_model().await.unwrap().spam_docs, 0);
+            assert!(!telegram.requests.lock().unwrap().iter().any(|(_, args)| args.to_string().contains("train:approve:")));
+        }
+    }
 
     async fn test_runtime() -> Runtime {
         let dir = std::env::temp_dir().join(format!("spb_test_{}", Uuid::new_v4()));
@@ -11551,8 +11791,5 @@ mod tests {
         assert_eq!(reply.from.as_ref().unwrap().id.0, 999);
     }
 }
-
-
-
 
 
