@@ -34,6 +34,11 @@
     statusKey = key; statusError = error;
     $('status').textContent = t(key); $('status').classList.toggle('error', error);
   }
+  function thresholdText(value) {
+    if (!Number.isFinite(value)) return '—';
+    const text = String(value);
+    return (text.split('.')[1]?.length ?? 0) < 2 ? value.toFixed(2) : text;
+  }
   function theme() {
     const dark = app?.initData ? app.colorScheme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
     document.documentElement.dataset.theme = dark ? 'dark' : 'light';
@@ -64,7 +69,6 @@
       }
     }
     $('threshold-controls').hidden = !canEdit;
-    $('threshold-note').textContent = canEdit ? (draft.threshold_override === null ? t('useGlobal') : t('customThreshold')) : t('readOnly');
     $('use-global').checked = draft.threshold_override === null;
     $('threshold-input').value = draft.threshold_override ?? globalThreshold;
     update();
@@ -75,7 +79,8 @@
     document.querySelectorAll('[data-module]').forEach(el => {
       el.setAttribute('aria-checked',String(draft.modules[el.dataset.module])); el.disabled = busy || blocked;
     });
-    $('threshold-value').textContent = Number(draft.threshold_override ?? globalThreshold).toFixed(2);
+    $('threshold-note').textContent = canEdit ? (draft.threshold_override === null ? t('useGlobal') : t('customThreshold')) : t('readOnly');
+    $('threshold-value').textContent = thresholdText(draft.threshold_override ?? globalThreshold);
     $('use-global').disabled = busy || blocked;
     $('threshold-input').disabled = busy || blocked || draft.threshold_override === null;
     $('save-bar').hidden = !count;
@@ -128,7 +133,7 @@
   }
   function valueLabel(key, value) {
     if (key !== 'threshold_override') return t(value ? 'on' : 'off');
-    return value === null ? `${t('global')} · ${globalThreshold.toFixed(2)}` : `${t('custom')} · ${value.toFixed(2)}`;
+    return value === null ? `${t('global')} · ${thresholdText(globalThreshold)}` : `${t('custom')} · ${thresholdText(value)}`;
   }
   function review() {
     if (busy || blocked || !Object.keys(changes()).length) return;
