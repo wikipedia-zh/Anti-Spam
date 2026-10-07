@@ -126,6 +126,7 @@ impl Runtime {
         );
         let case_id = case_id.to_string();
         let decision = decision.to_string();
+        let test_group_id = self.config.test_group_id;
         let mut model = self.model.lock().await;
         let (changed, next) = self.with_conn(move |conn| {
             let tx = conn.transaction()?;
@@ -140,6 +141,7 @@ impl Runtime {
             )? != 0;
             if changed && decision == "approve" {
                 write_sample(&tx, "spam", &text, Some(&case_id))?;
+                network_delivery::enqueue_network_ban(&tx, &case_id, test_group_id)?;
             }
             let next = Self::load_model(&tx)?;
             tx.commit()?;
@@ -178,7 +180,8 @@ impl Runtime {
                  AND c.action IN ('auto_ban','spam_ban','report_approved','guest_bot_ban','guest_invoker_ban','project_ban')
                  AND c.status NOT IN ('reversal_pending','ban_failed','ban_pending')
                  AND (c.chat_id=?2 OR c.action='project_ban' OR EXISTS(
-                    SELECT 1 FROM network_ban_targets n WHERE n.case_id=c.id AND n.chat_id=?2)))",
+                    SELECT 1 FROM network_ban_targets n WHERE n.case_id=c.id AND n.chat_id=?2)
+                    OR EXISTS(SELECT 1 FROM network_deliveries d WHERE d.case_id=c.id AND d.chat_id=?2 AND d.outcome_unknown=1)))",
                 params![case_id, chat_id, user_id], |row| row.get(0),
             )?)
         }).await

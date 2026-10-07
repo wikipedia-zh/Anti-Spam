@@ -11,6 +11,8 @@ mod reliability;
 use reliability::{execute_auto_ban, passes_threshold, stable_probability};
 mod reversal_retry;
 use reversal_retry::{reverse_ban_case, spawn_reversal_worker};
+mod network_delivery;
+use network_delivery::{deliver_network_bans, spawn_network_worker};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -272,6 +274,7 @@ struct Runtime {
     exchange_channel: Mutex<Option<i64>>,
     model: Mutex<ModelState>,
     review_lock: Mutex<()>,
+    user_action_locks: Mutex<HashMap<i64, std::sync::Weak<Mutex<()>>>>,
     spam_rules: RwLock<Vec<SpamRule>>,
     mass_train_buffer: Mutex<HashMap<i64, Vec<String>>>,
     mass_train_mode: Mutex<HashMap<i64, String>>,
@@ -502,6 +505,7 @@ impl Runtime {
             exchange_channel: Mutex::new(exchange_channel),
             model: Mutex::new(model),
             review_lock: Mutex::new(()),
+            user_action_locks: Mutex::new(HashMap::new()),
             spam_rules: RwLock::new(spam_rules),
             mass_train_buffer: Mutex::new(HashMap::new()),
             mass_train_mode: Mutex::new(HashMap::new()),
@@ -694,6 +698,9 @@ impl Runtime {
         }
         if user_version < 19 {
             Self::migrate_v18_to_v19(conn)?;
+        }
+        if user_version < 20 {
+            Self::migrate_v19_to_v20(conn)?;
         }
         Ok(())
     }
@@ -1323,6 +1330,7 @@ impl Runtime {
         .await
     }
 
+    #[cfg(test)]
     async fn list_netban_enabled_chats(&self) -> Result<Vec<i64>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare("SELECT chat_id FROM group_module_settings WHERE netban = 1")?;
@@ -1396,6 +1404,7 @@ impl Runtime {
     /// carries no netban field, so leaving this column out of its INSERT and
     /// its ON CONFLICT list means a later re-persist (a status change, a log
     /// id backfill) can never silently clear the flag.
+    #[cfg(test)]
     async fn mark_netban_eligible(&self, case_id: &str) -> Result<()> {
         let case_id = case_id.to_string();
         self.with_conn(move |conn| {
@@ -5354,29 +5363,12 @@ async fn propagate_network_ban(bot: &Bot, runtime: &Runtime, case: &CaseRecord) 
 /// local; a reviewer approving it is the second gate that makes it
 /// project-wide).
 async fn commit_network_ban(bot: &Bot, runtime: &Runtime, case: &CaseRecord) {
-    if runtime.is_global_whitelisted(case.target_user_id).await.unwrap_or(false) {
+    if let Err(err) = runtime.enqueue_network_deliveries(&case.id).await {
+        log::error!("could not queue network ban {}: {err}", case.id);
         return;
     }
-    let _ = runtime.mark_netban_eligible(&case.id).await;
-
-    let targets = runtime.list_netban_enabled_chats().await.unwrap_or_default();
-    for chat_id in targets {
-        if chat_id == case.chat_id {
-            continue;
-        }
-        if runtime.is_group_whitelisted(chat_id, case.target_user_id).await.unwrap_or(false) {
-            continue;
-        }
-        if bot.ban_chat_member(ChatId(chat_id), UserId(case.target_user_id as u64)).await.is_ok() {
-            // Silent on purpose. Propagation hits every receiving group at
-            // once, almost always about someone who has never posted there -
-            // announcing it just fills unrelated groups with notices about
-            // strangers. The record is still written, and the groups that
-            // actually meet this user get told at that point instead, by
-            // check_netban_and_act / the join-time catch-up in
-            // notify_bot_added.
-            let _ = runtime.record_network_ban_target(&case.id, chat_id).await;
-        }
+    if let Err(err) = deliver_network_bans(bot, runtime, Some(&case.id)).await {
+        log::warn!("network delivery {}: {err}", case.id);
     }
 }
 
@@ -9349,6 +9341,7 @@ async fn main() -> Result<()> {
     let bot = Bot::new(config.bot_token.clone());
     let runtime = Arc::new(Runtime::load(config).await?);
     let reversal_worker = spawn_reversal_worker(bot.clone(), runtime.clone());
+    let network_worker = spawn_network_worker(bot.clone(), runtime.clone());
 
     if let Some(owner_id) = runtime.config.owner_id {
         // Best-effort: a restart is exactly when this is most useful, but it
@@ -9593,6 +9586,8 @@ async fn main() -> Result<()> {
     dispatcher.dispatch().await;
     reversal_worker.abort();
     let _ = reversal_worker.await;
+    network_worker.abort();
+    let _ = network_worker.await;
 
     Ok(())
 }
@@ -9602,6 +9597,7 @@ mod tests {
     use super::*;
     mod reliability;
     mod reversal_retry;
+    mod network_delivery;
 
     /// Exercise the real command handler without contacting Telegram.
     struct TelegramStub {

@@ -47,6 +47,14 @@ impl Runtime {
                     params![case.id, case.chat_id, Utc::now().to_rfc3339()],
                 )?;
             }
+            // A lost API response may still have applied the ban. Keep those
+            // targets for reversal before cancelling unfinished deliveries.
+            tx.execute(
+                "INSERT OR IGNORE INTO network_ban_targets(case_id,chat_id,created_at)
+                 SELECT case_id,chat_id,?2 FROM network_deliveries WHERE case_id=?1 AND outcome_unknown=1",
+                params![case.id, Utc::now().to_rfc3339()],
+            )?;
+            tx.execute("UPDATE network_deliveries SET state='cancelled',outcome_unknown=0 WHERE case_id=?1 AND state!='done'", params![case.id])?;
             tx.execute("UPDATE cases SET status='reversal_pending' WHERE id=?1", params![case.id])?;
             tx.execute(
                 "INSERT INTO reversal_retries(case_id,actor_id,actor_name) VALUES (?1,?2,?3)
@@ -66,7 +74,7 @@ impl Runtime {
             let tx = conn.transaction()?;
             let now = Utc::now().timestamp();
             let not_before: i64 = tx.query_row(
-                "SELECT not_before FROM reversal_retry_state WHERE id=1",
+                "SELECT not_before FROM telegram_retry_state WHERE id=1",
                 [],
                 |r| r.get(0),
             )?;
@@ -92,18 +100,6 @@ impl Runtime {
         .await
     }
 
-    async fn delay_reversals(&self, seconds: u32) -> Result<()> {
-        let until = Utc::now().timestamp() + i64::from(seconds).max(1);
-        self.with_conn(move |conn| {
-            conn.execute(
-                "UPDATE reversal_retry_state SET not_before=MAX(not_before,?1) WHERE id=1",
-                params![until],
-            )?;
-            Ok(())
-        })
-        .await
-    }
-
     async fn finish_reversal(&self, case: &CaseRecord) -> Result<()> {
         let case = case.clone();
         self.with_conn(move |conn| {
@@ -124,7 +120,7 @@ impl Runtime {
             Ok(conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM reversal_retries r JOIN cases c ON c.id=r.case_id
                  WHERE r.case_id=?1 AND c.status='reversal_pending' AND r.next_attempt_at<=?2
-                 AND (SELECT not_before FROM reversal_retry_state WHERE id=1)<=?2)",
+                 AND (SELECT not_before FROM telegram_retry_state WHERE id=1)<=?2)",
                 params![case_id, Utc::now().timestamp()],
                 |r| r.get(0),
             )?)
@@ -141,6 +137,7 @@ pub(super) async fn reverse_ban_case(
     actor_name: &str,
 ) -> Result<String, String> {
     let _guard = runtime.review_lock.lock().await;
+    let _action_guard = runtime.user_action_guard(case.target_user_id).await;
     let case = runtime
         .load_case(&case.id)
         .await
@@ -218,7 +215,7 @@ async fn apply_reversal(
                 Ok(Ok(_)) => {}
                 Ok(Err(teloxide::RequestError::RetryAfter(delay))) => {
                     runtime
-                        .delay_reversals(delay.seconds())
+                        .delay_telegram_queue(delay.seconds())
                         .await
                         .map_err(|e| e.to_string())?;
                     errors.push(format!("Telegram 要求等待 {} 秒", delay.seconds()));
@@ -271,7 +268,7 @@ pub(super) async fn retry_due_reversals(bot: &Bot, runtime: &Runtime) -> Result<
         conn.execute("DELETE FROM reversal_retries WHERE NOT EXISTS (SELECT 1 FROM cases WHERE id=case_id AND status='reversal_pending')", [])?;
         let mut stmt = conn.prepare(
             "SELECT case_id FROM reversal_retries WHERE next_attempt_at<=?1
-             AND (SELECT not_before FROM reversal_retry_state WHERE id=1)<=?1
+             AND (SELECT not_before FROM telegram_retry_state WHERE id=1)<=?1
              ORDER BY next_attempt_at,case_id LIMIT 10",
         )?;
         let rows = stmt.query_map(params![Utc::now().timestamp()], |r| r.get::<_, String>(0))?;
@@ -284,6 +281,7 @@ pub(super) async fn retry_due_reversals(bot: &Bot, runtime: &Runtime) -> Result<
             continue;
         }
         if let Some(case) = runtime.load_case(&case_id).await? {
+            let _action_guard = runtime.user_action_guard(case.target_user_id).await;
             attempted += 1;
             if let Err(err) = attempt_reversal(bot, runtime, case).await {
                 log::warn!("reversal retry {case_id}: {err}");

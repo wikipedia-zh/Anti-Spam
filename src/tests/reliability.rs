@@ -431,7 +431,7 @@ async fn reliability_migration_is_additive_and_idempotent() {
             Runtime::init_db(conn)?;
             assert_eq!(
                 conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
-                19
+                20
             );
             Ok(())
         })

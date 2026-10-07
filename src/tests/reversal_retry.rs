@@ -135,7 +135,7 @@ async fn rate_limit_pauses_the_queue_across_restart_and_manual_retries() {
     let until: i64 = restarted
         .with_conn(|conn| {
             Ok(conn.query_row(
-                "SELECT not_before FROM reversal_retry_state WHERE id=1",
+                "SELECT not_before FROM telegram_retry_state WHERE id=1",
                 [],
                 |r| r.get(0),
             )?)
@@ -156,7 +156,7 @@ async fn rate_limit_pauses_the_queue_across_restart_and_manual_retries() {
     assert!(unban_requests(&success).is_empty());
     restarted
         .with_conn(|conn| {
-            conn.execute("UPDATE reversal_retry_state SET not_before=0", [])?;
+            conn.execute("UPDATE telegram_retry_state SET not_before=0", [])?;
             Ok(())
         })
         .await
@@ -332,7 +332,7 @@ async fn startup_worker_recovers_legacy_pending_reversals_without_inventing_an_a
         .await
         .unwrap();
     runtime.with_conn(|conn| {
-        conn.execute_batch("DROP TABLE reversal_retries; DROP TABLE reversal_retry_state; PRAGMA user_version=18;")?;
+        conn.execute_batch("DROP TABLE reversal_retries; DROP TABLE telegram_retry_state; PRAGMA user_version=18;")?;
         Ok(())
     }).await.unwrap();
     let restarted = Arc::new(Runtime::load(runtime.config.clone()).await.unwrap());
