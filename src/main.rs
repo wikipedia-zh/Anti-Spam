@@ -15,6 +15,8 @@ mod network_delivery;
 use network_delivery::{deliver_network_bans, spawn_network_worker};
 mod captcha;
 use captcha::{check_captcha_and_act, start_captcha_challenge, spawn_captcha_worker};
+mod edited_messages;
+use edited_messages::moderate_edited_message;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -4553,8 +4555,6 @@ async fn process_new_group_member(bot: &Bot, runtime: &Arc<Runtime>, message: &M
 
         if !all_reasons.is_empty() {
             banned = true;
-            let _ = bot.delete_message(message.chat.id, message.id).await;
-            let _ = ban_user(bot, message.chat.id, user.id.0 as i64).await;
             let case = CaseRecord {
                 id: Uuid::new_v4().to_string(),
                 action: ActionKind::AutoBan,
@@ -4572,13 +4572,9 @@ async fn process_new_group_member(bot: &Bot, runtime: &Arc<Runtime>, message: &M
                 log_message_id: None,
                 created_at: Utc::now(),
             };
-            let log_message_id = log_action(bot, runtime, &case).await.unwrap_or_default();
-            let mut updated = case.clone();
-            updated.log_message_id = Some(log_message_id);
-            let _ = store_case(runtime, &updated).await;
-            let _ = notify_group(bot, runtime, &updated, log_message_id, "<b>自動模組封禁</b>").await;
-            propagate_network_ban(bot, runtime, &updated).await;
-            broadcast_ban_status(bot, runtime, updated.target_user_id, true).await;
+            if let Err(err) = execute_auto_ban(bot, runtime, case, "<b>自動模組封禁</b>").await {
+                log::error!("join moderation failed: {err}");
+            }
         }
     }
 
@@ -5450,6 +5446,18 @@ fn extract_full_text(msg: &Message) -> String {
     text
 }
 
+fn with_hidden_links(msg: &Message, mut text: String) -> String {
+    for entity in msg.entities().or(msg.caption_entities()).unwrap_or(&[]) {
+        if let teloxide::types::MessageEntityKind::TextLink { url } = &entity.kind {
+            if !text.contains(url.as_str()) {
+                text.push('\n');
+                text.push_str(url.as_str());
+            }
+        }
+    }
+    text
+}
+
 fn tokenize_or_empty(text: &str) -> Vec<String> {
     tokenize(text)
 }
@@ -5921,9 +5929,6 @@ async fn check_attachment_policy_and_act(bot: &Bot, runtime: &Arc<Runtime>, mess
         return false;
     }
 
-    let _ = bot.delete_message(message.chat.id, message.id).await;
-    let _ = ban_user(bot, message.chat.id, user_id).await;
-
     let case = CaseRecord {
         id: Uuid::new_v4().to_string(),
         action: ActionKind::AutoBan,
@@ -5941,15 +5946,9 @@ async fn check_attachment_policy_and_act(bot: &Bot, runtime: &Arc<Runtime>, mess
         log_message_id: None,
         created_at: Utc::now(),
     };
-    let log_message_id = log_action(bot, runtime, &case).await.unwrap_or_default();
-    let mut updated = case.clone();
-    updated.log_message_id = Some(log_message_id);
-    let _ = store_case(runtime, &updated).await;
-    let _ = notify_group(bot, runtime, &updated, log_message_id, "<b>附件政策封禁</b>").await;
-    // Unscored AutoBan, so netban_eligible() rejects it - a group's own
-    // attachment policy is not a project-wide spam finding.
-    propagate_network_ban(bot, runtime, &updated).await;
-    broadcast_ban_status(bot, runtime, updated.target_user_id, true).await;
+    if let Err(err) = execute_auto_ban(bot, runtime, case, "<b>附件政策封禁</b>").await {
+        log::error!("attachment moderation failed: {err}");
+    }
     true
 }
 
@@ -8884,7 +8883,8 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
     if is_group_admin(&bot, message.chat.id, user.id.0 as i64).await || runtime.is_maintainer(user.id.0 as i64).await {
         return Ok(());
     }
-    if let Ok(check) = runtime.check_group_modules(&bot, message.chat.id.0, user, None, message.text().or(message.caption())).await {
+    let rule_text = with_hidden_links(&message, message.text().or(message.caption()).unwrap_or("").to_string());
+    if let Ok(check) = runtime.check_group_modules(&bot, message.chat.id.0, user, None, Some(&rule_text)).await {
         if !check.reasons.is_empty() {
             let case_id = Uuid::new_v4().to_string();
             let case = CaseRecord {
@@ -8896,7 +8896,7 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
                 actor_user_id: None,
                 actor_name: None,
                 source_message_id: Some(message.id.0),
-                evidence_text: extract_full_text(&message),
+                evidence_text: with_hidden_links(&message, extract_full_text(&message)),
                 model_score: None,
                 matched_rule_id: None,
                 matched_rule_pattern: Some(check.reasons.join("；")),
@@ -9412,6 +9412,13 @@ async fn main() -> Result<()> {
         }
     });
 
+    let edited_message_handler = Update::filter_edited_message().endpoint({
+        let runtime = runtime.clone();
+        move |bot: Bot, message: Message| {
+            moderate_edited_message(bot, runtime.clone(), message)
+        }
+    });
+
     let callback_handler = Update::filter_callback_query().endpoint({
         let runtime = runtime.clone();
         move |bot: Bot, q: CallbackQuery| {
@@ -9447,6 +9454,7 @@ async fn main() -> Result<()> {
 
     let handler = dptree::entry()
         .branch(message_handler)
+        .branch(edited_message_handler)
         .branch(callback_handler)
         .branch(exchange_handler)
         .branch(chat_member_handler);
@@ -9474,6 +9482,7 @@ mod tests {
     mod reversal_retry;
     mod network_delivery;
     mod captcha;
+    mod edited_messages;
 
     /// Exercise the real command handler without contacting Telegram.
     struct TelegramStub {
