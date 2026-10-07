@@ -8,7 +8,9 @@
 // the LICENSE file.
 
 mod reliability;
-use reliability::{execute_auto_ban, passes_threshold, stable_probability};
+mod origin_retry;
+use origin_retry::execute_auto_ban;
+use reliability::{passes_threshold, stable_probability};
 mod reversal_retry;
 use reversal_retry::{reverse_ban_case, spawn_reversal_worker};
 mod network_delivery;
@@ -705,6 +707,9 @@ impl Runtime {
         }
         if user_version < 22 {
             Self::migrate_v21_to_v22(conn)?;
+        }
+        if user_version < 23 {
+            Self::migrate_v22_to_v23(conn)?;
         }
         Ok(())
     }
@@ -8814,7 +8819,6 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
     };
 
     match execute_auto_ban(&bot, &runtime, case, "<b>自動機器學習封禁</b>").await {
-        Ok(true) if is_bot_spam => { capture_bot_spam_rules(&bot, &runtime, message.chat.id.0, &text).await; }
         Ok(_) => {}
         Err(err) => log::error!("auto-ban execution failed: {err}"),
     }
@@ -8900,6 +8904,10 @@ fn parse_exchange_envelope(text: &str) -> Option<ExchangeEnvelope> {
 /// No `parse_mode` - plain text, so JSON's braces/quotes are never
 /// misinterpreted as Markdown/HTML.
 async fn send_exchange_message(bot: &Bot, chat: i64, action: &str, kind: &str, data: serde_json::Value) {
+    let _ = try_send_exchange_message(bot, chat, action, kind, data).await;
+}
+
+async fn try_send_exchange_message(bot: &Bot, chat: i64, action: &str, kind: &str, data: serde_json::Value) -> ResponseResult<()> {
     let text = serde_json::to_string_pretty(&serde_json::json!({
         "from": EXCHANGE_SENDER_GBB,
         "to": [EXCHANGE_SENDER_PM],
@@ -8908,7 +8916,8 @@ async fn send_exchange_message(bot: &Bot, chat: i64, action: &str, kind: &str, d
         "data": data,
     }))
     .unwrap_or_default();
-    let _ = bot.send_message(ChatId(chat), text).await;
+    bot.send_message(ChatId(chat), text).await?;
+    Ok(())
 }
 
 async fn handle_exchange_query_bad(bot: &Bot, runtime: &Runtime, chat: i64, data: serde_json::Value) {
@@ -9086,6 +9095,7 @@ async fn main() -> Result<()> {
     let miniapp_server = miniapp::start(bot.clone(), runtime.clone()).await?;
     let reversal_worker = spawn_reversal_worker(bot.clone(), runtime.clone());
     let network_worker = spawn_network_worker(bot.clone(), runtime.clone());
+    let origin_worker = origin_retry::spawn_origin_worker(bot.clone(), runtime.clone());
     let captcha_worker = spawn_captcha_worker(bot.clone(), runtime.clone());
 
     if let Some(owner_id) = runtime.config.owner_id {
@@ -9363,6 +9373,8 @@ async fn main() -> Result<()> {
     let _ = reversal_worker.await;
     network_worker.abort();
     let _ = network_worker.await;
+    origin_worker.abort();
+    let _ = origin_worker.await;
     captcha_worker.abort();
     let _ = captcha_worker.await;
 
@@ -9375,6 +9387,7 @@ mod tests {
     mod reliability;
     mod reversal_retry;
     mod network_delivery;
+    mod origin_retry;
     mod captcha;
     mod edited_messages;
     mod notices;
@@ -9449,7 +9462,7 @@ mod tests {
                             "user": {"id": args["user_id"], "is_bot": false, "first_name": "Test"}
                         }),
                         "getchat" => serde_json::json!({"id":args["chat_id"],"type":"supergroup","title":"Test","accent_color_id":0,"max_reaction_count":11,"accepted_gift_types":{"unlimited_gifts":false,"limited_gifts":false,"unique_gifts":false,"premium_subscription":false}}),
-                        "sendmessage" => serde_json::json!({
+                        "sendmessage" | "editmessagetext" => serde_json::json!({
                             "message_id": 100, "date": 0,
                             "chat": {"id": args["chat_id"], "type": "supergroup", "title": "Test"},
                             "text": args["text"]

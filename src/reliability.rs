@@ -192,7 +192,9 @@ impl Runtime {
             Ok(conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM cases c WHERE c.id != ?1 AND c.target_user_id=?3
                  AND c.action IN ('auto_ban','spam_ban','report_approved','guest_bot_ban','guest_invoker_ban','project_ban')
-                 AND c.status NOT IN ('reversal_pending','ban_failed','ban_pending')
+                 AND c.status NOT IN ('reversal_pending','reversed')
+                 AND (c.status NOT IN ('ban_failed','ban_pending') OR
+                    (c.chat_id=?2 AND EXISTS(SELECT 1 FROM origin_ban_jobs o WHERE o.case_id=c.id AND o.outcome_unknown=1)))
                  AND (c.chat_id=?2 OR c.action='project_ban' OR EXISTS(
                     SELECT 1 FROM network_ban_targets n WHERE n.case_id=c.id AND n.chat_id=?2)
                     OR EXISTS(SELECT 1 FROM network_deliveries d WHERE d.case_id=c.id AND d.chat_id=?2 AND d.outcome_unknown=1)))",
@@ -200,63 +202,4 @@ impl Runtime {
             )?)
         }).await
     }
-}
-
-/// Store intent before contacting Telegram. Never announce/propagate a ban
-/// unless the API succeeded and its result was committed to the case record.
-pub(super) async fn execute_auto_ban(
-    bot: &Bot,
-    runtime: &Runtime,
-    mut case: CaseRecord,
-    header: &str,
-) -> Result<bool> {
-    case.status = "ban_pending".to_string();
-    runtime.persist_case(&case).await?;
-    let deleted = if let Some(id) = case.source_message_id {
-        match delete_message_if_exists(bot, ChatId(case.chat_id), MessageId(id)).await {
-            Ok(()) => true,
-            Err(err) => {
-                log_callback_error(bot, runtime, &case, "delete_message", &err.to_string()).await;
-                false
-            }
-        }
-    } else {
-        true
-    };
-    let banned = match ban_user(bot, ChatId(case.chat_id), case.target_user_id).await {
-        Ok(()) => true,
-        Err(err) => {
-            log_callback_error(bot, runtime, &case, "ban", &err.to_string()).await;
-            false
-        }
-    };
-    case.status = match (banned, deleted) {
-        (true, true) => "auto_banned",
-        (true, false) => "banned_delete_failed",
-        (false, _) => "ban_failed",
-    }
-    .to_string();
-    runtime.persist_case(&case).await?;
-    match log_action(bot, runtime, &case).await {
-        Ok(id) => {
-            case.log_message_id = Some(id);
-            runtime.persist_case(&case).await?;
-            let title = if !banned {
-                "<b>封禁失敗，請管理員檢查權限及日誌</b>"
-            } else if !deleted {
-                "<b>已封禁，但訊息刪除失敗</b>"
-            } else {
-                header
-            };
-            if let Err(err) = notify_group(bot, runtime, &case, id, title).await {
-                log::warn!("case {} notification failed: {err}", case.id);
-            }
-        }
-        Err(err) => log::error!("case {} log delivery failed: {err}", case.id),
-    }
-    if banned {
-        propagate_network_ban(bot, runtime, &case).await;
-        broadcast_ban_status(bot, runtime, case.target_user_id, true).await;
-    }
-    Ok(banned)
 }

@@ -56,6 +56,7 @@ impl Runtime {
             )?;
             tx.execute("UPDATE network_deliveries SET state='cancelled',outcome_unknown=0 WHERE case_id=?1 AND state!='done'", params![case.id])?;
             tx.execute("UPDATE cases SET status='reversal_pending' WHERE id=?1", params![case.id])?;
+            tx.execute("UPDATE origin_ban_jobs SET state='cancelled',outcome_unknown=0 WHERE case_id=?1", params![case.id])?;
             tx.execute(
                 "INSERT INTO reversal_retries(case_id,actor_id,actor_name) VALUES (?1,?2,?3)
                  ON CONFLICT(case_id) DO UPDATE SET
