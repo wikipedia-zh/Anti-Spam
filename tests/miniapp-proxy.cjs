@@ -90,11 +90,17 @@ test('role reads and changes require authentication and fixed methods', async ()
 });
 test('conflicts survive the proxy and upstream failures stay private', async () => {
   const count=seen.length;
-  assert.equal((await request('host-case-reverse','POST',{},'{}')).status,405);
-  assert.equal((await request('host-case-reverse','PATCH',{Authorization:''},'{}')).status,401);
+  for (const route of ['host-case-reverse','host-case-review']) {
+    assert.equal((await request(route,'POST',{},'{}')).status,405);
+    assert.equal((await request(route,'PATCH',{Authorization:''},'{}')).status,401);
+    assert.equal((await request(route,'PATCH',{Origin:'https://other.example'},'{}')).status,403);
+  }
   assert.equal(seen.length,count);
   assert.equal((await request('host-case-reverse','PATCH',{},'{"case_id":"example"}')).status,200);
   assert.equal(seen.at(-1).path,'/api/host/case/reverse');
+  assert.equal((await request('host-case-review','PATCH',{},'{"case_id":"example","kind":"report","decision":"reject"}')).status,200);
+  assert.equal(seen.at(-1).path,'/api/host/case/review');
+  assert.equal(seen.at(-1).body,'{"case_id":"example","kind":"report","decision":"reject"}');
   responseStatus=404;responseBody=JSON.stringify({error:'case_not_found'});
   const missing=await request('host-case','POST',{},'{}');assert.equal(missing.status,404);
   responseStatus=409; responseBody=JSON.stringify({error:'settings_changed'});

@@ -58,6 +58,7 @@
     const s=states[language];
     Object.assign(s,{auto_banned:s.ban_done,guest_bot_banned:s.ban_done,guest_invoker_banned:s.ban_done,approved_and_banned:s.ban_done,force_approved:s.ban_done});
     s.banned_delete_failed=language==='en'?'Banned; message deletion failed':language==='zh-Hans'?'已封禁，删消息失败':'已封禁，刪訊息失敗';
+    s.rejected_and_cleaned=language==='en'?'Report rejected':language==='zh-Hans'?'举报已拒绝':'舉報已拒絕';
   }
   Object.assign(words['zh-Hant'],{groupSettings:'設定與自訂文字',openSettings:'前往群組設定 ↗',groupLinkNote:'此入口 5 分鐘內有效，只限你本人使用。開啟及儲存時會重新確認你和機器人的群組管理權限。',group_access_denied:'無法開啟此群設定。請確認你和機器人仍是該群管理員，且該群未被終止服務。'});
   Object.assign(words['zh-Hans'],{groupSettings:'设置与自定义文字',openSettings:'前往群组设置 ↗',groupLinkNote:'此入口 5 分钟内有效，仅限你本人使用。打开及保存时会重新确认你和机器人的群组管理权限。',group_access_denied:'无法打开此群设置。请确认你和机器人仍是该群管理员，且该群未被终止服务。'});
@@ -66,7 +67,8 @@
   Object.assign(words['zh-Hant'],{resultFilter:'處理結果',allResults:'全部',fromDate:'開始日期',throughDate:'結束日期',clearFilters:'清除篩選',dateNote:'日期包含首尾兩天；按裝置時區：',invalid_request:'請檢查搜尋條件及日期範圍。',banned:'封禁已生效',pending:'待執行',failed:'操作失敗（含部分失敗）',unconfirmed:'結果未確認',rejected:'舉報已拒絕',cancelled:'已取消'});
   Object.assign(words['zh-Hans'],{resultFilter:'处理结果',allResults:'全部',fromDate:'开始日期',throughDate:'结束日期',clearFilters:'清除筛选',dateNote:'日期包含首尾两天；按设备时区：',invalid_request:'请检查搜索条件和日期范围。',banned:'封禁已生效',pending:'待执行',failed:'操作失败（含部分失败）',unconfirmed:'结果未确认',rejected:'举报已拒绝',cancelled:'已取消'});
   Object.assign(words.en,{resultFilter:'Result',allResults:'All',fromDate:'From date',throughDate:'Through date',clearFilters:'Clear filters',dateNote:'Dates include both days; device time zone: ',invalid_request:'Check the search filters and date range.',banned:'Ban in effect',pending:'Awaiting action',failed:'Failed or partly failed',unconfirmed:'Result unconfirmed',rejected:'Report rejected',cancelled:'Cancelled'});
-  const caseFilters=['','pending_review','banned','pending','failed','unconfirmed','reversal_pending','reversed','rejected','cancelled'];
+  Object.assign(words['zh-Hant'],{pending_training:'待審訓練樣本',caseDetails:'案件詳情與處理'});Object.assign(words['zh-Hans'],{pending_training:'待审核训练样本',caseDetails:'案件详情与处理'});Object.assign(words.en,{pending_training:'Training samples awaiting review',caseDetails:'Case details and actions'});
+  const caseFilters=['','pending_review','pending_training','banned','pending','failed','unconfirmed','reversal_pending','reversed','rejected','cancelled'];
   let lang='zh-Hant',request,clearToken,root,view='overview',search='',filter='',fromDate='',throughDate='',createdFrom=null,createdBefore=null,offset=0,data=null,busy=false,closed=false,error='',groupLink=null;
   const t = key => words[lang][key] ?? key;
   const element = (tag,text,className) => {const el=document.createElement(tag); if(text!==undefined)el.textContent=text; if(className)el.className=className; return el;};
@@ -112,7 +114,7 @@
     if(!data)return;
     if(view==='overview'){
       const summary=data.items[0];const grid=element('div',undefined,'host-summary');
-      for(const key of ['pending_reports','pending_work','failed_work','pending_network']){const card=button('',()=>{view=key==='pending_reports'?'cases':'queue';resetFilters();filter={pending_reports:'pending_review',failed_work:'failed',pending_network:'network'}[key]||'';load();});card.className='host-stat';card.append(element('span',t(key)),element('strong',value(key,summary[key])));grid.append(card);}root.append(grid);
+      for(const key of ['pending_reports','pending_training','pending_work','failed_work','pending_network']){const card=button('',()=>{view=['pending_reports','pending_training'].includes(key)?'cases':'queue';resetFilters();filter={pending_reports:'pending_review',pending_training:'pending_training',failed_work:'failed',pending_network:'network'}[key]||'';load();});card.className='host-stat';card.append(element('span',t(key)),element('strong',value(key,summary[key])));grid.append(card);}root.append(grid);
       const info=element('article',undefined,'host-record');const dl=element('dl');for(const key of ['known_groups','rules','global_threshold','version','schema'])dl.append(element('dt',t(key)),element('dd',value(key,summary[key])));info.append(dl);root.append(info);
       if(summary.telegram_not_before>Date.now()/1000)root.append(element('p',t('cooldown')+date(summary.telegram_not_before),'host-note'));
       root.append(element('p',t('modelNote'),'host-note'));

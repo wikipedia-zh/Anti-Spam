@@ -8,6 +8,10 @@ const CREATED_SECONDS: &str = "CAST(strftime('%s',substr(created_at,1,19) || CAS
     WHEN substr(created_at,-6,1) IN ('+','-') THEN substr(created_at,-6)
     ELSE '' END) AS INTEGER)";
 
+const PENDING_TRAINING: &str = "c.action='spam_ban' AND c.status NOT IN ('ban_pending','ban_failed','reversed','reversal_pending')
+    AND EXISTS(SELECT 1 FROM training_review_locations l WHERE l.case_id=c.id)
+    AND NOT EXISTS(SELECT 1 FROM training_reviews r WHERE r.case_id=c.id)";
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Query {
@@ -34,6 +38,7 @@ impl Query {
                 && matches!(
                     self.filter.as_str(),
                     "pending_review"
+                        | "pending_training"
                         | "banned"
                         | "pending"
                         | "failed"
@@ -96,6 +101,7 @@ impl Runtime {
                     let work = queue_status::WORK;
                     let mut summary = rows(&tx, &format!("SELECT
                         (SELECT COUNT(*) FROM cases WHERE action='pending_report' AND status='pending_review') AS pending_reports,
+                        (SELECT COUNT(*) FROM cases c WHERE {PENDING_TRAINING}) AS pending_training,
                         (SELECT COUNT(*) FROM ({work})) AS pending_work,
                         (SELECT COUNT(*) FROM ({work}) WHERE last_error IS NOT NULL) AS failed_work,
                         (SELECT COUNT(*) FROM network_deliveries WHERE state='pending') AS pending_network,
@@ -115,6 +121,7 @@ impl Runtime {
                     FROM cases c WHERE (?1='' OR id=?1 OR target_user_id=?2 OR chat_id=?2)
                     AND (?4=''
                         OR (?4='pending_review' AND action='pending_report' AND status='pending_review')
+                        OR (?4='pending_training' AND {PENDING_TRAINING})
                         OR (?4='banned' AND (status IN ('ban_done','auto_banned','guest_bot_banned','guest_invoker_banned','approved_and_banned','force_approved','banned_delete_failed')
                             OR (status='done' AND action IN ('spam_ban','project_ban'))))
                         OR (?4='pending' AND status IN ('ban_pending','action_pending'))

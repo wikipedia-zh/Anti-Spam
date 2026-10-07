@@ -19,6 +19,7 @@ mod rule_updates;
 mod rule_notices;
 mod host_panel;
 mod host_cases;
+mod review_decisions;
 mod role_updates;
 use origin_retry::execute_auto_ban;
 use reliability::{passes_threshold, stable_probability};
@@ -745,6 +746,9 @@ impl Runtime {
         }
         if user_version < 31 {
             Self::migrate_v30_to_v31(conn)?;
+        }
+        if user_version < 32 {
+            Self::migrate_v31_to_v32(conn)?;
         }
         Ok(())
     }
@@ -4891,23 +4895,36 @@ fn netban_eligible(action: &ActionKind, model_score: Option<f64>, global_thresho
 ///
 /// Review a local `/sb` before training and promoting it to the network.
 /// Empty or token-less evidence cannot train the model.
-async fn queue_training_review(bot: &Bot, runtime: &Runtime, case: &CaseRecord) -> Result<()> {
+async fn queue_training_review(bot: &Bot, runtime: &Runtime, case: &CaseRecord, guards: Arc<origin_retry::ActionGuards>) -> Result<()> {
     if is_empty_ml_text(&case.evidence_text) {
         return Ok(());
     }
     let id=case.id.clone();
-    let decided=runtime.with_conn(move |conn| Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM training_reviews WHERE case_id=?1)",params![id],|r|r.get::<_,bool>(0))?)).await?;
+    let save_guard=guards.clone();
+    let decided=runtime.with_conn(move |conn| {
+        let _guard=save_guard;
+        let known:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM training_reviews WHERE case_id=?1) OR EXISTS(SELECT 1 FROM training_review_locations WHERE case_id=?1 AND message_id IS NOT NULL)",params![id],|r|r.get(0))?;
+        if !known {conn.execute("INSERT OR IGNORE INTO training_review_locations(case_id) VALUES (?1)",[id])?;}
+        Ok(known)
+    }).await?;
     if decided {return Ok(());}
     let body = notices::review_card(case, "待審核訓練樣本 · /sb", "批准：訓練並加入跨群黑名單。\n拒絕：不訓練，保留本群封禁。", None);
     let buttons = InlineKeyboardMarkup::new(vec![vec![
         InlineKeyboardButton::callback("訓練並加入黑名單", format!("train:approve:{}", case.id)),
         InlineKeyboardButton::callback("拒絕訓練", format!("train:reject:{}", case.id)),
     ]]);
-    bot
+    let sent=bot
         .send_message(ChatId(runtime.config.report_channel_id), body)
         .parse_mode(ParseMode::Html)
         .reply_markup(buttons)
         .await?;
+    let id=case.id.clone();
+    let chat=runtime.config.report_channel_id;
+    runtime.with_conn(move |conn| {
+        let _guards=guards;
+        conn.execute("INSERT INTO training_review_locations(case_id,chat_id,message_id) VALUES (?1,?2,?3) ON CONFLICT(case_id) DO UPDATE SET chat_id=excluded.chat_id,message_id=excluded.message_id",params![id,chat,sent.id.0])?;
+        Ok(())
+    }).await?;
     Ok(())
 }
 
@@ -8930,6 +8947,7 @@ mod tests {
     mod rule_notices;
     mod role_updates;
     mod host_cases;
+    mod host_review;
     mod captcha;
     mod edited_messages;
     mod notices;

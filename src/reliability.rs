@@ -172,27 +172,9 @@ impl Runtime {
         let decision = decision.to_string();
         let test_group_id = self.config.test_group_id;
         self.with_model_transaction(move |tx| {
-            let (action, status, text): (String, String, String) = tx.query_row(
-                "SELECT action, status, evidence_text FROM cases WHERE id=?1", params![case_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?;
-            anyhow::ensure!(action == ActionKind::SpamBan.as_str() && !matches!(status.as_str(), "reversed" | "reversal_pending" | "ban_failed" | "ban_pending"), "case is no longer eligible for training review");
-            let changed = tx.execute(
-                "INSERT OR IGNORE INTO training_reviews (case_id, decision, actor_id, decided_at) VALUES (?1, ?2, ?3, ?4)",
-                params![case_id, decision, actor_id, Utc::now().to_rfc3339()],
-            )? != 0;
-            if changed && decision == "approve" {
-                write_sample(tx, "spam", &text, Some(&case_id))?;
-                network_delivery::enqueue_network_ban(tx, &case_id, test_group_id)?;
-            }
-            if changed {
-                if let Some((chat,message))=location {
-                    tx.execute("INSERT INTO review_updates(case_id,kind,decision,chat_id,message_id,actor_id) VALUES (?1,'train',?2,?3,?4,?5)",
-                        params![case_id,decision,chat,message,actor_id])?;
-                }
-            }
-            Ok(changed)
-        }).await
+            review_decisions::training(tx, &case_id, &decision, actor_id, location, test_group_id)
+        })
+        .await
     }
 
     pub(super) async fn remove_network_ban_target(

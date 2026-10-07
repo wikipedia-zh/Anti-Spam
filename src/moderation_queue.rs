@@ -78,47 +78,20 @@ impl Runtime {
             matches!(decision, "approve" | "reject"),
             "invalid report decision"
         );
-        let strike_reporter = if let Some(id) = case.actor_user_id {
-            !self.is_maintainer(id).await
-        } else {
-            false
-        };
         let case_id = case.id.clone();
         let decision = decision.to_string();
         self.with_model_transaction(move |tx| {
-            let _guard=guard;
-            let pending: Option<(String,Option<i64>,bool)>=tx.query_row(
-                "SELECT evidence_text,actor_user_id,source_message_id IS NULL FROM cases
-                 WHERE id=?1 AND action='pending_report' AND status='pending_review'",params![case_id],
-                |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-            let Some((text,reporter,no_source))=pending else {return Ok((false,_guard));};
-            let mut note=String::new();
-            if decision == "approve" {
-                tx.execute("UPDATE cases SET action='report_approved',status='ban_pending',actor_user_id=?2,actor_name=?3,log_message_id=NULL WHERE id=?1",
-                    params![case_id,actor.0,actor.1])?;
-                tx.execute("INSERT INTO origin_ban_jobs(case_id,header,delete_done) VALUES (?1,'<b>舉報已受理，對象已封禁</b>',?2)",
-                    params![case_id,no_source])?;
-                tx.execute("INSERT INTO ban_followups(case_id,training_mode,audit_done) VALUES (?1,'report',1)",params![case_id])?;
-            } else {
-                reliability::write_sample(tx,"ham",&text,Some(&case_id))?;
-                if let Some(reporter)=reporter.filter(|_|strike_reporter) {
-                    tx.execute("INSERT INTO report_offenses(user_id,rejected_count,last_rejected_at) VALUES (?1,1,?2)
-                        ON CONFLICT(user_id) DO UPDATE SET rejected_count=rejected_count+1,last_rejected_at=excluded.last_rejected_at",
-                        params![reporter,Utc::now().to_rfc3339()])?;
-                    let count: i64=tx.query_row("SELECT rejected_count FROM report_offenses WHERE user_id=?1",[reporter],|r|r.get(0))?;
-                    note=if count>=REPORT_STRIKE_LIMIT {
-                        format!("\n<b>舉報者</b>: <code>{reporter}</code> 已累計 {count} 次被拒，已暫停使用 /spam")
-                    } else {format!("\n<b>舉報者</b>: <code>{reporter}</code> 已累計 {count}/{REPORT_STRIKE_LIMIT} 次被拒")};
-                }
-                tx.execute("UPDATE cases SET action='report_rejected',status='rejected_and_cleaned',actor_user_id=?2,actor_name=?3 WHERE id=?1",
-                    params![case_id,actor.0,actor.1])?;
-            }
-            tx.execute("INSERT INTO review_updates(case_id,kind,decision,chat_id,message_id,confirmation_chat_id,confirmation_message_id,note)
-                SELECT ?1,'report',?2,?3,?4,(SELECT chat_id FROM report_confirmations WHERE case_id=?1),
-                (SELECT message_id FROM report_confirmations WHERE case_id=?1),?5",params![case_id,decision,location.0,location.1,note])?;
-            tx.execute("DELETE FROM report_confirmations WHERE case_id=?1",params![case_id])?;
-            Ok((true,_guard))
-        }).await.map(|(changed,_)|changed)
+            let changed = review_decisions::report(
+                tx,
+                &case_id,
+                &decision,
+                (actor.0, &actor.1),
+                Some(location),
+            )?;
+            Ok((changed, guard))
+        })
+        .await
+        .map(|(changed, _)| changed)
     }
 }
 
@@ -163,7 +136,7 @@ async fn deliver_review_update(bot: &Bot, runtime: &Runtime, id: &str) -> Result
             u.review_status,u.confirmation_status,u.attempts,COALESCE(j.state,''),u.kind,u.decision,u.actor_id FROM review_updates u
             LEFT JOIN origin_ban_jobs j ON j.case_id=u.case_id WHERE u.case_id=?1 AND u.next_attempt_at<=?2
             AND (SELECT not_before FROM telegram_retry_state WHERE id=1)<=?2",params![case_id,now],
-            |r|Ok((r.get::<_,i64>(0)?,r.get::<_,i32>(1)?,r.get::<_,Option<i64>>(2)?,r.get::<_,Option<i32>>(3)?,
+            |r|Ok((r.get::<_,Option<i64>>(0)?,r.get::<_,Option<i32>>(1)?,r.get::<_,Option<i64>>(2)?,r.get::<_,Option<i32>>(3)?,
                 r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,u32>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?,r.get::<_,Option<i64>>(11)?))).optional()?;
         if let Some(ref row)=row {
             let attempt=row.7.saturating_add(1).min(31);
@@ -215,8 +188,8 @@ async fn deliver_review_update(bot: &Bot, runtime: &Runtime, id: &str) -> Result
     for (stage, chat, msg, text, status) in [
         (
             "review_status",
-            Some(chat),
-            Some(msg),
+            chat,
+            msg,
             notices::review_card(&case, title, &note, actor.or(case.actor_user_id)),
             review_status,
         ),

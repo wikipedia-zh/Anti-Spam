@@ -53,7 +53,7 @@ pub(super) const WORK: &str = "
         FROM warning_requests WHERE state='pending'
     UNION ALL SELECT '規則通知',case_id,source_chat_id,attempts,next_attempt_at,last_error
         FROM rule_notice_jobs WHERE state='pending'
-    UNION ALL SELECT '審核通知',u.case_id,u.chat_id,u.attempts,u.next_attempt_at,u.last_error
+    UNION ALL SELECT '審核通知',u.case_id,COALESCE(u.chat_id,u.confirmation_chat_id,c.chat_id),u.attempts,u.next_attempt_at,u.last_error
         FROM review_updates u JOIN cases c ON c.id=u.case_id LEFT JOIN origin_ban_jobs j ON j.case_id=c.id
         WHERE u.review_status!=c.status||':'||COALESCE(j.state,'') OR u.confirmation_status!=c.status||':'||COALESCE(j.state,'')";
 

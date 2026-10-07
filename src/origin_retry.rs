@@ -1,7 +1,7 @@
 use super::*;
 use rusqlite::OptionalExtension;
 
-struct ActionGuards {
+pub(super) struct ActionGuards {
     _review: tokio::sync::OwnedMutexGuard<()>,
     _user: tokio::sync::OwnedMutexGuard<()>,
 }
@@ -101,7 +101,7 @@ impl Runtime {
         Ok(())
     }
 
-    async fn origin_guards(&self, case: &CaseRecord) -> Arc<ActionGuards> {
+    pub(super) async fn origin_guards(&self, case: &CaseRecord) -> Arc<ActionGuards> {
         Arc::new(ActionGuards {
             _review: self.review_guard(&case.id).await,
             _user: self.user_action_guard(case.target_user_id).await,
@@ -662,7 +662,7 @@ pub(super) async fn attempt_origin_ban(
         if job.training_mode == "review"
             && job.case.matched_rule_pattern.as_deref() != Some("BOTSPAM")
         {
-            if let Err(err) = api(queue_training_review(bot, runtime, &job.case)).await {
+            if let Err(err) = api(queue_training_review(bot, runtime, &job.case, guards.clone())).await {
                 record_error(runtime, &mut job, "training_review", &err).await?;
                 runtime.save_origin_job(&job, "pending", guards).await?;
                 return Ok(true);

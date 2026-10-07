@@ -535,6 +535,30 @@ async fn reverse_host_case(
     }
 }
 
+async fn review_host_case(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    payload: std::result::Result<Json<host_cases::Review>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let grant = session(&api, &headers).await?;
+    if grant.scope != Scope::Host || !is_host(grant.user_id) {
+        return Err(forbidden());
+    }
+    let Json(request) =
+        payload.map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    match api
+        .runtime
+        .review_host_case(grant.user_id, request)
+        .await
+        .map_err(storage_error)?
+    {
+        host_cases::Outcome::Saved(value) => Ok(Json(value)),
+        host_cases::Outcome::Conflict => Err(ApiError(StatusCode::CONFLICT, "settings_changed")),
+        host_cases::Outcome::Invalid => Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request")),
+        host_cases::Outcome::Forbidden => Err(forbidden()),
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GroupTarget {
@@ -689,6 +713,10 @@ pub(super) fn router(api: Api) -> Router {
         .route("/api/miniapp/logout", post(logout))
         .route("/api/host/query", post(host_query))
         .route("/api/host/case", post(read_host_case))
+        .route(
+            "/api/host/case/review",
+            axum::routing::patch(review_host_case),
+        )
         .route(
             "/api/host/case/reverse",
             axum::routing::patch(reverse_host_case),

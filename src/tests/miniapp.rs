@@ -186,6 +186,81 @@ async fn group_admin_can_edit_ot_text_but_cannot_save_after_revocation() {
 }
 
 #[tokio::test]
+async fn host_review_api_checks_scope_target_and_replays_the_saved_decision() {
+    let api = TestApi::new().await;
+    let mut case = dummy_case(ActionKind::PendingReport, -100, 300, Utc::now());
+    case.status = "pending_review".into();
+    api.runtime.persist_case(&case).await.unwrap();
+    let group = api.login(HOST_ID, -100).await;
+    let send = |token: String, body: serde_json::Value| {
+        api.request(reqwest::Method::PATCH, "/api/host/case/review")
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+    };
+    assert_eq!(
+        send(group, serde_json::json!({})).await.unwrap().status(),
+        403
+    );
+    let link = api.service.host_link(HOST_ID).await.unwrap();
+    let launch = link
+        .query_pairs()
+        .find(|(key, _)| key == "startapp")
+        .unwrap()
+        .1
+        .into_owned();
+    let session: serde_json::Value = api
+        .login_raw(&signed(
+            &api.runtime.config.bot_token,
+            HOST_ID,
+            &launch,
+            Utc::now().timestamp(),
+        ))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let token = session["token"].as_str().unwrap().to_string();
+    let snapshot = api
+        .runtime
+        .host_case(crate::host_cases::Query {
+            case_id: case.id.clone(),
+            offset: 0,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let mut body = serde_json::json!({"request_id":Uuid::new_v4().to_string(),"case_id":case.id,"target_user_id":999,"expected_revision":snapshot["revision"],"kind":"report","decision":"approve"});
+    assert_eq!(
+        send(token.clone(), body.clone()).await.unwrap().status(),
+        409
+    );
+    body["target_user_id"] = serde_json::json!(300);
+    let mut forged = body.clone();
+    forged["actor_id"] = serde_json::json!(200);
+    assert_eq!(send(token.clone(), forged).await.unwrap().status(), 400);
+    let saved = send(token.clone(), body.clone()).await.unwrap();
+    assert_eq!(saved.status(), 200);
+    assert_eq!(
+        saved.json::<serde_json::Value>().await.unwrap()["status"],
+        "ban_pending"
+    );
+    assert_eq!(
+        send(token.clone(), body.clone()).await.unwrap().status(),
+        200
+    );
+    body["request_id"] = serde_json::json!(Uuid::new_v4().to_string());
+    assert_eq!(send(token, body).await.unwrap().status(), 409);
+    assert!(!api
+        .telegram
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(m, _)| m == "banchatmember"));
+}
+
+#[tokio::test]
 async fn host_case_api_enforces_scope_target_and_confirmation_revision() {
     let api = TestApi::new().await;
     let case = dummy_case(ActionKind::AutoBan, -100, 300, Utc::now());
