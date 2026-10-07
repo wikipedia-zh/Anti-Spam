@@ -13,6 +13,8 @@ mod reversal_retry;
 use reversal_retry::{reverse_ban_case, spawn_reversal_worker};
 mod network_delivery;
 use network_delivery::{deliver_network_bans, spawn_network_worker};
+mod captcha;
+use captcha::{check_captcha_and_act, start_captcha_challenge, spawn_captcha_worker};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -285,11 +287,6 @@ struct Runtime {
     /// is a rolling behavioral signal, not something that needs to survive
     /// a restart.
     flood_tracker: Mutex<HashMap<(i64, i64), VecDeque<Instant>>>,
-    /// (chat_id, user_id) -> outstanding join CAPTCHA. In-memory only: a
-    /// restart mid-challenge just means the member gets re-challenged on
-    /// their next message, or the timeout task (also lost on restart)
-    /// simply never fires — no harm either way, just re-issue on demand.
-    pending_captcha: Mutex<HashMap<(i64, i64), PendingCaptcha>>,
     /// chat_id -> last few human (non-bot) messages, newest last. Backs
     /// check_guest_bot_and_act's invoker correlation: Bot API never tells us
     /// who summoned a guest-mode bot (that link only exists in MTProto's
@@ -336,12 +333,6 @@ struct RecentMessage {
     display_name: String,
     text: String,
     seen_at: Instant,
-}
-
-struct PendingCaptcha {
-    expected_answer: String,
-    expires_at: Instant,
-    challenge_message_id: MessageId,
 }
 
 #[derive(Clone)]
@@ -512,7 +503,6 @@ impl Runtime {
             pending_rule_additions: Mutex::new(HashMap::new()),
             group_module_cache: RwLock::new(HashMap::new()),
             flood_tracker: Mutex::new(HashMap::new()),
-            pending_captcha: Mutex::new(HashMap::new()),
             recent_messages: Mutex::new(HashMap::new()),
             group_seen_flush: Mutex::new(HashMap::new()),
             banned_groups: RwLock::new(banned_groups),
@@ -701,6 +691,9 @@ impl Runtime {
         }
         if user_version < 20 {
             Self::migrate_v19_to_v20(conn)?;
+        }
+        if user_version < 21 {
+            Self::migrate_v20_to_v21(conn)?;
         }
         Ok(())
     }
@@ -4440,127 +4433,6 @@ fn is_platform_pseudo_user(user_id: i64) -> bool {
     IDS.contains(&user_id)
 }
 
-const CAPTCHA_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Not cryptographically random and not meant to be - this only needs to be
-/// unpredictable enough to stop a dumb join-spam bot from guessing the
-/// answer, not to resist a targeted attack.
-fn generate_captcha_challenge(seed_extra: i64) -> (i64, i64, String) {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as i64)
-        .unwrap_or(0);
-    let seed = nanos.wrapping_add(seed_extra).unsigned_abs();
-    let a = (seed % 8 + 1) as i64;
-    let b = ((seed / 8) % 8 + 1) as i64;
-    (a, b, (a + b).to_string())
-}
-
-/// Restricts a new member to text-only, posts a simple arithmetic challenge,
-/// and schedules a kick if it goes unanswered. Reuses the same
-/// spawn-a-delayed-cleanup-task pattern `notify_group` already uses for its
-/// 180s auto-delete, just kicking instead of deleting when it fires.
-async fn start_captcha_challenge(bot: &Bot, runtime: &Arc<Runtime>, chat_id: ChatId, user: &teloxide::types::User) {
-    let user_id = user.id.0 as i64;
-    let (a, b, expected_answer) = generate_captcha_challenge(user_id);
-
-    if bot
-        .restrict_chat_member(chat_id, user.id, teloxide::types::ChatPermissions::SEND_MESSAGES)
-        .await
-        .is_err()
-    {
-        return;
-    }
-
-    let text = format!(
-        "{}（<code>{user_id}</code>）你好，為了防止機器人/廣告帳號，請在 {} 秒內直接回覆下面問題的答案（純數字），逾時將被移出群組：\n\n<b>{a} + {b} = ?</b>",
-        mention_link(user_id, &short_user(user)),
-        CAPTCHA_TIMEOUT.as_secs(),
-    );
-    let Ok(sent) = bot.send_message(chat_id, text).parse_mode(ParseMode::Html).await else { return; };
-
-    {
-        let mut pending = runtime.pending_captcha.lock().await;
-        pending.insert(
-            (chat_id.0, user_id),
-            PendingCaptcha { expected_answer, expires_at: Instant::now() + CAPTCHA_TIMEOUT, challenge_message_id: sent.id },
-        );
-    }
-
-    let bot = bot.clone();
-    let runtime = runtime.clone();
-    let challenge_message_id = sent.id;
-    tokio::spawn(async move {
-        sleep(CAPTCHA_TIMEOUT).await;
-        let still_pending = {
-            let mut pending = runtime.pending_captcha.lock().await;
-            match pending.get(&(chat_id.0, user_id)) {
-                Some(p) if p.challenge_message_id == challenge_message_id => {
-                    pending.remove(&(chat_id.0, user_id));
-                    true
-                }
-                _ => false,
-            }
-        };
-        if still_pending {
-            let _ = bot.delete_message(chat_id, challenge_message_id).await;
-            // Kick, not ban: failing to answer in time isn't proof of spam,
-            // just an unverified join.
-            let _ = kick_user(&bot, chat_id, user_id).await;
-        }
-    });
-}
-
-/// Checks an incoming message against a pending join CAPTCHA for its sender
-/// in this chat. Returns true if it consumed the message (whether right or
-/// wrong), so the caller can skip further processing for it.
-async fn check_captcha_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) -> bool {
-    let Some(user) = message.from.as_ref() else { return false; };
-    let key = (message.chat.id.0, user.id.0 as i64);
-
-    let (expected, challenge_message_id) = {
-        let pending = runtime.pending_captcha.lock().await;
-        let Some(entry) = pending.get(&key) else { return false; };
-        if Instant::now() > entry.expires_at {
-            // Already expired - let the timeout task's own kick handle it
-            // rather than racing it.
-            return false;
-        }
-        (entry.expected_answer.clone(), entry.challenge_message_id)
-    };
-
-    let answer = message.text().unwrap_or("").trim();
-    if answer == expected {
-        runtime.pending_captcha.lock().await.remove(&key);
-        let _ = bot
-            .restrict_chat_member(message.chat.id, user.id, teloxide::types::ChatPermissions::all())
-            .await;
-        let _ = bot.delete_message(message.chat.id, message.id).await;
-        // Clean up the question itself, not just the answer - it was still
-        // sitting in the chat with nothing telling anyone it got resolved.
-        let _ = bot.delete_message(message.chat.id, challenge_message_id).await;
-        if let Ok(sent) = bot
-            .send_message(message.chat.id, format!("✅ {}（<code>{}</code>）驗證通過，歡迎！", mention_link(user.id.0 as i64, &short_user(user)), user.id.0))
-            .parse_mode(ParseMode::Html)
-            .await
-        {
-            // Clear the welcome after 60s, same self-delete pattern as
-            // notify_group - it's a transient confirmation, not chat history.
-            let bot = bot.clone();
-            let chat_id = message.chat.id;
-            let sent_id = sent.id;
-            tokio::spawn(async move {
-                sleep(Duration::from_secs(60)).await;
-                let _ = bot.delete_message(chat_id, sent_id).await;
-            });
-        }
-    } else {
-        // Wrong guess: delete it and let them try again until the timeout.
-        let _ = bot.delete_message(message.chat.id, message.id).await;
-    }
-    true
-}
-
 async fn notify_bot_added(bot: &Bot, runtime: &Arc<Runtime>, message: &Message) -> bool {
     let Some(users) = message.new_chat_members() else { return false; };
     if users.is_empty() {
@@ -4726,7 +4598,7 @@ async fn process_new_group_member(bot: &Bot, runtime: &Arc<Runtime>, message: &M
     }
 
     if !banned && enabled.captcha {
-        start_captcha_challenge(bot, runtime, message.chat.id, user).await;
+        start_captcha_challenge(bot, runtime, message, user).await;
     }
 }
 
@@ -9342,6 +9214,7 @@ async fn main() -> Result<()> {
     let runtime = Arc::new(Runtime::load(config).await?);
     let reversal_worker = spawn_reversal_worker(bot.clone(), runtime.clone());
     let network_worker = spawn_network_worker(bot.clone(), runtime.clone());
+    let captcha_worker = spawn_captcha_worker(bot.clone(), runtime.clone());
 
     if let Some(owner_id) = runtime.config.owner_id {
         // Best-effort: a restart is exactly when this is most useful, but it
@@ -9588,6 +9461,8 @@ async fn main() -> Result<()> {
     let _ = reversal_worker.await;
     network_worker.abort();
     let _ = network_worker.await;
+    captcha_worker.abort();
+    let _ = captcha_worker.await;
 
     Ok(())
 }
@@ -9598,11 +9473,13 @@ mod tests {
     mod reliability;
     mod reversal_retry;
     mod network_delivery;
+    mod captcha;
 
     /// Exercise the real command handler without contacting Telegram.
     struct TelegramStub {
         bot: Bot,
         requests: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+        members: Arc<std::sync::Mutex<HashMap<(i64,i64),serde_json::Value>>>,
         stop: Arc<std::sync::atomic::AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
         address: std::net::SocketAddr,
@@ -9621,11 +9498,17 @@ mod tests {
         }
 
         fn with_api_errors(admin_ids: Vec<i64>, failures: Vec<(String, i64, serde_json::Value)>) -> Self {
+            Self::with_members(admin_ids,failures,false)
+        }
+
+        fn with_members(admin_ids: Vec<i64>, failures: Vec<(String,i64,serde_json::Value)>, stateful: bool) -> Self {
             use std::io::{BufRead, Read, Write};
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
             let captured = requests.clone();
+            let members = Arc::new(std::sync::Mutex::new(HashMap::<(i64,i64),serde_json::Value>::new()));
+            let member_state = members.clone();
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stopped = stop.clone();
             let thread = std::thread::spawn(move || {
@@ -9652,7 +9535,7 @@ mod tests {
                     reader.read_exact(&mut body).unwrap();
                     let args: serde_json::Value = serde_json::from_slice(&body).unwrap();
                     captured.lock().unwrap().push((method.clone(), args.clone()));
-                    let result = match method.as_str() {
+                    let mut result = match method.as_str() {
                         "getchatmember" => serde_json::json!({
                             "status": if admin_ids.contains(&args["user_id"].as_i64().unwrap()) { "creator" } else { "member" },
                             "is_anonymous": false,
@@ -9665,6 +9548,34 @@ mod tests {
                         }),
                         _ => serde_json::json!(true),
                     };
+                    if stateful {
+                        if let (Some(chat_id),Some(user_id))=(args["chat_id"].as_i64(),args["user_id"].as_i64()) {
+                            let key=(chat_id,user_id);
+                            let failed=failures.iter().any(|(m,c,_)| m==&method && *c==chat_id);
+                            let mut members=member_state.lock().unwrap();
+                            if method=="getchatmember" {
+                                if let Some(member)=members.get(&key) { result=member.clone(); }
+                            } else if !failed {
+                                let user=serde_json::json!({"id":user_id,"is_bot":false,"first_name":"Test"});
+                                match method.as_str() {
+                                    "restrictchatmember" => {
+                                        let mut member=args["permissions"].clone();
+                                        for key in serde_json::to_value(teloxide::types::ChatPermissions::all()).unwrap().as_object().unwrap().keys() {
+                                            member.as_object_mut().unwrap().entry(key.clone()).or_insert(serde_json::json!(false));
+                                        }
+                                        member["user"]=user;
+                                        member["status"]=serde_json::json!("restricted");
+                                        member["is_member"]=serde_json::json!(true);
+                                        member["until_date"]=args.get("until_date").cloned().unwrap_or(serde_json::json!(0));
+                                        members.insert(key,member);
+                                    }
+                                    "banchatmember" => { members.insert(key,serde_json::json!({"user":user,"status":"kicked","until_date":args.get("until_date").cloned().unwrap_or(serde_json::json!(0))})); }
+                                    "unbanchatmember" => { members.insert(key,serde_json::json!({"user":user,"status":"left"})); }
+                                    _=>{}
+                                }
+                            }
+                        }
+                    }
                     let response = if let Some((_, _, error)) = failures.iter().find(|(m, chat, _)| m == &method && args["chat_id"].as_i64() == Some(*chat)) {
                         error.clone()
                     } else {
@@ -9675,7 +9586,7 @@ mod tests {
             });
             let client = reqwest::Client::builder().no_proxy().build().unwrap();
             let bot = Bot::with_client("test", client).set_api_url(format!("http://{address}").parse().unwrap());
-            Self { bot, requests, stop, thread: Some(thread), address }
+            Self { bot, requests, members, stop, thread: Some(thread), address }
         }
     }
 
