@@ -17,6 +17,7 @@ mod maintenance;
 mod warning_queue;
 mod rule_updates;
 mod rule_notices;
+mod host_panel;
 use origin_retry::execute_auto_ban;
 use reliability::{passes_threshold, stable_probability};
 mod reversal_retry;
@@ -3212,6 +3213,7 @@ impl Runtime {
 #[derive(Debug, Clone)]
 enum ModerationCommand {
     Settings,
+    Manage,
     Start,
     Help,
     MyId,
@@ -3308,6 +3310,7 @@ fn parse_command(text: &str) -> ModerationCommand {
     let base = head.split('@').next().unwrap_or(head).to_lowercase();
     match base.as_str() {
         "/settings" => ModerationCommand::Settings,
+        "/manage" => ModerationCommand::Manage,
         "/spamban" | "/sb" => ModerationCommand::SpamBan(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
         "/mute" | "/m" => ModerationCommand::Mute(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
         "/kick" | "/k" => ModerationCommand::Kick(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
@@ -5924,6 +5927,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         ModerationCommand::Settings => {
             miniapp::launch(&bot, &runtime, &message).await?;
         }
+        ModerationCommand::Manage => {
+            miniapp::launch_host(&bot, &runtime, &message).await?;
+        }
         ModerationCommand::HostCtl(arg) => {
             // Host-only admin console. Gated on is_host - Telegram
             // authenticates from_id, so it's unforgeable. Anyone else gets no
@@ -6128,6 +6134,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             if is_host(from_id) && section.trim().is_empty() {
                 text.push_str(
                     "\n\n<b>━━ host ━━</b>\n\
+                     項目管理面板：私訊使用 <code>/manage</code>\n\
                      主持人終端：<code>/hostctl &lt;密碼&gt; ??</code> 查代碼表（GDS 語法，僅你可用，指令與回覆自動刪除）",
                 );
             }

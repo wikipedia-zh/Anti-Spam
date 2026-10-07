@@ -22,6 +22,7 @@
   const language = navigator.language.toLowerCase();
   let lang = language.startsWith('zh') ? (/hans|cn|sg/.test(language) ? 'zh-Hans' : 'zh-Hant') : 'en';
   let token = '', original = null, draft = null, globalThreshold = 0, canEdit = false;
+  let hostMode = false;
   let busy = false, blocked = false, pendingPatch = null, statusKey = 'loading', statusError = false;
   const t = key => copy[lang][key] || copy[lang].temporarily_unavailable;
   const groups = {protection:['flood','guestban','captcha','netban','nohalal'],messages:['nocontact','novoice','noexec','nosm','cmdclean']};
@@ -52,6 +53,7 @@
     }
   }
   function render() {
+    if (hostMode) { window.SPBHost.setLanguage(lang); return; }
     document.documentElement.lang = lang; document.title = `${t('heading')} — SPB`;
     document.querySelectorAll('[data-text]').forEach(el => { el.textContent = t(el.dataset.text); });
     document.querySelectorAll('[data-lang]').forEach(el => el.setAttribute('aria-pressed', String(el.dataset.lang === lang)));
@@ -124,6 +126,7 @@
     } finally { clearTimeout(timer); }
   }
   function fail(error, saving = false) {
+    if (hostMode) { window.SPBHost.fail(error); return; }
     const key = error.message;
     blocked = ['session_expired','forbidden','settings_changed'].includes(key);
     if (key === 'session_expired' || key === 'forbidden') token = '';
@@ -243,6 +246,11 @@
       const session = await request('session','POST',{init_data:app.initData});
       token = session.token;
       setTimeout(() => { token = ''; blocked = true; fail(new Error('session_expired')); },Math.max(0,session.expires_at * 1000 - Date.now()));
+      if (session.scope === 'host') {
+        hostMode = true;
+        await window.SPBHost.start(request,lang,() => { token = ''; });
+        return;
+      }
       await load();
     } catch (error) { fail(error); }
   }

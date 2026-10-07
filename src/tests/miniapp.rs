@@ -186,6 +186,158 @@ async fn group_admin_can_edit_ot_text_but_cannot_save_after_revocation() {
 }
 
 #[tokio::test]
+async fn host_sessions_are_separate_from_group_admin_and_maintainer_sessions() {
+    let api = TestApi::new().await;
+    api.runtime
+        .set_maintainer(200, true, Some(HOST_ID))
+        .await
+        .unwrap();
+    assert!(api.service.host_link(200).await.is_err());
+    for user in [200, HOST_ID] {
+        let token = api.login(user, -100).await;
+        assert_eq!(
+            api.request(reqwest::Method::POST, "/api/host/query")
+                .bearer_auth(&token)
+                .json(&serde_json::json!({"view":"overview"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+    }
+    let link = api.service.host_link(HOST_ID).await.unwrap();
+    let launch = link
+        .query_pairs()
+        .find(|(key, _)| key == "startapp")
+        .unwrap()
+        .1
+        .into_owned();
+    let raw = signed(
+        &api.runtime.config.bot_token,
+        HOST_ID,
+        &launch,
+        Utc::now().timestamp(),
+    );
+    let impostor = signed(
+        &api.runtime.config.bot_token,
+        200,
+        &launch,
+        Utc::now().timestamp(),
+    );
+    assert_eq!(api.login_raw(&impostor).await.status(), 401);
+    let response = api.login_raw(&raw).await;
+    assert_eq!(response.status(), 200);
+    let session: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(session["scope"], "host");
+    let token = session["token"].as_str().unwrap();
+    assert_eq!(api.login_raw(&raw).await.status(), 401);
+    assert_eq!(
+        api.save(token, 0, serde_json::json!({"netban":true}))
+            .await
+            .status(),
+        403
+    );
+    for view in ["overview", "cases", "groups", "people", "audit", "queue"] {
+        let response = api
+            .request(reqwest::Method::POST, "/api/host/query")
+            .bearer_auth(token)
+            .json(&serde_json::json!({"view":view}))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, 200, "{view}: {body}");
+    }
+    let logout = api
+        .request(reqwest::Method::POST, "/api/miniapp/logout")
+        .bearer_auth(token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), 200);
+    assert_eq!(
+        api.request(reqwest::Method::POST, "/api/host/query")
+            .bearer_auth(token)
+            .json(&serde_json::json!({"view":"overview"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+}
+
+#[tokio::test]
+async fn host_queries_paginate_filter_and_redact_private_diagnostics() {
+    let runtime = test_runtime().await;
+    for user in 100..127 {
+        let mut case = dummy_case(ActionKind::AutoBan, -100, user, Utc::now());
+        case.evidence_text = format!("{} test", runtime.config.bot_token);
+        runtime.persist_case(&case).await.unwrap();
+    }
+    let query = |view: &str, search: &str, offset| crate::host_panel::Query {
+        view: view.into(),
+        search: search.into(),
+        offset,
+        filter: String::new(),
+    };
+    let first = runtime.host_query(query("cases", "", 0)).await.unwrap();
+    assert_eq!(first["items"].as_array().unwrap().len(), 25);
+    assert_eq!(first["has_more"], true);
+    assert!(!first.to_string().contains(&runtime.config.bot_token));
+    let second = runtime.host_query(query("cases", "", 25)).await.unwrap();
+    assert_eq!(second["items"].as_array().unwrap().len(), 2);
+    assert_eq!(second["has_more"], false);
+    let filtered = runtime.host_query(query("cases", "100", 0)).await.unwrap();
+    assert_eq!(filtered["items"].as_array().unwrap().len(), 1);
+    assert_eq!(filtered["items"][0]["target_user_id"], 100);
+    assert!(runtime.host_query(query("config", "", 0)).await.is_err());
+    assert!(runtime
+        .host_query(query("cases", "", 100_001))
+        .await
+        .is_err());
+    let escaped = runtime
+        .host_query(query("cases", "' OR 1=1 --", 0))
+        .await
+        .unwrap();
+    assert!(escaped["items"].as_array().unwrap().is_empty());
+    let mut pending = dummy_case(ActionKind::PendingReport, -100, 300, Utc::now());
+    pending.status = "pending_review".into();
+    runtime.persist_case(&pending).await.unwrap();
+    let mut pending_query = query("cases", "", 0);
+    pending_query.filter = "pending_review".into();
+    let pending_rows = runtime.host_query(pending_query).await.unwrap();
+    assert_eq!(pending_rows["items"].as_array().unwrap().len(), 1);
+    assert_eq!(pending_rows["items"][0]["id"], pending.id);
+    let mut notice = dummy_case(ActionKind::AutoBan, -100, 400, Utc::now());
+    notice.evidence_text = "@ExampleBot".into();
+    runtime.capture_rules(&notice).await.unwrap();
+    runtime
+        .with_conn(|conn| {
+            conn.execute("UPDATE rule_notice_jobs SET last_error='timeout'", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let mut failures = query("queue", "", 0);
+    failures.filter = "failed".into();
+    let failed = runtime.host_query(failures).await.unwrap();
+    assert_eq!(failed["items"].as_array().unwrap().len(), 1);
+    let summary = runtime.host_query(query("overview", "", 0)).await.unwrap();
+    assert_eq!(summary["items"][0]["failed_work"], 1);
+    assert_eq!(summary["items"][0]["pending_reports"], 1);
+    let mut network = query("queue", "", 0);
+    network.filter = "network".into();
+    assert!(runtime.host_query(network).await.unwrap()["items"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
 async fn only_the_bound_user_can_redeem_a_launch_and_only_once() {
     let api = TestApi::new().await;
     let raw = api.init(200, -100).await;

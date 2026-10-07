@@ -67,6 +67,14 @@ struct Grant {
     user_id: i64,
     chat_id: i64,
     expires_at: i64,
+    scope: Scope,
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Scope {
+    Group,
+    Host,
 }
 
 struct Rate {
@@ -115,6 +123,15 @@ impl Service {
     }
 
     pub(super) async fn launch_link(&self, user_id: i64, chat_id: i64) -> Result<Url> {
+        self.scoped_link(user_id, chat_id, Scope::Group).await
+    }
+
+    pub(super) async fn host_link(&self, user_id: i64) -> Result<Url> {
+        anyhow::ensure!(is_host(user_id), "host access required");
+        self.scoped_link(user_id, user_id, Scope::Host).await
+    }
+
+    async fn scoped_link(&self, user_id: i64, chat_id: i64, scope: Scope) -> Result<Url> {
         let now = Utc::now().timestamp();
         let mut access = self.access.lock().await;
         access.launches.retain(|_, g| g.expires_at > now);
@@ -134,6 +151,7 @@ impl Service {
                 user_id,
                 chat_id,
                 expires_at: now + AUTH_TTL,
+                scope,
             },
         );
         let mut link = self.settings.launch_url.clone();
@@ -285,6 +303,9 @@ async fn boundary(State(api): State<Api>, request: Request, next: Next) -> Respo
 }
 
 async fn permissions(api: &Api, grant: &Grant) -> std::result::Result<bool, ApiError> {
+    if grant.scope != Scope::Group {
+        return Err(forbidden());
+    }
     if api.runtime.is_group_banned(grant.chat_id).await
         || (api.runtime.is_user_banned(grant.user_id).await
             && !api.runtime.is_maintainer(grant.user_id).await)
@@ -394,7 +415,16 @@ async fn login(
         }
         grant
     };
-    permissions(&api, &grant).await?;
+    match grant.scope {
+        Scope::Group => {
+            permissions(&api, &grant).await?;
+        }
+        Scope::Host => {
+            if !is_host(grant.user_id) {
+                return Err(forbidden());
+            }
+        }
+    }
     let mut access = api.service.access.lock().await;
     access.sessions.retain(|_, g| g.expires_at > now);
     if access.sessions.len() >= CAPACITY {
@@ -405,6 +435,7 @@ async fn login(
         return Err(unauthorized());
     }
     let token = Uuid::new_v4().simple().to_string();
+    let scope = grant.scope;
     let expires_at = Utc::now().timestamp() + SESSION_TTL;
     access.sessions.insert(
         token_hash(&token),
@@ -414,8 +445,46 @@ async fn login(
         },
     );
     Ok(Json(
-        serde_json::json!({"token":token,"expires_at":expires_at}),
+        serde_json::json!({"token":token,"expires_at":expires_at,"scope":scope}),
     ))
+}
+
+async fn host_query(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    payload: std::result::Result<Json<host_panel::Query>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let grant = session(&api, &headers).await?;
+    if grant.scope != Scope::Host || !is_host(grant.user_id) {
+        return Err(forbidden());
+    }
+    let Json(query) = payload.map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    if !query.valid() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
+    }
+    Ok(Json(
+        api.runtime.host_query(query).await.map_err(storage_error)?,
+    ))
+}
+
+async fn logout(
+    State(api): State<Api>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    session(&api, &headers).await?;
+    if let Some(token) = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    {
+        api.service
+            .access
+            .lock()
+            .await
+            .sessions
+            .remove(&token_hash(token));
+    }
+    Ok(Json(serde_json::json!({"logged_out":true})))
 }
 
 async fn read_settings(
@@ -473,6 +542,8 @@ async fn save_settings(
 pub(super) fn router(api: Api) -> Router {
     Router::new()
         .route("/api/miniapp/session", post(login))
+        .route("/api/miniapp/logout", post(logout))
+        .route("/api/host/query", post(host_query))
         .route(
             "/api/groups/current/settings",
             get(read_settings).patch(save_settings),
@@ -538,6 +609,41 @@ pub(super) async fn start(bot: Bot, runtime: Arc<Runtime>) -> Result<Option<Serv
         }
     });
     Ok(Some(Server { shutdown, task }))
+}
+
+pub(super) async fn launch_host(
+    bot: &Bot,
+    runtime: &Runtime,
+    message: &Message,
+) -> ResponseResult<()> {
+    let Some(user) = message.from.as_ref() else {
+        return Ok(());
+    };
+    if !is_host(user.id.0 as i64) {
+        return Ok(());
+    }
+    if !message.chat.is_private() {
+        return reply_ephemeral(bot, message, "請私訊機器人輸入 /manage。").await;
+    }
+    let Some(service) = runtime.miniapp.get() else {
+        return reply_ephemeral(bot, message, "管理面板尚未開放。").await;
+    };
+    match service.host_link(user.id.0 as i64).await {
+        Ok(link) => {
+            bot.send_message(
+                message.chat.id,
+                "項目管理\n此連結只限主持人本人使用，5 分鐘內有效。",
+            )
+            .reply_markup(InlineKeyboardMarkup::new(vec![vec![
+                InlineKeyboardButton::url("開啟管理面板", link),
+            ]]))
+            .await?;
+        }
+        Err(_) => {
+            reply_ephemeral(bot, message, "暫時無法開啟管理面板，請稍後再試。").await?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) async fn launch(bot: &Bot, runtime: &Runtime, message: &Message) -> ResponseResult<()> {

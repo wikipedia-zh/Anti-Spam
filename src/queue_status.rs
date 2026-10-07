@@ -37,7 +37,7 @@ pub(super) async fn handle(
 
 // The same completion predicates used by the workers, including notices
 // whose case has changed since the previous successful delivery.
-const WORK: &str = "
+pub(super) const WORK: &str = "
     SELECT '封禁' AS kind,j.case_id,c.chat_id,j.attempts,j.next_attempt_at,j.last_error
         FROM origin_ban_jobs j JOIN cases c ON c.id=j.case_id WHERE j.state='pending'
     UNION ALL SELECT '跨群封禁',case_id,chat_id,attempts,next_attempt_at,last_error

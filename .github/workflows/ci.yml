@@ -48,4 +48,5 @@ jobs:
           php -l web/settings/api.php
           php -l web/settings/index.php
           node --check web/settings/settings.js
+          node --check web/settings/host.js
           node --test tests/miniapp-proxy.cjs

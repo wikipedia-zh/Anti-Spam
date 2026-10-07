@@ -63,6 +63,19 @@ test('the proxy forwards fixed paths, exact JSON, and its own key', async () => 
   assert.equal(login.status,200); assert.equal(seen.at(-1).path,'/api/miniapp/session');
   assert.equal(seen.at(-1).headers.authorization,undefined);
 });
+test('management queries use fixed authenticated POST routes', async () => {
+  for (const [route,path] of [['host-query','/api/host/query'],['logout','/api/miniapp/logout']]) {
+    const count=seen.length;
+    assert.equal((await request(route,'GET')).status,405);
+    assert.equal((await request(route,'POST',{Authorization:''},'{}')).status,401);
+    assert.equal((await request(route,'POST',{Origin:'https://other.example'},'{}')).status,403);
+    assert.equal(seen.length,count);
+    assert.equal((await request(route,'POST',{},JSON.stringify({view:'overview'}))).status,200);
+    assert.equal(seen.at(-1).path,path);
+    assert.equal(seen.at(-1).headers.authorization,bearer);
+    assert.equal(seen.at(-1).headers['x-spb-proxy-key'],key);
+  }
+});
 test('conflicts survive the proxy and upstream failures stay private', async () => {
   responseStatus=409; responseBody=JSON.stringify({error:'settings_changed'});
   const conflict=await request(); assert.equal(conflict.status,409);
