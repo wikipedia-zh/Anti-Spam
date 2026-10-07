@@ -18,6 +18,7 @@ use captcha::{check_captcha_and_act, start_captcha_challenge, spawn_captcha_work
 mod edited_messages;
 use edited_messages::moderate_edited_message;
 mod notices;
+mod evaluation;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -1776,88 +1777,16 @@ impl Runtime {
         .await
     }
 
-    /// Hold-out evaluation: trains a throwaway model on part of the samples
-    /// and scores the rest, which the model has never seen.
-    ///
-    /// Exists because the spam threshold was being chosen by feel. Scoring
-    /// the live model against its own training data would just report how
-    /// well it memorised them, so this splits the samples deterministically
-    /// (every Nth row by rowid, no RNG - the same data gives the same answer
-    /// twice) and builds the counts in memory. Nothing here touches
-    /// `word_frequencies`, so it is safe to run on a live bot.
-    ///
-    /// Reports precision/recall at several thresholds, since the useful
-    /// question is not "is 0.85 good" but "what does moving it cost".
+    /// Evaluate grouped historical samples without changing the live model.
     async fn evaluate_model(&self, holdout_fraction: f64) -> Result<String> {
-        let samples: Vec<(i64, String, String)> = self
-            .with_conn(|conn| {
-                let mut stmt = conn.prepare("SELECT rowid, label, text FROM training_samples WHERE trim(text) != '' AND label IN ('spam','ham') ORDER BY rowid")?;
-                let mut rows = stmt.query([])?;
-                let mut out = Vec::new();
-                while let Some(row) = rows.next()? {
-                    out.push((row.get(0)?, row.get(1)?, row.get(2)?));
-                }
-                Ok(out)
-            })
-            .await?;
-
-        if samples.len() < 20 {
-            return Ok(format!("樣本太少（{}），至少需要 20 筆才能評估。", samples.len()));
-        }
-
-        let step = (1.0 / holdout_fraction).round().max(2.0) as usize;
-        let mut train = ModelState::default();
-        let mut test: Vec<(bool, String)> = Vec::new();
-        for (i, (_, label, text)) in samples.iter().enumerate() {
-            let is_spam = label == "spam";
-            if i % step == 0 {
-                test.push((is_spam, text.clone()));
-                continue;
-            }
-            let tokens = tokenize(text);
-            if is_spam {
-                train.spam_docs += 1;
-                for t in tokens { *train.spam_tokens.entry(t).or_default() += 1; }
-            } else {
-                train.ham_docs += 1;
-                for t in tokens { *train.ham_tokens.entry(t).or_default() += 1; }
-            }
-        }
-        if test.is_empty() || train.spam_docs == 0 || train.ham_docs == 0 {
-            return Ok("切分後其中一側沒有樣本，無法評估。".to_string());
-        }
-
-        let scored: Vec<(bool, f64)> = test.iter().map(|(is_spam, text)| (*is_spam, score_spam_from_text(&train, text))).collect();
+        let samples = self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT label, text FROM training_samples")?;
+            let rows = stmt.query_map([], |row| Ok(evaluation::Sample { label: row.get(0)?, text: row.get(1)? }))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        }).await?;
         let live = self.current_threshold().await.unwrap_or(self.config.spam_threshold);
-
-        let mut out = format!(
-            "<b>❖ 模型評估</b>\n訓練 {} 筆 / 測試 {} 筆（保留 1/{step}）\n目前門檻 {live:.2}\n\n<code>門檻  精確率  召回率   F1   漏放  誤封</code>",
-            train.spam_docs + train.ham_docs,
-            scored.len(),
-        );
-        let mut thresholds = vec![0.50, 0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95];
-        if !thresholds.iter().any(|t| (*t - live).abs() < 1e-9) {
-            thresholds.push(live);
-            thresholds.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        }
-        for t in thresholds {
-            let (mut tp, mut fp, mut fnn) = (0usize, 0usize, 0usize);
-            for (is_spam, score) in &scored {
-                match (*is_spam, passes_threshold(*score, t)) {
-                    (true, true) => tp += 1,
-                    (false, true) => fp += 1,
-                    (true, false) => fnn += 1,
-                    (false, false) => {}
-                }
-            }
-            let precision = if tp + fp == 0 { 0.0 } else { tp as f64 / (tp + fp) as f64 };
-            let recall = if tp + fnn == 0 { 0.0 } else { tp as f64 / (tp + fnn) as f64 };
-            let f1 = if precision + recall == 0.0 { 0.0 } else { 2.0 * precision * recall / (precision + recall) };
-            let marker = if (t - live).abs() < 1e-9 { " ←" } else { "" };
-            out.push_str(&format!("\n<code>{t:.2}   {:.3}   {:.3}  {:.3}   {fnn:>3}   {fp:>3}</code>{marker}", precision, recall, f1));
-        }
-        out.push_str("\n\n漏放 = 是垃圾但沒攔到；誤封 = 正常訊息被判垃圾。\n此評估只用訓練樣本，未動到實際模型。");
-        Ok(out)
+        let report = evaluation::evaluate(&samples, holdout_fraction, live)?;
+        Ok(evaluation::format_report(&report, live))
     }
 
     /// Rebuilds `word_frequencies` from scratch by replaying every
@@ -5418,10 +5347,13 @@ fn is_empty_ml_text(text: &str) -> bool {
 }
 
 fn score_spam_from_text(model: &ModelState, text: &str) -> f64 {
-    if is_empty_ml_text(text) {
+    score_spam_from_tokens(model, &tokenize(text))
+}
+
+fn score_spam_from_tokens(model: &ModelState, tokens: &[String]) -> f64 {
+    if tokens.is_empty() {
         return 0.0;
     }
-    let tokens = tokenize(text);
     let spam_total = model.spam_tokens.values().sum::<u64>() as f64 + 1.0;
     let ham_total = model.ham_tokens.values().sum::<u64>() as f64 + 1.0;
     let vocab = (model.spam_tokens.len() + model.ham_tokens.len()).max(1) as f64;
@@ -5432,8 +5364,8 @@ fn score_spam_from_text(model: &ModelState, text: &str) -> f64 {
     let mut log_ham = prior_ham.ln();
 
     for token in tokens {
-        let spam_count = *model.spam_tokens.get(&token).unwrap_or(&0);
-        let ham_count = *model.ham_tokens.get(&token).unwrap_or(&0);
+        let spam_count = *model.spam_tokens.get(token).unwrap_or(&0);
+        let ham_count = *model.ham_tokens.get(token).unwrap_or(&0);
         let spam_prob = (spam_count as f64 + 1.0) / (spam_total + vocab);
         let ham_prob = (ham_count as f64 + 1.0) / (ham_total + vocab);
         log_spam += spam_prob.ln();
@@ -9117,6 +9049,11 @@ async fn handle_exchange_post(bot: Bot, runtime: Arc<Runtime>, post: Message) ->
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<_> = env::args_os().skip(1).collect();
+    if !args.is_empty() {
+        anyhow::ensure!(args.len() == 2 && args[0] == "--evaluate-samples", "usage: --evaluate-samples <snapshot.json>");
+        return evaluation::run_offline(std::path::Path::new(&args[1]));
+    }
     // teloxide logs getUpdates failures, network retries and dispatcher
     // errors through the `log` crate. Without a backend those vanish - which
     // is why a stalled poller once went dark with no trace in kubectl logs.
@@ -9420,6 +9357,7 @@ mod tests {
     mod captcha;
     mod edited_messages;
     mod notices;
+    mod evaluation;
 
     /// Exercise the real command handler without contacting Telegram.
     struct TelegramStub {
@@ -10354,7 +10292,7 @@ mod tests {
     #[tokio::test]
     async fn ml_eval_is_read_only_and_reports_thresholds() {
         let runtime = test_runtime().await;
-        for i in 0..15 {
+        for i in 100..115 {
             train_spam(&runtime, &format!("免费代理 大水必红 赢钱 {i}"), None).await.unwrap();
             train_ham(&runtime, &format!("大家好 請問有人可以幫忙編輯條目嗎 {i}"), None).await.unwrap();
         }
