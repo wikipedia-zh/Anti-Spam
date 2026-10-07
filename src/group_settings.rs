@@ -9,6 +9,10 @@ pub(super) struct Snapshot {
     pub revision: i64,
     pub modules: BTreeMap<String, bool>,
     pub threshold_override: Option<f64>,
+    #[serde(default)]
+    pub ot_template: Option<String>,
+    #[serde(default = "default_ot_template")]
+    pub default_ot_template: String,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -25,6 +29,7 @@ pub(super) enum SaveResult {
     Conflict,
     Invalid,
     Forbidden,
+    InvalidTemplate,
 }
 
 pub(super) fn column(key: &str) -> Option<&'static str> {
@@ -66,10 +71,43 @@ fn snapshot(conn: &Connection, chat_id: i64) -> Result<Snapshot> {
         revision,
         modules,
         threshold_override,
+        ot_template: conn
+            .query_row(
+                "SELECT ot_template FROM group_warn_settings WHERE chat_id=?1",
+                [chat_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten(),
+        default_ot_template: default_ot_template(),
     })
 }
 
 impl Runtime {
+    pub(super) fn migrate_v26_to_v27(conn: &mut Connection) -> Result<()> {
+        let tx = conn.transaction()?;
+        // Commands and the panel share a revision, even for groups that only
+        // used /ot_template and have no module-settings row yet.
+        let bump = "INSERT INTO group_module_settings(chat_id,no_contact) SELECT NEW.chat_id,1
+                    WHERE NOT EXISTS(SELECT 1 FROM group_module_settings WHERE chat_id=NEW.chat_id);
+                    UPDATE group_module_settings SET settings_revision=settings_revision+1 WHERE chat_id=NEW.chat_id;";
+        tx.execute_batch(&format!(
+            "CREATE TRIGGER IF NOT EXISTS group_text_revision_insert AFTER INSERT ON group_warn_settings
+             WHEN NEW.ot_template IS NOT NULL BEGIN {bump} END;
+             CREATE TRIGGER IF NOT EXISTS group_text_revision_update AFTER UPDATE OF ot_template ON group_warn_settings
+             WHEN NEW.ot_template IS NOT OLD.ot_template BEGIN {bump} END;
+             CREATE TRIGGER IF NOT EXISTS group_text_revision_delete AFTER DELETE ON group_warn_settings
+             WHEN OLD.ot_template IS NOT NULL BEGIN
+               INSERT INTO group_module_settings(chat_id,no_contact) SELECT OLD.chat_id,1
+               WHERE NOT EXISTS(SELECT 1 FROM group_module_settings WHERE chat_id=OLD.chat_id);
+               UPDATE group_module_settings SET settings_revision=settings_revision+1 WHERE chat_id=OLD.chat_id;
+             END;
+             PRAGMA user_version=27;"
+        ))?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub(super) fn migrate_v21_to_v22(conn: &mut Connection) -> Result<()> {
         let tx = conn.transaction()?;
         Self::add_column_if_missing(
@@ -124,7 +162,7 @@ impl Runtime {
         if Uuid::parse_str(&patch.request_id).is_err()
             || patch.expected_revision < 0
             || patch.changes.is_empty()
-            || patch.changes.len() > PUBLIC_MODULES.len() + 1
+            || patch.changes.len() > PUBLIC_MODULES.len() + 2
         {
             return Ok(SaveResult::Invalid);
         }
@@ -139,6 +177,10 @@ impl Runtime {
                         .is_some_and(|v| v.is_finite() && (0.50..=0.99).contains(&v))
                 {
                     return Ok(SaveResult::Invalid);
+                }
+            } else if key == "ot_template" {
+                if !value.is_null() && !value.as_str().is_some_and(valid_ot_template) {
+                    return Ok(SaveResult::InvalidTemplate);
                 }
             } else if column(key).is_none() || !value.is_boolean() {
                 return Ok(SaveResult::Invalid);
@@ -162,9 +204,10 @@ impl Runtime {
             let before = snapshot(&tx, chat_id)?;
             if before.revision != patch.expected_revision { return Ok(SaveResult::Conflict); }
             let mut after = before.clone();
-            for (key,value) in patch.changes {
+            for (key,value) in &patch.changes {
                 if key == "threshold_override" { after.threshold_override = value.as_f64(); }
-                else { after.modules.insert(key, value.as_bool().unwrap()); }
+                else if key == "ot_template" { after.ot_template = value.as_str().map(str::to_string); }
+                else { after.modules.insert(key.clone(), value.as_bool().unwrap()); }
             }
             tx.execute("INSERT OR IGNORE INTO group_module_settings(chat_id,no_contact) VALUES (?1,1)", [chat_id])?;
             let mut assignments = Vec::new();
@@ -176,6 +219,10 @@ impl Runtime {
             assignments.push(format!("spam_threshold_override=?{}", values.len()+1));
             values.push(after.threshold_override.into());
             tx.execute(&format!("UPDATE group_module_settings SET {} WHERE chat_id=?1", assignments.join(",")), rusqlite::params_from_iter(values))?;
+            if patch.changes.contains_key("ot_template") {
+                tx.execute("INSERT INTO group_warn_settings(chat_id,ot_template) VALUES (?1,?2)
+                    ON CONFLICT(chat_id) DO UPDATE SET ot_template=excluded.ot_template",params![chat_id,after.ot_template])?;
+            }
             let saved = snapshot(&tx, chat_id)?;
             tx.execute("INSERT INTO group_settings_audit(request_id,chat_id,actor_user_id,expected_revision,changes_json,before_json,after_json,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![patch.request_id, chat_id, user_id, patch.expected_revision, changes, serde_json::to_string(&before)?, serde_json::to_string(&saved)?, Utc::now().to_rfc3339()])?;
@@ -186,4 +233,41 @@ impl Runtime {
             Ok(SaveResult::Saved(saved))
         }).await
     }
+}
+
+pub(super) fn valid_ot_template(text: &str) -> bool {
+    if text.trim().is_empty()
+        || text.encode_utf16().count() > 3500
+        || text
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        return false;
+    }
+    let (body, buttons) = extract_template_buttons(text);
+    if body.trim().is_empty()
+        || body
+            .replace("{user}", &"x".repeat(400))
+            .replace("{count}", &"9".repeat(20))
+            .encode_utf16()
+            .count()
+            > 4096
+    {
+        return false;
+    }
+    // Keep the existing template syntax; a panel save must not silently lose
+    // malformed buttons or store URLs Telegram cannot open.
+    static BUTTONS: OnceLock<StdRegex> = OnceLock::new();
+    let re =
+        BUTTONS.get_or_init(|| StdRegex::new(r"\{button(?::([^}\[]*))?\}\[([^\]]+)\]").unwrap());
+    let captures: Vec<_> = re.captures_iter(text).collect();
+    if captures.len() > 100 || re.replace_all(text, "").contains("{button") {
+        return false;
+    }
+    if captures.iter().any(|c| {
+        !Url::parse(c[2].trim()).is_ok_and(|u| matches!(u.scheme(), "https" | "http" | "tg"))
+    }) {
+        return false;
+    }
+    captures.len() == buttons.map(|b| b.inline_keyboard.len()).unwrap_or(0)
 }

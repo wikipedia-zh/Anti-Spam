@@ -6,6 +6,227 @@ fn patch(revision: i64, changes: serde_json::Value) -> Patch {
 }
 
 #[tokio::test]
+async fn panel_edits_existing_ot_text_without_changing_warning_policy() {
+    let runtime = test_runtime().await;
+    runtime
+        .set_warn_config(-100, 7, "kick", None)
+        .await
+        .unwrap();
+    runtime.set_ot_warn_count(-100, 2).await.unwrap();
+    runtime
+        .set_ot_template(-100, Some("{user} 舊文字 {count}"))
+        .await
+        .unwrap();
+    let initial = runtime.group_settings_snapshot(-100).await.unwrap();
+    assert_eq!(
+        initial.ot_template.as_deref(),
+        Some("{user} 舊文字 {count}")
+    );
+    assert_eq!(initial.default_ot_template, default_ot_template());
+    let text =
+        "<b>{user}</b> 請留意主題。\n目前 {count} 次。\n{button:群規}[https://example.com/rules]";
+    let update = patch(initial.revision, serde_json::json!({"ot_template":text}));
+    let saved = runtime
+        .save_group_settings(-100, 200, update.clone(), false)
+        .await
+        .unwrap();
+    let SaveResult::Saved(ref after) = saved else {
+        panic!("not saved");
+    };
+    assert_eq!(after.ot_template.as_deref(), Some(text));
+    assert_eq!(after.revision, initial.revision + 1);
+    assert_eq!(
+        runtime
+            .save_group_settings(-100, 200, update, false)
+            .await
+            .unwrap(),
+        saved
+    );
+    let policy = runtime.get_warn_settings(-100).await.unwrap();
+    assert_eq!(policy.ot_template.as_deref(), Some(text));
+    assert_eq!(
+        (
+            policy.threshold,
+            policy.action.as_str(),
+            policy.ot_warn_count
+        ),
+        (7, "kick", 2)
+    );
+    assert_eq!(
+        runtime.get_warn_settings(-200).await.unwrap().ot_template,
+        None
+    );
+    let SaveResult::Saved(reset) = runtime
+        .save_group_settings(
+            -100,
+            200,
+            patch(after.revision, serde_json::json!({"ot_template":null})),
+            false,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("not reset");
+    };
+    assert!(reset.ot_template.is_none());
+    assert_eq!(
+        runtime.get_warn_settings(-100).await.unwrap().ot_template,
+        None
+    );
+}
+
+#[tokio::test]
+async fn command_text_changes_conflict_with_an_open_panel() {
+    let runtime = test_runtime().await;
+    let before = runtime.group_settings_snapshot(-100).await.unwrap();
+    runtime
+        .set_ot_template(-100, Some("New text {user}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime
+            .save_group_settings(
+                -100,
+                200,
+                patch(
+                    before.revision,
+                    serde_json::json!({"ot_template":"Old draft"})
+                ),
+                false
+            )
+            .await
+            .unwrap(),
+        SaveResult::Conflict
+    );
+    let current = runtime.group_settings_snapshot(-100).await.unwrap();
+    runtime
+        .set_ot_template(-100, Some("New text {user}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime
+            .group_settings_snapshot(-100)
+            .await
+            .unwrap()
+            .revision,
+        current.revision
+    );
+    runtime.set_ot_template(-100, None).await.unwrap();
+    assert_eq!(
+        runtime
+            .save_group_settings(
+                -100,
+                200,
+                patch(current.revision, serde_json::json!({"flood":false})),
+                false
+            )
+            .await
+            .unwrap(),
+        SaveResult::Conflict
+    );
+}
+
+#[tokio::test]
+async fn failed_text_audit_rolls_back_text_modules_and_revision() {
+    let runtime = test_runtime().await;
+    runtime
+        .set_ot_template(-100, Some("Original"))
+        .await
+        .unwrap();
+    let before = runtime.group_settings_snapshot(-100).await.unwrap();
+    runtime.with_conn(|conn| {
+        conn.execute_batch("CREATE TRIGGER fail_text_audit BEFORE INSERT ON group_settings_audit BEGIN SELECT RAISE(ABORT,'injected'); END;")?;
+        Ok(())
+    }).await.unwrap();
+    assert!(runtime
+        .save_group_settings(
+            -100,
+            200,
+            patch(
+                before.revision,
+                serde_json::json!({"ot_template":"Changed","flood":false})
+            ),
+            false
+        )
+        .await
+        .is_err());
+    assert_eq!(runtime.group_settings_snapshot(-100).await.unwrap(), before);
+    assert_eq!(
+        runtime
+            .get_warn_settings(-100)
+            .await
+            .unwrap()
+            .ot_template
+            .as_deref(),
+        Some("Original")
+    );
+}
+
+#[tokio::test]
+async fn panel_rejects_invalid_text_but_keeps_legacy_templates_on_unrelated_saves() {
+    let runtime = test_runtime().await;
+    for text in [
+        serde_json::json!(true),
+        serde_json::json!("  \n "),
+        serde_json::json!("x".repeat(3501)),
+        serde_json::json!("🙂".repeat(1751)),
+        serde_json::json!("{user}".repeat(11)),
+        serde_json::json!("Hi {button}[javascript:alert(1)]"),
+        serde_json::json!("{button}[https://example.com]"),
+        serde_json::json!("Hi {button}[broken"),
+        serde_json::json!("Hi {button}[not a url]"),
+    ] {
+        assert_eq!(
+            runtime
+                .save_group_settings(
+                    -100,
+                    200,
+                    patch(0, serde_json::json!({"ot_template":text})),
+                    false
+                )
+                .await
+                .unwrap(),
+            SaveResult::InvalidTemplate
+        );
+    }
+    runtime
+        .with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO group_warn_settings(chat_id,ot_template) VALUES (-100,?1)",
+                ["x".repeat(5000)],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let before = runtime.group_settings_snapshot(-100).await.unwrap();
+    let SaveResult::Saved(saved) = runtime
+        .save_group_settings(
+            -100,
+            200,
+            patch(before.revision, serde_json::json!({"flood":false})),
+            false,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("not saved");
+    };
+    assert_eq!(saved.ot_template, before.ot_template);
+    assert!(!saved.modules["flood"]);
+}
+
+#[test]
+fn older_audit_snapshots_can_still_be_replayed_after_text_settings_are_added() {
+    let snapshot: crate::group_settings::Snapshot = serde_json::from_value(serde_json::json!({
+        "chat_id":-100,"title":"Test","revision":3,"modules":{},"threshold_override":null
+    }))
+    .unwrap();
+    assert!(snapshot.ot_template.is_none());
+    assert_eq!(snapshot.default_ot_template, default_ot_template());
+}
+
+#[tokio::test]
 async fn cancelled_requests_still_invalidate_cache_after_the_database_write() {
     for writer in 0..3 {
         let runtime = Arc::new(test_runtime().await);

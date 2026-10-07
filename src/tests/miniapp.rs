@@ -144,6 +144,48 @@ impl TestApi {
 }
 
 #[tokio::test]
+async fn group_admin_can_edit_ot_text_but_cannot_save_after_revocation() {
+    let api = TestApi::new().await;
+    let token = api.login(200, -100).await;
+    let response = api
+        .save(
+            &token,
+            0,
+            serde_json::json!({"ot_template":"{user} 請留意群組主題。{count}"}),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    let saved: serde_json::Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    assert_eq!(saved["ot_template"], "{user} 請留意群組主題。{count}");
+    let revision = saved["revision"].as_i64().unwrap();
+    let invalid = api
+        .save(&token, revision, serde_json::json!({"ot_template":" "}))
+        .await;
+    assert_eq!(invalid.status(), 400);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&invalid.text().await.unwrap()).unwrap()["error"],
+        "invalid_template"
+    );
+    api.telegram.members.lock().unwrap().insert(
+        (-100, 200),
+        serde_json::json!({"status":"member","user":{"id":200,"is_bot":false,"first_name":"Test"}}),
+    );
+    assert_eq!(
+        api.save(&token, revision, serde_json::json!({"ot_template":null}))
+            .await
+            .status(),
+        403
+    );
+    assert!(api
+        .runtime
+        .get_warn_settings(-100)
+        .await
+        .unwrap()
+        .ot_template
+        .is_some());
+}
+
+#[tokio::test]
 async fn only_the_bound_user_can_redeem_a_launch_and_only_once() {
     let api = TestApi::new().await;
     let raw = api.init(200, -100).await;

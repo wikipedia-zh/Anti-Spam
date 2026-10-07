@@ -463,6 +463,9 @@ async fn save_settings(
         group_settings::SaveResult::Invalid => {
             Err(ApiError(StatusCode::BAD_REQUEST, "invalid_settings"))
         }
+        group_settings::SaveResult::InvalidTemplate => {
+            Err(ApiError(StatusCode::BAD_REQUEST, "invalid_template"))
+        }
         group_settings::SaveResult::Forbidden => Err(forbidden()),
     }
 }

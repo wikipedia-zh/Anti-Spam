@@ -724,6 +724,9 @@ impl Runtime {
         if user_version < 26 {
             Self::migrate_v25_to_v26(conn)?;
         }
+        if user_version < 27 {
+            Self::migrate_v26_to_v27(conn)?;
+        }
         Ok(())
     }
 
@@ -3115,6 +3118,7 @@ impl Runtime {
     }
 
     async fn set_ot_template(&self, chat_id: i64, template: Option<&str>) -> Result<()> {
+        anyhow::ensure!(template.is_none_or(group_settings::valid_ot_template), "invalid OT template");
         let template = template.map(|s| s.to_string());
         self.with_conn(move |conn| {
             conn.execute(
@@ -7211,12 +7215,16 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 return Ok(());
             }
             if text_arg.trim().eq_ignore_ascii_case("reset") {
-                runtime.set_ot_template(chat_id, None).await.ok();
-                bot.send_message(message.chat.id, "已還原為預設範本。").await?;
+                let text = if runtime.set_ot_template(chat_id, None).await.is_ok() { "已還原為預設範本。" } else { "未能儲存，請稍後重試。" };
+                bot.send_message(message.chat.id, text).await?;
                 return Ok(());
             }
-            runtime.set_ot_template(chat_id, Some(text_arg.trim())).await.ok();
-            bot.send_message(message.chat.id, "已更新本群 /ot 範本。").await?;
+            if !group_settings::valid_ot_template(text_arg.trim()) {
+                reply_ephemeral(&bot, &message, "文字不可空白或超過 3500 字元；請檢查按鈕格式、網址及提及次數。").await?;
+                return Ok(());
+            }
+            let text = if runtime.set_ot_template(chat_id, Some(text_arg.trim())).await.is_ok() { "已更新本群 /ot 範本。" } else { "未能儲存，請稍後重試。" };
+            bot.send_message(message.chat.id, text).await?;
         }
         ModerationCommand::MaintainerDoc(sub) => {
             require_maintainer!(&bot, runtime, from_id, message, "只有維護人員可以使用此指令。");

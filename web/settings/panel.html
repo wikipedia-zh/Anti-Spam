@@ -46,6 +46,17 @@
           <p class="hint" data-text="thresholdHint">降低門檻會增加自動封禁，也可能增加誤判。</p>
         </fieldset>
       </section>
+      <section id="custom-text-section" aria-labelledby="custom-text-heading" hidden>
+        <div class="section-heading"><span class="eyebrow">04</span><h2 id="custom-text-heading" data-text="customText">群組自訂文字</h2></div>
+        <div class="text-setting">
+          <label class="text-label" for="ot-template" data-text="otTemplate">離題提醒 · /ot</label>
+          <p class="hint" data-text="otHint">用 {user} 提及用戶，{count} 顯示目前警告數。支援原有的 Telegram HTML 格式。</p>
+          <label class="global-choice"><input id="ot-default" type="checkbox"><span data-text="useDefaultText">使用預設文字</span></label>
+          <textarea id="ot-template" rows="6" maxlength="3500" required aria-describedby="ot-help ot-count" spellcheck="false" dir="auto"></textarea>
+          <div class="text-tools"><button id="ot-user" type="button" class="quiet" data-text="insertUser">插入用戶</button><button id="ot-count-token" type="button" class="quiet" data-text="insertCount">插入警告數</button><span id="ot-count" class="hint"></span></div>
+          <p id="ot-help" class="hint"><span data-text="otButtons">連結按鈕格式：</span> <code>{button:群規}[https://example.com/rules]</code></p>
+        </div>
+      </section>
       <p class="footnote" data-text="scope">設定只套用到本群。儲存前會列出變更供你確認。</p>
     </div>
   </main>

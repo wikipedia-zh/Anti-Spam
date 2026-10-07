@@ -16,6 +16,9 @@
       modules:{flood:['Flood protection','Mute users who send too many messages in a short time.'],guestban:['Guest bots','Delete posts and ban bots that are not group members.'],captcha:['Join verification','Ask new members to verify. Remove them if time runs out.'],netban:['Shared bans','Apply bans that meet the network’s eligibility rules.'],nohalal:['Text and name rules','Enable the existing NoHalal text and name checks.'],nocontact:['Contact cards','Block contact cards and ban the sender.'],novoice:['Voice messages','Block voice messages and ban the sender.'],noexec:['Executable files','Block executable files and ban the sender.'],nosm:['Service messages','Remove Telegram service messages, such as joins and departures.'],cmdclean:['Command cleanup','Delete unauthorized commands. Repeating within 24 hours triggers a 5-minute mute.']}
     }
   };
+  Object.assign(copy['zh-Hant'], {customText:'群組自訂文字',otTemplate:'離題提醒 · /ot',otHint:'用 {user} 提及用戶，{count} 顯示目前警告數。支援原有的 Telegram HTML 格式。',useDefaultText:'使用預設文字',otButtons:'連結按鈕格式：',insertUser:'插入用戶',insertCount:'插入警告數',defaultText:'預設',invalid_template:'文字不可空白或超過 3500 字元；請檢查按鈕格式、網址及提及次數。'});
+  Object.assign(copy['zh-Hans'], {customText:'群组自定义文字',otTemplate:'离题提醒 · /ot',otHint:'用 {user} 提及用户，{count} 显示目前警告数。支持原有的 Telegram HTML 格式。',useDefaultText:'使用默认文字',otButtons:'链接按钮格式：',insertUser:'插入用户',insertCount:'插入警告数',defaultText:'默认',invalid_template:'文字不可为空或超过 3500 字符；请检查按钮格式、网址及提及次数。'});
+  Object.assign(copy.en, {customText:'Group messages',otTemplate:'Off-topic notice · /ot',otHint:'Use {user} to mention the user and {count} for their warning count. Existing Telegram HTML formatting is supported.',useDefaultText:'Use default text',otButtons:'Link button format:',insertUser:'Insert user',insertCount:'Insert count',defaultText:'Default',invalid_template:'Enter up to 3500 characters. Check button syntax, URLs and the number of user mentions.'});
   const language = navigator.language.toLowerCase();
   let lang = language.startsWith('zh') ? (/hans|cn|sg/.test(language) ? 'zh-Hans' : 'zh-Hant') : 'en';
   let token = '', original = null, draft = null, globalThreshold = 0, canEdit = false;
@@ -28,6 +31,7 @@
     const result = {};
     for (const key of Object.keys(original.modules)) if (draft.modules[key] !== original.modules[key]) result[key] = draft.modules[key];
     if (canEdit && draft.threshold_override !== original.threshold_override) result.threshold_override = draft.threshold_override;
+    if (Object.hasOwn(original,'ot_template') && draft.ot_template !== original.ot_template) result.ot_template = draft.ot_template;
     return result;
   }
   function status(key, error = false) {
@@ -71,6 +75,9 @@
     $('threshold-controls').hidden = !canEdit;
     $('use-global').checked = draft.threshold_override === null;
     $('threshold-input').value = draft.threshold_override ?? globalThreshold;
+    $('custom-text-section').hidden = !Object.hasOwn(original,'ot_template');
+    $('ot-default').checked = draft.ot_template === null;
+    $('ot-template').value = draft.ot_template ?? original.default_ot_template ?? '';
     update();
   }
   function update() {
@@ -83,6 +90,11 @@
     $('threshold-value').textContent = thresholdText(draft.threshold_override ?? globalThreshold);
     $('use-global').disabled = busy || blocked;
     $('threshold-input').disabled = busy || blocked || draft.threshold_override === null;
+    $('ot-default').disabled = busy || blocked;
+    $('ot-template').disabled = busy || blocked || draft.ot_template === null;
+    $('ot-user').disabled = busy || blocked || draft.ot_template === null;
+    $('ot-count-token').disabled = busy || blocked || draft.ot_template === null;
+    $('ot-count').textContent = `${$('ot-template').value.length} / 3500`;
     $('save-bar').hidden = !count;
     $('unsaved').textContent = t('pending').replace('{n}',count);
     $('review').disabled = busy || blocked; $('discard').disabled = busy;
@@ -132,6 +144,7 @@
     finally { busy = false; update(); }
   }
   function valueLabel(key, value) {
+    if (key === 'ot_template') return value === null ? `${t('defaultText')}\n${original.default_ot_template}` : value;
     if (key !== 'threshold_override') return t(value ? 'on' : 'off');
     return value === null ? `${t('global')} · ${thresholdText(globalThreshold)}` : `${t('custom')} · ${thresholdText(value)}`;
   }
@@ -140,12 +153,17 @@
     if (canEdit && draft.threshold_override !== null && (!$('threshold-input').checkValidity() || !Number.isFinite(draft.threshold_override))) {
       status('invalidThreshold',true); $('threshold-input').focus(); return;
     }
+    if (Object.hasOwn(changes(),'ot_template') && draft.ot_template !== null && (!draft.ot_template.trim() || !$('ot-template').checkValidity())) {
+      status('invalid_template',true); $('ot-template').focus(); return;
+    }
     $('review-group').textContent = $('group-name').textContent;
     $('changes').replaceChildren(); $('save-error').textContent = '';
     for (const [key,value] of Object.entries(changes())) {
-      const term = document.createElement('dt'); term.textContent = key === 'threshold_override' ? t('threshold') : copy[lang].modules[key][0];
+      const term = document.createElement('dt'); term.textContent = key === 'ot_template' ? t('otTemplate') : key === 'threshold_override' ? t('threshold') : copy[lang].modules[key][0];
       const detail = document.createElement('dd');
-      detail.textContent = `${valueLabel(key,key === 'threshold_override' ? original.threshold_override : original.modules[key])} → ${valueLabel(key,value)}`;
+      const before = valueLabel(key,['threshold_override','ot_template'].includes(key) ? original[key] : original.modules[key]);
+      detail.textContent = key === 'ot_template' ? `${before}\n↓\n${valueLabel(key,value)}` : `${before} → ${valueLabel(key,value)}`;
+      if (key === 'ot_template') detail.className = 'text-change';
       $('changes').append(term,detail);
     }
     $('review-dialog').showModal(); update();
@@ -179,6 +197,20 @@
     $('threshold-input').value = draft.threshold_override ?? globalThreshold; pendingPatch = null; update();
   });
   $('threshold-input').addEventListener('input', () => { draft.threshold_override = $('threshold-input').valueAsNumber; pendingPatch = null; update(); });
+  $('ot-default').addEventListener('change', () => {
+    draft.ot_template = $('ot-default').checked ? null : $('ot-template').value;
+    $('ot-template').value = draft.ot_template ?? original.default_ot_template;
+    pendingPatch = null; update();
+  });
+  $('ot-template').addEventListener('input', () => { draft.ot_template = $('ot-template').value; pendingPatch = null; update(); });
+  for (const [id,marker] of [['ot-user','{user}'],['ot-count-token','{count}']]) {
+    $(id).addEventListener('click', () => {
+      const input = $('ot-template');
+      if (input.value.length - (input.selectionEnd - input.selectionStart) + marker.length > input.maxLength) return;
+      input.setRangeText(marker,input.selectionStart,input.selectionEnd,'end');
+      draft.ot_template = input.value; pendingPatch = null; update(); input.focus();
+    });
+  }
   $('review').addEventListener('click',review); $('discard').addEventListener('click',discard);
   $('save').addEventListener('click',save); $('cancel').addEventListener('click', () => $('review-dialog').close());
   $('review-dialog').addEventListener('cancel', event => { if (busy) event.preventDefault(); });
