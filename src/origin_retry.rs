@@ -18,6 +18,13 @@ struct OriginJob {
     error: Option<String>,
 }
 
+fn supported_action(action: &ActionKind) -> bool {
+    matches!(
+        action,
+        ActionKind::AutoBan | ActionKind::GuestBotBan | ActionKind::GuestInvokerBan
+    )
+}
+
 impl Runtime {
     pub(super) fn migrate_v22_to_v23(conn: &mut Connection) -> Result<()> {
         let tx = conn.transaction()?;
@@ -50,43 +57,69 @@ impl Runtime {
     }
 
     async fn queue_origin_ban(&self, case: CaseRecord, header: String) -> Result<()> {
+        self.queue_origin_bans(vec![(case, header)]).await
+    }
+
+    pub(super) async fn queue_origin_bans(&self, cases: Vec<(CaseRecord, String)>) -> Result<()> {
         anyhow::ensure!(
-            case.action == ActionKind::AutoBan,
+            cases.iter().all(|(case, _)| supported_action(&case.action)),
             "unsupported original ban action"
         );
-        let guards = self.origin_guards(&case).await;
+        let mut ids: Vec<_> = cases.iter().map(|(c, _)| c.id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        let mut review_guards = Vec::new();
+        for id in ids {
+            review_guards.push(self.review_guard(&id).await);
+        }
+        let mut users: Vec<_> = cases.iter().map(|(c, _)| c.target_user_id).collect();
+        users.sort();
+        users.dedup();
+        let mut user_guards = Vec::new();
+        for id in users {
+            user_guards.push(self.user_action_guard(id).await);
+        }
         self.with_conn(move |conn| {
             // Keep the locks until the blocking transaction ends, even if the
             // caller is cancelled while SQLite is busy.
-            let _guards = guards;
+            let _guards = (review_guards, user_guards);
             let tx = conn.transaction()?;
-            let inserted = tx.execute(
-                "INSERT OR IGNORE INTO cases (id,action,chat_id,target_user_id,target_name,
+            for (case, header) in cases {
+                let guest = matches!(
+                    case.action,
+                    ActionKind::GuestBotBan | ActionKind::GuestInvokerBan
+                );
+                let inserted = tx.execute(
+                    "INSERT OR IGNORE INTO cases (id,action,chat_id,target_user_id,target_name,
                  actor_user_id,actor_name,source_message_id,evidence_text,model_score,
                  matched_rule_id,matched_rule_pattern,status,log_message_id,created_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'ban_pending',NULL,?13)",
-                params![
-                    case.id,
-                    case.action.as_str(),
-                    case.chat_id,
-                    case.target_user_id,
-                    case.target_name,
-                    case.actor_user_id,
-                    case.actor_name,
-                    case.source_message_id,
-                    case.evidence_text,
-                    case.model_score,
-                    case.matched_rule_id,
-                    case.matched_rule_pattern,
-                    case.created_at.to_rfc3339()
-                ],
-            )?;
-            // Replays must not revive a reversed case or adopt a historical failure.
-            if inserted != 0 {
-                tx.execute(
-                    "INSERT INTO origin_ban_jobs(case_id,header,delete_done) VALUES (?1,?2,?3)",
-                    params![case.id, header, case.source_message_id.is_none()],
+                 SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'ban_pending',NULL,?13
+                 WHERE ?14=0 OR NOT EXISTS(SELECT 1 FROM cases WHERE (action=?2 OR (action='unbanned' AND matched_rule_pattern=?12)) AND chat_id=?3
+                     AND target_user_id=?4 AND source_message_id=?8)",
+                    params![
+                        case.id,
+                        case.action.as_str(),
+                        case.chat_id,
+                        case.target_user_id,
+                        case.target_name,
+                        case.actor_user_id,
+                        case.actor_name,
+                        case.source_message_id,
+                        case.evidence_text,
+                        case.model_score,
+                        case.matched_rule_id,
+                        case.matched_rule_pattern,
+                        case.created_at.to_rfc3339(),
+                        guest
+                    ],
                 )?;
+                // Replays must not revive a reversed case or adopt a historical failure.
+                if inserted != 0 {
+                    tx.execute(
+                        "INSERT INTO origin_ban_jobs(case_id,header,delete_done) VALUES (?1,?2,?3)",
+                        params![case.id, header, case.source_message_id.is_none()],
+                    )?;
+                }
             }
             tx.commit()?;
             Ok(())
@@ -113,7 +146,7 @@ impl Runtime {
                 },r.get::<_,u32>(6)?)),
             ).optional()?;
             let Some((job,attempts)) = job else { return Ok(None); };
-            if case.action != ActionKind::AutoBan || matches!(case.status.as_str(), "reversed" | "reversal_pending") {
+            if !supported_action(&case.action) || matches!(case.status.as_str(), "reversed" | "reversal_pending") {
                 tx.execute("UPDATE origin_ban_jobs SET state='cancelled' WHERE case_id=?1",params![case.id])?;
                 tx.commit()?;
                 return Ok(None);
@@ -135,18 +168,19 @@ impl Runtime {
     ) -> Result<()> {
         let job = job.clone();
         let state = state.to_string();
-        let threshold = self.current_threshold().await?;
+        let default_threshold = self.config.spam_threshold;
         let test_group = self.config.test_group_id;
         self.with_conn(move |conn| {
             let _guards = guards;
             let tx = conn.transaction()?;
+            let threshold = Self::load_threshold(&tx)?.unwrap_or(default_threshold);
             let changed = tx.execute(
                 "UPDATE origin_ban_jobs SET state=?2,ban_done=?3,delete_done=?4,outcome_unknown=?5,
                  announced_status=?6,broadcast_done=?7,last_error=?8 WHERE case_id=?1 AND state='pending'",
                 params![job.case.id,state,job.banned,job.deleted,job.unknown,job.announced,job.broadcast,job.error],
             )?;
             if changed != 0 {
-                tx.execute("UPDATE cases SET status=?2,log_message_id=?3 WHERE id=?1 AND action='auto_ban'
+                tx.execute("UPDATE cases SET status=?2,log_message_id=?3 WHERE id=?1 AND action IN ('auto_ban','guest_bot_ban','guest_invoker_ban')
                     AND status NOT IN ('reversed','reversal_pending')",
                     params![job.case.id,job.case.status,job.case.log_message_id])?;
                 if job.banned && netban_eligible(&job.case.action,job.case.model_score,threshold,job.case.matched_rule_pattern.as_deref()) {
@@ -187,6 +221,12 @@ async fn record_error(
 }
 
 async fn policy_still_enabled(runtime: &Runtime, case: &CaseRecord) -> Result<bool> {
+    if matches!(
+        case.action,
+        ActionKind::GuestBotBan | ActionKind::GuestInvokerBan
+    ) {
+        return Ok(runtime.get_group_modules(case.chat_id).await?.guest_ban);
+    }
     let Some(reason) = case.matched_rule_pattern.as_deref() else {
         return Ok(true);
     };
@@ -212,7 +252,11 @@ async fn policy_still_enabled(runtime: &Runtime, case: &CaseRecord) -> Result<bo
     }))
 }
 
-async fn attempt_origin_ban(bot: &Bot, runtime: &Runtime, case: CaseRecord) -> Result<bool> {
+pub(super) async fn attempt_origin_ban(
+    bot: &Bot,
+    runtime: &Runtime,
+    case: CaseRecord,
+) -> Result<bool> {
     let guards = runtime.origin_guards(&case).await;
     let Some(case) = runtime.load_case(&case.id).await? else {
         return Ok(false);
@@ -244,7 +288,15 @@ async fn attempt_origin_ban(bot: &Bot, runtime: &Runtime, case: CaseRecord) -> R
             })
             .await
             {
-                Ok(member) => member.kind.is_privileged(),
+                Ok(member) => {
+                    member.kind.is_privileged()
+                        || (job.case.action == ActionKind::GuestBotBan
+                            && !matches!(
+                                member.kind,
+                                teloxide::types::ChatMemberKind::Left
+                                    | teloxide::types::ChatMemberKind::Banned(_)
+                            ))
+                }
                 Err(err) => {
                     record_error(runtime, &mut job, "check_member", &err).await?;
                     runtime.save_origin_job(&job, "pending", guards).await?;
@@ -325,7 +377,11 @@ async fn attempt_origin_ban(bot: &Bot, runtime: &Runtime, case: CaseRecord) -> R
         }
     }
     job.case.status = match (job.banned, job.deleted) {
-        (true, true) => "auto_banned",
+        (true, true) => match job.case.action {
+            ActionKind::GuestBotBan => "guest_bot_banned",
+            ActionKind::GuestInvokerBan => "guest_invoker_banned",
+            _ => "auto_banned",
+        },
         (true, false) => "banned_delete_failed",
         (false, _) => "ban_failed",
     }

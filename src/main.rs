@@ -5916,9 +5916,6 @@ async fn check_guest_bot_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Me
         return false;
     }
 
-    let _ = bot.delete_message(message.chat.id, message.id).await;
-    let _ = bot.ban_chat_member(message.chat.id, user.id).await;
-
     let case = CaseRecord {
         id: Uuid::new_v4().to_string(),
         action: ActionKind::GuestBotBan,
@@ -5932,43 +5929,24 @@ async fn check_guest_bot_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Me
         model_score: None,
         matched_rule_id: None,
         matched_rule_pattern: Some("GUEST_MODE".to_string()),
-        status: "guest_bot_banned".to_string(),
+        status: "ban_pending".to_string(),
         log_message_id: None,
         created_at: Utc::now(),
     };
-    let log_message_id = log_action(bot, runtime, &case).await.unwrap_or_default();
-    let mut updated = case.clone();
-    updated.log_message_id = Some(log_message_id);
-    let _ = store_case(runtime, &updated).await;
-    let _ = notify_group(bot, runtime, &updated, log_message_id, "<b>訪客模式機器人已封鎖</b>").await;
-    propagate_network_ban(bot, runtime, &updated).await;
-    broadcast_ban_status(bot, runtime, updated.target_user_id, true).await;
-
-    // The guest bot's own account is only half the problem - whoever typed
-    // `@thatbot` to summon it is a real member who chose to invite spam into
-    // the chat, and their message (plus their spammy profile, per the
-    // report that led to this) stays behind untouched otherwise. Bot API
-    // gives no way to identify them directly (see this function's doc
-    // comment), so this falls back to the best available signal: the most
-    // recent bare `@thatbot` mention in this chat. See
-    // find_recent_guest_invoker for exactly what counts as a match.
+    let mut pending = vec![(case, "<b>訪客模式機器人已封鎖</b>".to_string())];
+    let mut invoker_message = None;
+    // Correlate the most recent bare mention before either API action. Both
+    // cases commit together, so a restart cannot lose the second target.
     if let Some(bot_username) = user.username.as_deref() {
         if let Some((invoker_id, invoker_msg_id, invoker_name, invoker_text)) = runtime.find_recent_guest_invoker(chat_id, bot_username).await {
-            // One summon can pull in several guest bots, so this runs once
-            // per guest reply for the same invoking message. Forget it
-            // immediately and skip anyone already banned here, so the
-            // follow-up replies don't each open a duplicate case.
-            runtime.forget_recent_message(chat_id, invoker_msg_id).await;
+            invoker_message = Some(invoker_msg_id);
             let invoker_exempt = runtime.is_maintainer(invoker_id).await
                 || is_platform_pseudo_user(invoker_id)
-                || runtime.is_global_whitelisted(invoker_id).await.unwrap_or(false)
-                || runtime.is_group_whitelisted(chat_id, invoker_id).await.unwrap_or(false)
+                || runtime.is_global_whitelisted(invoker_id).await.unwrap_or(true)
+                || runtime.is_group_whitelisted(chat_id, invoker_id).await.unwrap_or(true)
                 || runtime.find_active_ban_in_chat(chat_id, invoker_id).await.ok().flatten().is_some()
                 || is_group_admin(bot, message.chat.id, invoker_id).await;
             if !invoker_exempt {
-                let _ = bot.delete_message(message.chat.id, invoker_msg_id).await;
-                let _ = bot.ban_chat_member(message.chat.id, UserId(invoker_id as u64)).await;
-
                 let invoker_case = CaseRecord {
                     id: Uuid::new_v4().to_string(),
                     action: ActionKind::GuestInvokerBan,
@@ -5982,21 +5960,30 @@ async fn check_guest_bot_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Me
                     model_score: None,
                     matched_rule_id: None,
                     matched_rule_pattern: Some("GUEST_MODE_INVOKER".to_string()),
-                    status: "guest_invoker_banned".to_string(),
+                    status: "ban_pending".to_string(),
                     log_message_id: None,
                     created_at: Utc::now(),
                 };
-                let invoker_log_id = log_action(bot, runtime, &invoker_case).await.unwrap_or_default();
-                let mut invoker_updated = invoker_case.clone();
-                invoker_updated.log_message_id = Some(invoker_log_id);
-                let _ = store_case(runtime, &invoker_updated).await;
-                let _ = notify_group(bot, runtime, &invoker_updated, invoker_log_id, "<b>訪客模式召喚者已封鎖</b>").await;
-                propagate_network_ban(bot, runtime, &invoker_updated).await;
-                broadcast_ban_status(bot, runtime, invoker_updated.target_user_id, true).await;
+                pending.push((invoker_case, "<b>訪客模式召喚者已封鎖</b>".to_string()));
             }
         }
     }
-
+    if let Err(err) = runtime.queue_origin_bans(pending.clone()).await {
+        log::error!("could not queue guest bans: {err}");
+        return true;
+    }
+    if let Some(id) = invoker_message {
+        runtime.forget_recent_message(chat_id, id).await;
+    }
+    for (case, _) in pending {
+        let id = case.id.clone();
+        if let Err(err) = origin_retry::attempt_origin_ban(bot, runtime, case).await {
+            log::warn!("guest ban {id}: {}", notices::diagnostic(&runtime.config, &err.to_string()));
+        }
+        if let Err(err) = deliver_network_bans(bot, runtime, Some(&id)).await {
+            log::warn!("guest network ban {id}: {}", notices::diagnostic(&runtime.config, &err.to_string()));
+        }
+    }
     true
 }
 
@@ -9388,6 +9375,7 @@ mod tests {
     mod reversal_retry;
     mod network_delivery;
     mod origin_retry;
+    mod guest_delivery;
     mod captcha;
     mod edited_messages;
     mod notices;
