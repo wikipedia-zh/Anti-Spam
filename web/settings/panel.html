@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://telegram.org; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'">
+  <meta name="color-scheme" content="light dark">
+  <title>群組設定 — SPB</title>
+  <link rel="stylesheet" href="/fonts.css">
+  <link rel="stylesheet" href="settings.css">
+  <script src="https://telegram.org/js/telegram-web-app.js" defer></script>
+  <script src="settings.js" defer></script>
+</head>
+<body>
+  <header class="masthead">
+    <a class="wordmark" href="/" aria-label="SPB">spb.</a>
+    <nav aria-label="Language" class="languages">
+      <button type="button" data-lang="en" lang="en">EN</button>
+      <button type="button" data-lang="zh-Hant" lang="zh-Hant" aria-pressed="true">繁</button>
+      <button type="button" data-lang="zh-Hans" lang="zh-Hans">简</button>
+    </nav>
+  </header>
+  <main>
+    <p class="eyebrow">SPAM PROTECTION BOT / SETTINGS</p>
+    <h1 data-text="heading">群組設定</h1>
+    <p id="group-name" class="group-name" dir="auto"></p>
+    <p id="status" role="status" aria-live="polite">正在確認權限…</p>
+    <button id="reload" type="button" hidden data-text="reload">重新讀取</button>
+    <div id="settings" hidden>
+      <section aria-labelledby="protection-heading">
+        <div class="section-heading"><span class="eyebrow">01</span><h2 id="protection-heading" data-text="protection">群組防護</h2></div>
+        <div id="protection"></div>
+      </section>
+      <section aria-labelledby="messages-heading">
+        <div class="section-heading"><span class="eyebrow">02</span><h2 id="messages-heading" data-text="messages">訊息管理</h2></div>
+        <div id="messages"></div>
+      </section>
+      <section aria-labelledby="model-heading">
+        <div class="section-heading"><span class="eyebrow">03</span><h2 id="model-heading" data-text="model">垃圾訊息判斷</h2></div>
+        <div class="threshold-row"><div><h3 data-text="threshold">封禁門檻</h3><p id="threshold-note"></p></div><output id="threshold-value"></output></div>
+        <fieldset id="threshold-controls" hidden>
+          <label class="global-choice"><input id="use-global" type="checkbox"><span data-text="useGlobal">跟隨全域設定</span></label>
+          <label class="number-label" for="threshold-input" data-text="customThreshold">本群門檻（0.50–0.99）</label>
+          <input id="threshold-input" type="number" min="0.50" max="0.99" step="0.01" inputmode="decimal">
+          <p class="hint" data-text="thresholdHint">降低門檻會增加自動封禁，也可能增加誤判。</p>
+        </fieldset>
+      </section>
+      <p class="footnote" data-text="scope">設定只套用到本群。儲存前會列出變更供你確認。</p>
+    </div>
+  </main>
+  <footer id="save-bar" hidden><div><p id="unsaved" role="status"></p><button id="discard" type="button" class="quiet" data-text="discard">取消變更</button></div><button id="review" type="button" class="primary" data-text="review">查看變更</button></footer>
+  <dialog id="review-dialog" aria-labelledby="review-heading">
+    <p class="eyebrow">SPB / SETTINGS</p><h2 id="review-heading" data-text="review">查看變更</h2>
+    <p id="review-group" dir="auto"></p><dl id="changes"></dl>
+    <p id="save-error" role="alert"></p>
+    <div class="dialog-actions"><button id="cancel" type="button" data-text="back">返回</button><button id="save" type="button" class="primary" data-text="save">儲存設定</button></div>
+  </dialog>
+  <dialog id="discard-dialog" aria-labelledby="discard-heading">
+    <h2 id="discard-heading" data-text="leave">放棄尚未儲存的變更？</h2>
+    <div class="dialog-actions"><button id="keep-editing" type="button" data-text="back">返回</button><button id="confirm-discard" type="button" class="primary" data-text="discard">取消變更</button></div>
+  </dialog>
+  <noscript>請啟用 JavaScript，並從 Telegram 群組的 /settings 連結開啟。</noscript>
+</body>
+</html>

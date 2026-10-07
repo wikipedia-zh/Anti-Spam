@@ -42,3 +42,10 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release
+
+      - name: Check settings proxy
+        run: |
+          php -l web/settings/api.php
+          php -l web/settings/index.php
+          node --check web/settings/settings.js
+          node --test tests/miniapp-proxy.cjs

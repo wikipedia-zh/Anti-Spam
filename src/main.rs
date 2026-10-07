@@ -19,6 +19,8 @@ mod edited_messages;
 use edited_messages::moderate_edited_message;
 mod notices;
 mod evaluation;
+mod group_settings;
+mod miniapp;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -285,7 +287,7 @@ struct Runtime {
     mass_train_buffer: Mutex<HashMap<i64, Vec<String>>>,
     mass_train_mode: Mutex<HashMap<i64, String>>,
     pending_rule_additions: Mutex<HashMap<i64, String>>,
-    group_module_cache: RwLock<HashMap<i64, GroupModuleSettings>>,
+    group_module_cache: Arc<RwLock<HashMap<i64, GroupModuleSettings>>>,
     /// (chat_id, user_id) -> recent message timestamps within the flood
     /// window. In-memory only and reset on restart is fine — flood control
     /// is a rolling behavioral signal, not something that needs to survive
@@ -328,6 +330,7 @@ struct Runtime {
     /// trip against Telegram's rate limit before the message could even be
     /// looked at.
     me_id: OnceLock<UserId>,
+    miniapp: OnceLock<Arc<miniapp::Service>>,
 }
 
 /// One entry in `Runtime::recent_messages`. See that field's doc comment.
@@ -505,7 +508,7 @@ impl Runtime {
             mass_train_buffer: Mutex::new(HashMap::new()),
             mass_train_mode: Mutex::new(HashMap::new()),
             pending_rule_additions: Mutex::new(HashMap::new()),
-            group_module_cache: RwLock::new(HashMap::new()),
+            group_module_cache: Arc::new(RwLock::new(HashMap::new())),
             flood_tracker: Mutex::new(HashMap::new()),
             recent_messages: Mutex::new(HashMap::new()),
             group_seen_flush: Mutex::new(HashMap::new()),
@@ -513,6 +516,7 @@ impl Runtime {
             banned_users: RwLock::new(banned_users),
             maintainers: RwLock::new(maintainers),
             me_id: OnceLock::new(),
+            miniapp: OnceLock::new(),
         })
     }
 
@@ -698,6 +702,9 @@ impl Runtime {
         }
         if user_version < 21 {
             Self::migrate_v20_to_v21(conn)?;
+        }
+        if user_version < 22 {
+            Self::migrate_v21_to_v22(conn)?;
         }
         Ok(())
     }
@@ -2361,6 +2368,10 @@ impl Runtime {
         if let Some(cached) = self.group_module_cache.read().await.get(&chat_id) {
             return Ok(cached.clone());
         }
+        let mut cache = self.group_module_cache.write().await;
+        if let Some(cached) = cache.get(&chat_id) {
+            return Ok(cached.clone());
+        }
         let settings = self
             .with_conn(move |conn| {
                 conn.execute(
@@ -2392,11 +2403,12 @@ impl Runtime {
                 }
             })
             .await?;
-        self.group_module_cache.write().await.insert(chat_id, settings.clone());
+        cache.insert(chat_id, settings.clone());
         Ok(settings)
     }
 
     async fn set_group_module(&self, chat_id: i64, module: &str, enabled: bool) -> Result<()> {
+        let mut cache = self.group_module_cache.clone().write_owned().await;
         let module = module.to_string();
         self.with_conn(move |conn| {
             conn.execute(
@@ -2472,14 +2484,15 @@ impl Runtime {
             }
                 _ => {}
             }
+            cache.remove(&chat_id);
             Ok(())
         })
         .await?;
-        self.group_module_cache.write().await.remove(&chat_id);
         Ok(())
     }
 
     async fn set_group_threshold(&self, chat_id: i64, value: Option<f64>) -> Result<()> {
+        let mut cache = self.group_module_cache.clone().write_owned().await;
         self.with_conn(move |conn| {
             conn.execute(
                 "INSERT OR IGNORE INTO group_module_settings (chat_id, no_contact) VALUES (?1, 1)",
@@ -2489,10 +2502,10 @@ impl Runtime {
                 "UPDATE group_module_settings SET spam_threshold_override = ?2 WHERE chat_id = ?1",
                 params![chat_id, value],
             )?;
+            cache.remove(&chat_id);
             Ok(())
         })
         .await?;
-        self.group_module_cache.write().await.remove(&chat_id);
         Ok(())
     }
 
@@ -2568,7 +2581,7 @@ impl Runtime {
         let _ = self
             .with_conn(move |conn| {
                 conn.execute(
-                    "INSERT INTO group_module_settings (chat_id, title, last_seen) VALUES (?1, ?2, ?3)
+                    "INSERT INTO group_module_settings (chat_id, title, last_seen, no_contact) VALUES (?1, ?2, ?3, 1)
                      ON CONFLICT(chat_id) DO UPDATE SET
                          title = COALESCE(excluded.title, group_module_settings.title),
                          last_seen = excluded.last_seen",
@@ -3266,6 +3279,7 @@ impl Runtime {
 
 #[derive(Debug, Clone)]
 enum ModerationCommand {
+    Settings,
     Start,
     Help,
     MyId,
@@ -3360,6 +3374,7 @@ fn parse_command(text: &str) -> ModerationCommand {
     let head = text.split_whitespace().next().unwrap_or("");
     let base = head.split('@').next().unwrap_or(head).to_lowercase();
     match base.as_str() {
+        "/settings" => ModerationCommand::Settings,
         "/spamban" | "/sb" => ModerationCommand::SpamBan(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
         "/mute" | "/m" => ModerationCommand::Mute(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
         "/kick" | "/k" => ModerationCommand::Kick(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
@@ -3780,6 +3795,7 @@ fn help_text() -> String {
         "<code>/unban</code> <code>/unmute</code> 解除（僅本群）\n",
         "<code>/white</code> <code>/unwhite</code> 本群白名單\n",
         "· 加 <code>-global</code> 為全域白名單\n",
+        "<code>/settings</code> 開啟群組設定面板\n",
         "<code>/module</code> 查看模組開關狀態\n",
         "<code>/module 名稱 on|off</code> 切換\n",
         "<code>/module all on|off</code> 全開／全關\n",
@@ -6184,6 +6200,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
     }
 
     match cmd {
+        ModerationCommand::Settings => {
+            miniapp::launch(&bot, &runtime, &message).await?;
+        }
         ModerationCommand::HostCtl(arg) => {
             // Host-only admin console. Gated on is_host - Telegram
             // authenticates from_id, so it's unforgeable. Anyone else gets no
@@ -9064,6 +9083,7 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     let bot = Bot::new(config.bot_token.clone());
     let runtime = Arc::new(Runtime::load(config).await?);
+    let miniapp_server = miniapp::start(bot.clone(), runtime.clone()).await?;
     let reversal_worker = spawn_reversal_worker(bot.clone(), runtime.clone());
     let network_worker = spawn_network_worker(bot.clone(), runtime.clone());
     let captcha_worker = spawn_captcha_worker(bot.clone(), runtime.clone());
@@ -9338,6 +9358,7 @@ async fn main() -> Result<()> {
         .build();
 
     dispatcher.dispatch().await;
+    if let Some(server) = miniapp_server { server.stop().await; }
     reversal_worker.abort();
     let _ = reversal_worker.await;
     network_worker.abort();
@@ -9358,6 +9379,8 @@ mod tests {
     mod edited_messages;
     mod notices;
     mod evaluation;
+    mod group_settings;
+    mod miniapp;
 
     /// Exercise the real command handler without contacting Telegram.
     struct TelegramStub {
@@ -9425,6 +9448,7 @@ mod tests {
                             "is_anonymous": false,
                             "user": {"id": args["user_id"], "is_bot": false, "first_name": "Test"}
                         }),
+                        "getchat" => serde_json::json!({"id":args["chat_id"],"type":"supergroup","title":"Test","accent_color_id":0,"max_reaction_count":11,"accepted_gift_types":{"unlimited_gifts":false,"limited_gifts":false,"unique_gifts":false,"premium_subscription":false}}),
                         "sendmessage" => serde_json::json!({
                             "message_id": 100, "date": 0,
                             "chat": {"id": args["chat_id"], "type": "supergroup", "title": "Test"},
