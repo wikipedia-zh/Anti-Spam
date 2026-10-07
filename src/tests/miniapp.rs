@@ -186,6 +186,93 @@ async fn group_admin_can_edit_ot_text_but_cannot_save_after_revocation() {
 }
 
 #[tokio::test]
+async fn rule_management_requires_host_scope_and_trials_never_touch_telegram() {
+    let api = TestApi::new().await;
+    let group = api.login(HOST_ID, -100).await;
+    for (path, method) in [
+        ("/api/host/rule", reqwest::Method::POST),
+        ("/api/host/rule", reqwest::Method::PATCH),
+        ("/api/host/rule/test", reqwest::Method::POST),
+    ] {
+        assert_eq!(
+            api.request(method, path)
+                .bearer_auth(&group)
+                .body("{}")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+    }
+    let link = api.service.host_link(HOST_ID).await.unwrap();
+    let launch = link
+        .query_pairs()
+        .find(|(k, _)| k == "startapp")
+        .unwrap()
+        .1
+        .into_owned();
+    let session: serde_json::Value = api
+        .login_raw(&signed(
+            &api.runtime.config.bot_token,
+            HOST_ID,
+            &launch,
+            Utc::now().timestamp(),
+        ))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let token = session["token"].as_str().unwrap();
+    let body = serde_json::json!({"request_id":Uuid::new_v4().to_string(),"rule_id":null,"expected_revision":0,"rule":{"pattern":"casino","description":"test"}});
+    let mut forged = body.clone();
+    forged["actor_id"] = serde_json::json!(200);
+    assert_eq!(
+        api.request(reqwest::Method::PATCH, "/api/host/rule")
+            .bearer_auth(token)
+            .body(forged.to_string())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    for (path, method, payload) in [
+        (
+            "/api/host/rule/test",
+            reqwest::Method::POST,
+            serde_json::json!({"pattern":"casino","text":"casino"}),
+        ),
+        ("/api/host/rule", reqwest::Method::PATCH, body.clone()),
+        ("/api/host/rule", reqwest::Method::PATCH, body),
+    ] {
+        loop {
+            let result = api
+                .request(method.clone(), path)
+                .bearer_auth(token)
+                .body(payload.to_string())
+                .send()
+                .await
+                .unwrap();
+            if result.status() == 429 {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            assert_eq!(result.status(), 200);
+            break;
+        }
+    }
+    assert_eq!(api.runtime.list_spam_rules().await.unwrap().len(), 1);
+    assert!(api
+        .telegram
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(method, _)| method != "banchatmember" && method != "sendmessage"));
+}
+
+#[tokio::test]
 async fn host_review_api_checks_scope_target_and_replays_the_saved_decision() {
     let api = TestApi::new().await;
     let mut case = dummy_case(ActionKind::PendingReport, -100, 300, Utc::now());

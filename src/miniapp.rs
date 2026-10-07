@@ -655,6 +655,70 @@ async fn save_host_role(
     }
 }
 
+fn rule_response(
+    outcome: host_rules::Outcome,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    match outcome {
+        host_rules::Outcome::Saved(value) => Ok(Json(value)),
+        host_rules::Outcome::Conflict => Err(ApiError(StatusCode::CONFLICT, "settings_changed")),
+        host_rules::Outcome::Invalid => Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request")),
+        host_rules::Outcome::Forbidden => Err(forbidden()),
+        host_rules::Outcome::Busy => Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "rate_limited")),
+    }
+}
+
+async fn read_host_rule(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    payload: std::result::Result<Json<host_rules::Target>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let grant = session(&api, &headers).await?;
+    if grant.scope != Scope::Host || !is_host(grant.user_id) {
+        return Err(forbidden());
+    }
+    let Json(target) = payload.map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    rule_response(
+        api.runtime
+            .host_rule(grant.user_id, target)
+            .await
+            .map_err(storage_error)?,
+    )
+}
+async fn save_host_rule(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    payload: std::result::Result<Json<host_rules::Patch>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let grant = session(&api, &headers).await?;
+    if grant.scope != Scope::Host || !is_host(grant.user_id) {
+        return Err(forbidden());
+    }
+    let Json(patch) = payload.map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    rule_response(
+        api.runtime
+            .save_host_rule(grant.user_id, patch)
+            .await
+            .map_err(storage_error)?,
+    )
+}
+async fn test_host_rule(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    payload: std::result::Result<Json<host_rules::Trial>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let grant = session(&api, &headers).await?;
+    if grant.scope != Scope::Host || !is_host(grant.user_id) {
+        return Err(forbidden());
+    }
+    let Json(trial) = payload.map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    rule_response(
+        api.runtime
+            .test_host_rule(grant.user_id, trial)
+            .await
+            .map_err(storage_error)?,
+    )
+}
+
 async fn read_settings(
     State(api): State<Api>,
     headers: HeaderMap,
@@ -723,6 +787,8 @@ pub(super) fn router(api: Api) -> Router {
         )
         .route("/api/host/group-link", post(host_group_link))
         .route("/api/host/role", post(read_host_role).patch(save_host_role))
+        .route("/api/host/rule", post(read_host_rule).patch(save_host_rule))
+        .route("/api/host/rule/test", post(test_host_rule))
         .route(
             "/api/groups/current/settings",
             get(read_settings).patch(save_settings),

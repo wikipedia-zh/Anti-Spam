@@ -29,12 +29,13 @@ $route = $_GET['route'] ?? '';
 $paths = ['session' => '/api/miniapp/session', 'settings' => '/api/groups/current/settings',
     'host-query' => '/api/host/query', 'logout' => '/api/miniapp/logout', 'host-role' => '/api/host/role',
     'host-group-link' => '/api/host/group-link', 'host-case' => '/api/host/case',
-    'host-case-reverse' => '/api/host/case/reverse', 'host-case-review' => '/api/host/case/review'];
+    'host-case-reverse' => '/api/host/case/reverse', 'host-case-review' => '/api/host/case/review',
+    'host-rule' => '/api/host/rule', 'host-rule-test' => '/api/host/rule/test'];
 if (!is_string($route) || !isset($paths[$route])) fail(404, 'invalid_request');
-if ((in_array($route, ['session', 'host-query', 'logout', 'host-group-link', 'host-case'], true) && $method !== 'POST')
+if ((in_array($route, ['session', 'host-query', 'logout', 'host-group-link', 'host-case', 'host-rule-test'], true) && $method !== 'POST')
     || (in_array($route, ['host-case-reverse', 'host-case-review'], true) && $method !== 'PATCH')
     || ($route === 'settings' && !in_array($method, ['GET', 'PATCH'], true))
-    || ($route === 'host-role' && !in_array($method, ['POST', 'PATCH'], true))) {
+    || (in_array($route, ['host-role', 'host-rule'], true) && !in_array($method, ['POST', 'PATCH'], true))) {
     fail(405, 'invalid_request');
 }
 $headers = ['Origin: ' . $origin, 'X-SPB-Proxy-Key: ' . $key, 'Content-Type: application/json'];

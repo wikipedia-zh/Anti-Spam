@@ -32,7 +32,7 @@ impl Query {
     pub(super) fn valid(&self) -> bool {
         matches!(
             self.view.as_str(),
-            "overview" | "cases" | "groups" | "people" | "audit" | "queue"
+            "overview" | "cases" | "groups" | "people" | "audit" | "queue" | "rules"
         ) && (self.filter.is_empty()
             || (self.view == "cases"
                 && matches!(
@@ -133,6 +133,10 @@ impl Runtime {
                     AND (?5 IS NULL OR {CREATED_SECONDS}>=?5)
                     AND (?6 IS NULL OR {CREATED_SECONDS}<?6)
                     ORDER BY rowid DESC LIMIT 26 OFFSET ?3"), params![search,id,query.offset,query.filter,query.created_from,query.created_before])?,
+                "rules" => rows(&tx, "SELECT r.id,r.description,SUBSTR(r.pattern,1,600) AS pattern,
+                    (SELECT COUNT(*) FROM cases c WHERE c.matched_rule_id=r.id OR INSTR('；'||COALESCE(c.matched_rule_pattern,'')||'；','；REGEX@'||r.id||'；')>0) AS recorded_hits
+                    FROM spam_rules r WHERE (?1='' OR r.id=?2 OR INSTR(LOWER(r.pattern),LOWER(?1))>0 OR INSTR(LOWER(r.description),LOWER(?1))>0)
+                    ORDER BY r.id DESC LIMIT 26 OFFSET ?3",params)?,
                 "groups" => rows(&tx, "SELECT g.chat_id,title,last_seen,netban,
                     spam_threshold_override,settings_revision,
                     EXISTS(SELECT 1 FROM banned_groups b WHERE b.chat_id=g.chat_id) AS service_denied

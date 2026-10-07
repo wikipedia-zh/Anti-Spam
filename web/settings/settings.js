@@ -232,6 +232,7 @@
   async function back() {
     if(hostMode && window.SPBRoleEditor.back()) return;
     if(hostMode && window.SPBCasePanel.back()) return;
+    if(hostMode && window.SPBRuleEditor.back()) return;
     if (busy) return;
     if ($('discard-dialog').open) { $('discard-dialog').close(); return; }
     if ($('review-dialog').open) { $('review-dialog').close(); return; }

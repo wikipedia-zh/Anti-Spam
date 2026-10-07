@@ -64,7 +64,7 @@ test('the proxy forwards fixed paths, exact JSON, and its own key', async () => 
   assert.equal(seen.at(-1).headers.authorization,undefined);
 });
 test('management queries use fixed authenticated POST routes', async () => {
-  for (const [route,path] of [['host-query','/api/host/query'],['logout','/api/miniapp/logout'],['host-group-link','/api/host/group-link'],['host-case','/api/host/case']]) {
+  for (const [route,path] of [['host-query','/api/host/query'],['logout','/api/miniapp/logout'],['host-group-link','/api/host/group-link'],['host-case','/api/host/case'],['host-rule-test','/api/host/rule/test']]) {
     const count=seen.length;
     assert.equal((await request(route,'GET')).status,405);
     assert.equal((await request(route,'POST',{Authorization:''},'{}')).status,401);
@@ -77,15 +77,17 @@ test('management queries use fixed authenticated POST routes', async () => {
   }
 });
 test('role reads and changes require authentication and fixed methods', async () => {
+  for(const [route,path] of [['host-role','/api/host/role'],['host-rule','/api/host/rule']]) {
   const before=seen.length;
-  assert.equal((await request('host-role','GET')).status,405);
-  assert.equal((await request('host-role','PATCH',{Authorization:''},'{}')).status,401);
-  assert.equal((await request('host-role','POST',{Origin:'https://other.example'},'{}')).status,403);
+  assert.equal((await request(route,'GET')).status,405);
+  assert.equal((await request(route,'PATCH',{Authorization:''},'{}')).status,401);
+  assert.equal((await request(route,'POST',{Origin:'https://other.example'},'{}')).status,403);
   assert.equal(seen.length,before);
   for(const method of ['POST','PATCH']){
     const payload=JSON.stringify({user_id:300,role:'maintainer',enabled:true});
-    assert.equal((await request('host-role',method,{},payload)).status,200);
-    assert.equal(seen.at(-1).path,'/api/host/role');assert.equal(seen.at(-1).body,payload);
+    assert.equal((await request(route,method,{},payload)).status,200);
+    assert.equal(seen.at(-1).path,path);assert.equal(seen.at(-1).body,payload);
+  }
   }
 });
 test('conflicts survive the proxy and upstream failures stay private', async () => {

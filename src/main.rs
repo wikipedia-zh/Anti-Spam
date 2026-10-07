@@ -21,6 +21,7 @@ mod host_panel;
 mod host_cases;
 mod review_decisions;
 mod case_thresholds;
+mod host_rules;
 mod role_updates;
 use origin_retry::execute_auto_ban;
 use reliability::{passes_threshold, stable_probability};
@@ -249,6 +250,7 @@ enum UndoData {
     GlobalWhitelist { user_id: i64, old_enabled: bool },
     RuleAdded { rule_id: i64 },
     RuleEdited { rule_id: i64, old_pattern: String },
+    RuleUpdated { rule_id: i64, before: host_rules::Rule, after: host_rules::Rule },
     RuleDeleted { pattern: String, description: String },
     ProjectChat { old: Option<i64> },
     /// `/leave` and `/forbid` - reverting either just lifts the denial,
@@ -753,6 +755,9 @@ impl Runtime {
         }
         if user_version < 33 {
             Self::migrate_v32_to_v33(conn)?;
+        }
+        if user_version < 34 {
+            Self::migrate_v33_to_v34(conn)?;
         }
         Ok(())
     }
@@ -8102,6 +8107,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     Ok(_) => Ok(format!("已將規則 @{rule_id} 的正則復原。")),
                     Err(e) => Err(e.to_string()),
                 },
+                UndoData::RuleUpdated { rule_id, before, after } => match runtime.restore_host_rule(rule_id, before, after).await {
+                    Ok(true) => Ok(format!("已復原規則 @{rule_id}。")),
+                    Ok(false) => Err("規則已再修改或刪除，請先確認目前內容。".to_string()),
+                    Err(e) => Err(e.to_string()),
+                },
                 UndoData::RuleDeleted { pattern, description } => match runtime.add_spam_rule(&pattern, &description).await {
                     Ok(new_id) => Ok(format!("已重新建立規則（新 ID：@{new_id}，原規則 ID 無法保留）。")),
                     Err(e) => Err(e.to_string()),
@@ -8953,6 +8963,7 @@ mod tests {
     mod host_cases;
     mod host_review;
     mod case_thresholds;
+    mod host_rules;
     mod captcha;
     mod edited_messages;
     mod notices;

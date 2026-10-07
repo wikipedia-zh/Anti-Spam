@@ -39,12 +39,12 @@
     }
   };
   words['zh-Hans'] = {...words['zh-Hant'],title:'项目管理',overview:'总览',cases:'案件',groups:'群组',people:'人员',audit:'操作记录',queue:'待处理',search:'用户 ID、群组 ID 或案件 ID',groupSearch:'群组名称或 ID',find:'搜索',refresh:'重新读取',logout:'退出登录',loading:'正在读取…',empty:'没有符合条件的记录。',previous:'上一页',next:'下一页',page:'页',updated:'更新于',pending_reports:'待审核举报',pending_work:'待处理工作',failed_work:'曾失败、等待重试',pending_network:'待发送联防',known_groups:'记录中的群组',rules:'封禁规则',global_threshold:'全局模型阈值',schema:'数据库版本',version:'程序版本',note:'显示目前保存的记录。群组最近出现时间不代表机器人现在仍有管理权限。',modelNote:'模型在本群封禁与加入联防，使用不同的判断条件。',unknown:'未知',yes:'是',no:'否',global:'跟随全局',chat_id:'群组 ID',target_user_id:'用户 ID',status:'处理状态',model_score:'模型分数',reason:'触发原因',netban_eligible:'曾符合联防条件',network_done:'已完成联防工作',network_pending:'待发送联防工作',created_at:'记录时间',evidence:'证据摘要',last_seen:'最近出现',netban:'接收联防',spam_threshold_override:'本群阈值',service_denied:'已终止服务',user_id:'用户 ID',role:'角色',added_by:'授权人',host:'项目主持人',maintainer:'维护员',reviewer:'审核员',actor_user_id:'操作人',source:'来源',detail:'变更摘要',reverted:'已撤销',settings:'群组设置',command:'指令',kind:'工作种类',case_id:'案件 ID',attempts:'尝试次数',next_attempt_at:'下次尝试',last_error:'上次错误',session_expired:'登录已过期。请私聊机器人重新输入 /manage。',forbidden:'只有项目主持人可以使用此面板。',temporarily_unavailable:'暂时无法读取，请稍后重试。',rate_limited:'操作太频繁，请稍候一分钟再试。',signedOut:'已退出登录。请私聊机器人输入 /manage 重新打开。',cooldown:'Telegram 暂停接收操作，重试时间：'};
-  const views = ['overview','cases','groups','people','audit','queue'];
+  const views = ['overview','cases','groups','people','rules','audit','queue'];
   const fields = {
     cases:['id','chat_id','target_user_id','action','status','model_score','reason','netban_eligible','network_done','network_pending','created_at'],
     groups:['chat_id','last_seen','netban','spam_threshold_override','service_denied'],
     people:['user_id','role','added_by','created_at'],audit:['id','source','actor_user_id','chat_id','action','reverted','created_at'],
-    queue:['kind','case_id','chat_id','attempts','next_attempt_at']
+    queue:['kind','case_id','chat_id','attempts','next_attempt_at'],rules:['id','pattern','recorded_hits']
   };
   const states={
     'zh-Hant':{auto_ban:'自動封禁',spam_ban:'人工封禁',pending_report:'待審舉報',report_approved:'舉報已批准',report_rejected:'舉報已拒絕',guest_bot_ban:'訪客機器人封禁',guest_invoker_ban:'訪客召喚者封禁',mute:'禁言',kick:'踢出群組',flood_mute:'洗版禁言',project_ban:'項目封禁',pending_review:'待審核',ban_done:'已封禁',done:'已完成',ban_pending:'待封禁',ban_failed:'封禁失敗',reversed:'已撤銷',reversal_pending:'正在撤銷',action_failed:'操作失敗',action_unconfirmed:'結果未確認',action_cancelled:'已取消',action_pending:'待執行'},
@@ -68,6 +68,9 @@
   Object.assign(words['zh-Hans'],{resultFilter:'处理结果',allResults:'全部',fromDate:'开始日期',throughDate:'结束日期',clearFilters:'清除筛选',dateNote:'日期包含首尾两天；按设备时区：',invalid_request:'请检查搜索条件和日期范围。',banned:'封禁已生效',pending:'待执行',failed:'操作失败（含部分失败）',unconfirmed:'结果未确认',rejected:'举报已拒绝',cancelled:'已取消'});
   Object.assign(words.en,{resultFilter:'Result',allResults:'All',fromDate:'From date',throughDate:'Through date',clearFilters:'Clear filters',dateNote:'Dates include both days; device time zone: ',invalid_request:'Check the search filters and date range.',banned:'Ban in effect',pending:'Awaiting action',failed:'Failed or partly failed',unconfirmed:'Result unconfirmed',rejected:'Report rejected',cancelled:'Cancelled'});
   Object.assign(words['zh-Hant'],{pending_training:'待審訓練樣本',caseDetails:'案件詳情與處理'});Object.assign(words['zh-Hans'],{pending_training:'待审核训练样本',caseDetails:'案件详情与处理'});Object.assign(words.en,{pending_training:'Training samples awaiting review',caseDetails:'Case details and actions'});
+  Object.assign(words['zh-Hant'],{ruleSearch:'規則名稱、正則或 ID',newRule:'新增規則',editRule:'編輯與測試',pattern:'正則',recorded_hits:'記錄中的命中案件',ruleNote:'命中數只計已有的規則 ID 或代碼記錄，舊案件可能不完整。'});
+  Object.assign(words['zh-Hans'],{ruleSearch:'规则名称、正则或 ID',newRule:'新增规则',editRule:'编辑与测试',pattern:'正则',recorded_hits:'记录中的命中案件',ruleNote:'命中数只计算已有的规则 ID 或代码记录，旧案件可能不完整。'});
+  Object.assign(words.en,{ruleSearch:'Rule name, pattern or ID',newRule:'Add rule',editRule:'Edit and test',pattern:'Pattern',recorded_hits:'Recorded case hits',ruleNote:'Counts use saved rule IDs or codes. Older cases may be incomplete.'});
   const caseFilters=['','pending_review','pending_training','banned','pending','failed','unconfirmed','reversal_pending','reversed','rejected','cancelled'];
   let lang='zh-Hant',request,clearToken,root,view='overview',search='',filter='',fromDate='',throughDate='',createdFrom=null,createdBefore=null,offset=0,data=null,busy=false,closed=false,error='',groupLink=null;
   const t = key => words[lang][key] ?? key;
@@ -97,7 +100,7 @@
     if(view==='queue'&&filter)root.append(element('p',t({failed:'failed_work',network:'pending_network'}[filter]),'host-note'));
     const dates={};const form=element('form',undefined,'host-tools');form.addEventListener('submit',event=>{event.preventDefault();if(!busy){const from=dateBoundary(dates.fromDate?.value),before=dateBoundary(dates.throughDate?.value,true);if((from!==null&&!Number.isFinite(from))||(before!==null&&!Number.isFinite(before))||(from!==null&&before!==null&&from>=before)){dates.throughDate?.setCustomValidity(t('invalid_request'));dates.throughDate?.reportValidity();return;}search=input.value.trim();filter=resultSelect?.value??filter;fromDate=dates.fromDate?.value||'';throughDate=dates.throughDate?.value||'';createdFrom=from;createdBefore=before;offset=0;load();}});
     const input=element('input');input.type='search';input.maxLength=100;input.value=search;input.disabled=busy;input.id='host-search';
-    if(view!=='overview'){const label=element('label',t({groups:'groupSearch',people:'userSearch',queue:'queueSearch',audit:'auditSearch'}[view]||'search'));label.htmlFor=input.id;label.append(input);form.append(label);}
+    if(view!=='overview'){const label=element('label',t({groups:'groupSearch',people:'userSearch',queue:'queueSearch',audit:'auditSearch',rules:'ruleSearch'}[view]||'search'));label.htmlFor=input.id;label.append(input);form.append(label);}
     let resultSelect;
     if(view==='cases'){
       const label=element('label',t('resultFilter'));resultSelect=element('select');resultSelect.id='host-result';label.htmlFor=resultSelect.id;resultSelect.disabled=busy;
@@ -111,6 +114,7 @@
     form.append(button(t('refresh'),load));root.append(form);
     if(['cases','audit'].includes(view))root.append(element('p',t('dateNote')+Intl.DateTimeFormat().resolvedOptions().timeZone,'host-note'));
     if(view==='people')root.append(button(t('manageRoles'),()=>editRole()));
+    if(view==='rules')root.append(button(t('newRule'),()=>editRule()),element('p',t('ruleNote'),'host-note'));
     if(!data)return;
     if(view==='overview'){
       const summary=data.items[0];const grid=element('div',undefined,'host-summary');
@@ -120,11 +124,12 @@
       root.append(element('p',t('modelNote'),'host-note'));
     }else{
       if(!data.items.length)root.append(element('p',t('empty')));
-      for(const item of data.items){const card=element('article',undefined,'host-record');card.append(element('h3',item.target_name||item.title||t(item.role)||item.case_id||item.id||t(view)));
+      for(const item of data.items){const card=element('article',undefined,'host-record');card.append(element('h3',item.target_name||item.title||(view==='rules'?`@${item.id} · ${item.description}`:'')||t(item.role)||item.case_id||item.id||t(view)));
         const brief=[item.target_user_id??item.user_id??item.chat_id,item.status?value('status',item.status):item.kind||'',item.created_at?date(item.created_at):''].filter(v=>v!==''&&v!==undefined).join(' · ');card.append(element('p',brief,'host-meta'));
         const detail=element('details');detail.append(element('summary',t('details')));const dl=element('dl');for(const key of fields[view])dl.append(element('dt',t(key)),element('dd',value(key,item[key])));detail.append(dl);
         for(const key of ['evidence','detail','last_error'])if(item[key]){detail.append(element('h4',t(key)),element('pre',item[key]));}card.append(detail);if(view==='people'&&item.role!=='host')card.append(button(t('editRoles'),()=>editRole(item.user_id)));
         if(view==='cases')card.append(button(t('caseDetails'),()=>window.SPBCasePanel.open({request,language:lang,caseId:item.id,status:s=>value('status',s),onAuthError:fail,onSaved:load})));
+        if(view==='rules')card.append(button(t('editRule'),()=>editRule(item.id)));
         if(view==='groups'){
           card.append(button(t('groupSettings'),()=>prepareGroup(item.chat_id)));
           if(groupLink?.chat_id===item.chat_id){
@@ -139,12 +144,13 @@
     if(['overview','groups'].includes(view))root.append(element('p',t('note'),'host-note'));
   }
   function editRole(userId){window.SPBRoleEditor.open({request,language:lang,userId,onAuthError:fail,onSaved:async id=>{view='people';resetFilters();search=String(id);await load();}});}
+  function editRule(ruleId){window.SPBRuleEditor.open({request,language:lang,ruleId,onAuthError:fail,onSaved:load});}
   async function prepareGroup(chatId){if(busy||closed)return;busy=true;error='';groupLink=null;render();try{const result=await request('host-group-link','POST',{chat_id:chatId});const url=new URL(result.url);if(url.protocol!=='https:'||url.hostname!=='t.me'||url.username||url.password)throw new Error('temporarily_unavailable');groupLink={chat_id:chatId,url:url.href};}catch(e){fail(e);}finally{busy=false;render();}}
   async function load(){if(busy||closed)return;busy=true;error='';data=null;groupLink=null;render();try{data=await request('host-query','POST',{view,search,filter,offset,created_from:createdFrom,created_before:createdBefore});}catch(e){fail(e);}finally{busy=false;render();}}
-  function fail(e){error=Object.hasOwn(words.en,e.message)?e.message:'temporarily_unavailable';if(['session_expired','forbidden'].includes(error)){closed=true;data=null;clearToken?.();window.SPBRoleEditor.expire();window.SPBCasePanel.expire();}render();}
+  function fail(e){error=Object.hasOwn(words.en,e.message)?e.message:'temporarily_unavailable';if(['session_expired','forbidden'].includes(error)){closed=true;data=null;clearToken?.();window.SPBRoleEditor.expire();window.SPBCasePanel.expire();window.SPBRuleEditor.expire();}render();}
   async function logout(){if(busy||closed)return;busy=true;render();try{await request('logout','POST',{});closed=true;data=null;clearToken();error='signedOut';}catch(e){fail(e);}finally{busy=false;render();}}
   window.SPBHost={
     async start(api,language,clear){request=api;lang=language;clearToken=clear;document.body.classList.add('host-mode');root=document.querySelector('main');document.getElementById('save-bar').hidden=true;await load();},
-    setLanguage(language){lang=language;render();window.SPBRoleEditor.setLanguage(language);window.SPBCasePanel.setLanguage(language);},fail
+    setLanguage(language){lang=language;render();window.SPBRoleEditor.setLanguage(language);window.SPBCasePanel.setLanguage(language);window.SPBRuleEditor.setLanguage(language);},fail
   };
 })();

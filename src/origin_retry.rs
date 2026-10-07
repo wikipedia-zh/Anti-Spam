@@ -386,10 +386,13 @@ async fn policy_still_enabled(
         "VOICE" => settings.no_voice,
         "EXEC_FILE" => settings.no_exec,
         "ARABIC" => settings.no_halal,
-        part if part.starts_with("REGEX@") => part[6..]
-            .parse::<i64>()
-            .ok()
-            .is_some_and(|id| rules.iter().any(|rule| rule.id == id)),
+        part if part.starts_with("REGEX@") => part[6..].parse::<i64>().ok().is_some_and(|id| {
+            rules.iter().any(|rule| {
+                rule.id == id
+                    && (regex_is_match(&rule.regex, &case.target_name)
+                        || regex_is_match(&rule.regex, &case.evidence_text))
+            })
+        }),
         // Unstructured historical labels are not reinterpreted here.
         _ => true,
     }))
