@@ -62,6 +62,7 @@
   Object.assign(words['zh-Hant'],{groupSettings:'設定與自訂文字',openSettings:'前往群組設定 ↗',groupLinkNote:'此入口 5 分鐘內有效，只限你本人使用。開啟及儲存時會重新確認你和機器人的群組管理權限。',group_access_denied:'無法開啟此群設定。請確認你和機器人仍是該群管理員，且該群未被終止服務。'});
   Object.assign(words['zh-Hans'],{groupSettings:'设置与自定义文字',openSettings:'前往群组设置 ↗',groupLinkNote:'此入口 5 分钟内有效，仅限你本人使用。打开及保存时会重新确认你和机器人的群组管理权限。',group_access_denied:'无法打开此群设置。请确认你和机器人仍是该群管理员，且该群未被终止服务。'});
   Object.assign(words.en,{groupSettings:'Settings and group messages',openSettings:'Open group settings ↗',groupLinkNote:'This link is valid for 5 minutes and only works for you. Your group admin rights and the bot’s are checked again when opening and saving.',group_access_denied:'Unable to open this group’s settings. You and the bot must still be group admins, and the group must not be denied service.'});
+  Object.assign(words['zh-Hant'],{caseDetails:'案件詳情與撤銷'});Object.assign(words['zh-Hans'],{caseDetails:'案件详情与撤销'});Object.assign(words.en,{caseDetails:'Case details and reversal'});
   let lang='zh-Hant',request,clearToken,root,view='overview',search='',filter='',offset=0,data=null,busy=false,closed=false,error='',groupLink=null;
   const t = key => words[lang][key] ?? key;
   const element = (tag,text,className) => {const el=document.createElement(tag); if(text!==undefined)el.textContent=text; if(className)el.className=className; return el;};
@@ -104,6 +105,7 @@
         const brief=[item.target_user_id??item.user_id??item.chat_id,item.status?value('status',item.status):item.kind||'',item.created_at?date(item.created_at):''].filter(v=>v!==''&&v!==undefined).join(' · ');card.append(element('p',brief,'host-meta'));
         const detail=element('details');detail.append(element('summary',t('details')));const dl=element('dl');for(const key of fields[view])dl.append(element('dt',t(key)),element('dd',value(key,item[key])));detail.append(dl);
         for(const key of ['evidence','detail','last_error'])if(item[key]){detail.append(element('h4',t(key)),element('pre',item[key]));}card.append(detail);if(view==='people'&&item.role!=='host')card.append(button(t('editRoles'),()=>editRole(item.user_id)));
+        if(view==='cases')card.append(button(t('caseDetails'),()=>window.SPBCasePanel.open({request,language:lang,caseId:item.id,status:s=>value('status',s),onAuthError:fail,onSaved:load})));
         if(view==='groups'){
           card.append(button(t('groupSettings'),()=>prepareGroup(item.chat_id)));
           if(groupLink?.chat_id===item.chat_id){
@@ -120,10 +122,10 @@
   function editRole(userId){window.SPBRoleEditor.open({request,language:lang,userId,onAuthError:fail,onSaved:async id=>{view='people';search=String(id);offset=0;filter='';await load();}});}
   async function prepareGroup(chatId){if(busy||closed)return;busy=true;error='';groupLink=null;render();try{const result=await request('host-group-link','POST',{chat_id:chatId});const url=new URL(result.url);if(url.protocol!=='https:'||url.hostname!=='t.me'||url.username||url.password)throw new Error('temporarily_unavailable');groupLink={chat_id:chatId,url:url.href};}catch(e){fail(e);}finally{busy=false;render();}}
   async function load(){if(busy||closed)return;busy=true;error='';data=null;groupLink=null;render();try{data=await request('host-query','POST',{view,search,filter,offset});}catch(e){fail(e);}finally{busy=false;render();}}
-  function fail(e){error=Object.hasOwn(words.en,e.message)?e.message:'temporarily_unavailable';if(['session_expired','forbidden'].includes(error)){closed=true;data=null;clearToken?.();window.SPBRoleEditor.expire();}render();}
+  function fail(e){error=Object.hasOwn(words.en,e.message)?e.message:'temporarily_unavailable';if(['session_expired','forbidden'].includes(error)){closed=true;data=null;clearToken?.();window.SPBRoleEditor.expire();window.SPBCasePanel.expire();}render();}
   async function logout(){if(busy||closed)return;busy=true;render();try{await request('logout','POST',{});closed=true;data=null;clearToken();error='signedOut';}catch(e){fail(e);}finally{busy=false;render();}}
   window.SPBHost={
     async start(api,language,clear){request=api;lang=language;clearToken=clear;document.body.classList.add('host-mode');root=document.querySelector('main');document.getElementById('save-bar').hidden=true;await load();},
-    setLanguage(language){lang=language;render();window.SPBRoleEditor.setLanguage(language);},fail
+    setLanguage(language){lang=language;render();window.SPBRoleEditor.setLanguage(language);window.SPBCasePanel.setLanguage(language);},fail
   };
 })();

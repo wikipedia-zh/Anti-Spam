@@ -50,4 +50,5 @@ jobs:
           node --check web/settings/settings.js
           node --check web/settings/host.js
           node --check web/settings/host-roles.js
+          node --check web/settings/host-cases.js
           node --test tests/miniapp-proxy.cjs

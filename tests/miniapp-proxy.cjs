@@ -64,7 +64,7 @@ test('the proxy forwards fixed paths, exact JSON, and its own key', async () => 
   assert.equal(seen.at(-1).headers.authorization,undefined);
 });
 test('management queries use fixed authenticated POST routes', async () => {
-  for (const [route,path] of [['host-query','/api/host/query'],['logout','/api/miniapp/logout'],['host-group-link','/api/host/group-link']]) {
+  for (const [route,path] of [['host-query','/api/host/query'],['logout','/api/miniapp/logout'],['host-group-link','/api/host/group-link'],['host-case','/api/host/case']]) {
     const count=seen.length;
     assert.equal((await request(route,'GET')).status,405);
     assert.equal((await request(route,'POST',{Authorization:''},'{}')).status,401);
@@ -89,6 +89,14 @@ test('role reads and changes require authentication and fixed methods', async ()
   }
 });
 test('conflicts survive the proxy and upstream failures stay private', async () => {
+  const count=seen.length;
+  assert.equal((await request('host-case-reverse','POST',{},'{}')).status,405);
+  assert.equal((await request('host-case-reverse','PATCH',{Authorization:''},'{}')).status,401);
+  assert.equal(seen.length,count);
+  assert.equal((await request('host-case-reverse','PATCH',{},'{"case_id":"example"}')).status,200);
+  assert.equal(seen.at(-1).path,'/api/host/case/reverse');
+  responseStatus=404;responseBody=JSON.stringify({error:'case_not_found'});
+  const missing=await request('host-case','POST',{},'{}');assert.equal(missing.status,404);
   responseStatus=409; responseBody=JSON.stringify({error:'settings_changed'});
   const conflict=await request(); assert.equal(conflict.status,409);
   assert.deepEqual(await conflict.json(),{error:'settings_changed'});

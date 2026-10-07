@@ -2,6 +2,15 @@
 //! publish a model snapshot only after the whole transaction commits.
 use super::*;
 
+pub(super) const OTHER_BAN_IN_CHAT: &str = "SELECT EXISTS(SELECT 1 FROM cases c WHERE c.id != ?1 AND c.target_user_id=?3
+                 AND c.action IN ('auto_ban','spam_ban','report_approved','guest_bot_ban','guest_invoker_ban','project_ban')
+                 AND c.status NOT IN ('reversal_pending','reversed')
+                 AND (c.status NOT IN ('ban_failed','ban_pending') OR
+                    (c.chat_id=?2 AND EXISTS(SELECT 1 FROM origin_ban_jobs o WHERE o.case_id=c.id AND o.outcome_unknown=1)))
+                 AND (c.chat_id=?2 OR c.action='project_ban' OR EXISTS(
+                    SELECT 1 FROM network_ban_targets n WHERE n.case_id=c.id AND n.chat_id=?2)
+                    OR EXISTS(SELECT 1 FROM network_deliveries d WHERE d.case_id=c.id AND d.chat_id=?2 AND d.outcome_unknown=1)))";
+
 pub(super) fn stable_probability(log_odds: f64) -> f64 {
     if log_odds >= 0.0 {
         1.0 / (1.0 + (-log_odds).exp())
@@ -211,16 +220,11 @@ impl Runtime {
         let case_id = case_id.to_string();
         self.with_conn(move |conn| {
             Ok(conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM cases c WHERE c.id != ?1 AND c.target_user_id=?3
-                 AND c.action IN ('auto_ban','spam_ban','report_approved','guest_bot_ban','guest_invoker_ban','project_ban')
-                 AND c.status NOT IN ('reversal_pending','reversed')
-                 AND (c.status NOT IN ('ban_failed','ban_pending') OR
-                    (c.chat_id=?2 AND EXISTS(SELECT 1 FROM origin_ban_jobs o WHERE o.case_id=c.id AND o.outcome_unknown=1)))
-                 AND (c.chat_id=?2 OR c.action='project_ban' OR EXISTS(
-                    SELECT 1 FROM network_ban_targets n WHERE n.case_id=c.id AND n.chat_id=?2)
-                    OR EXISTS(SELECT 1 FROM network_deliveries d WHERE d.case_id=c.id AND d.chat_id=?2 AND d.outcome_unknown=1)))",
-                params![case_id, chat_id, user_id], |row| row.get(0),
+                OTHER_BAN_IN_CHAT,
+                params![case_id, chat_id, user_id],
+                |row| row.get(0),
             )?)
-        }).await
+        })
+        .await
     }
 }

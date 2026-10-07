@@ -4,6 +4,44 @@ fn retry_delay(attempt: u32) -> i64 {
     (60_i64 << attempt.saturating_sub(1).min(6)).min(3600)
 }
 
+pub(super) fn begin_reversal_tx(
+    tx: &rusqlite::Transaction<'_>,
+    case: &CaseRecord,
+    actor_id: i64,
+    actor_name: &str,
+) -> Result<()> {
+    if case.status != "reversal_pending" {
+        tx.execute(
+                    "INSERT OR IGNORE INTO network_ban_targets(case_id,chat_id,created_at) VALUES (?1,?2,?3)",
+                    params![case.id, case.chat_id, Utc::now().to_rfc3339()],
+                )?;
+    }
+    // A lost API response may still have applied the ban. Keep those
+    // targets for reversal before cancelling unfinished deliveries.
+    tx.execute(
+                "INSERT OR IGNORE INTO network_ban_targets(case_id,chat_id,created_at)
+                 SELECT case_id,chat_id,?2 FROM network_deliveries WHERE case_id=?1 AND outcome_unknown=1",
+                params![case.id, Utc::now().to_rfc3339()],
+            )?;
+    tx.execute("UPDATE network_deliveries SET state='cancelled',outcome_unknown=0 WHERE case_id=?1 AND state!='done'", params![case.id])?;
+    tx.execute(
+        "UPDATE cases SET status='reversal_pending' WHERE id=?1",
+        params![case.id],
+    )?;
+    tx.execute(
+        "UPDATE origin_ban_jobs SET state='cancelled',outcome_unknown=0 WHERE case_id=?1",
+        params![case.id],
+    )?;
+    tx.execute(
+        "INSERT INTO reversal_retries(case_id,actor_id,actor_name) VALUES (?1,?2,?3)
+                 ON CONFLICT(case_id) DO UPDATE SET
+                    actor_id=COALESCE(reversal_retries.actor_id,excluded.actor_id),
+                    actor_name=COALESCE(reversal_retries.actor_name,excluded.actor_name)",
+        params![case.id, actor_id, actor_name],
+    )?;
+    Ok(())
+}
+
 impl Runtime {
     pub(super) fn migrate_v18_to_v19(conn: &mut Connection) -> Result<()> {
         let tx = conn.transaction()?;
@@ -41,32 +79,11 @@ impl Runtime {
         let actor_name = actor_name.to_string();
         self.with_conn(move |conn| {
             let tx = conn.transaction()?;
-            if case.status != "reversal_pending" {
-                tx.execute(
-                    "INSERT OR IGNORE INTO network_ban_targets(case_id,chat_id,created_at) VALUES (?1,?2,?3)",
-                    params![case.id, case.chat_id, Utc::now().to_rfc3339()],
-                )?;
-            }
-            // A lost API response may still have applied the ban. Keep those
-            // targets for reversal before cancelling unfinished deliveries.
-            tx.execute(
-                "INSERT OR IGNORE INTO network_ban_targets(case_id,chat_id,created_at)
-                 SELECT case_id,chat_id,?2 FROM network_deliveries WHERE case_id=?1 AND outcome_unknown=1",
-                params![case.id, Utc::now().to_rfc3339()],
-            )?;
-            tx.execute("UPDATE network_deliveries SET state='cancelled',outcome_unknown=0 WHERE case_id=?1 AND state!='done'", params![case.id])?;
-            tx.execute("UPDATE cases SET status='reversal_pending' WHERE id=?1", params![case.id])?;
-            tx.execute("UPDATE origin_ban_jobs SET state='cancelled',outcome_unknown=0 WHERE case_id=?1", params![case.id])?;
-            tx.execute(
-                "INSERT INTO reversal_retries(case_id,actor_id,actor_name) VALUES (?1,?2,?3)
-                 ON CONFLICT(case_id) DO UPDATE SET
-                    actor_id=COALESCE(reversal_retries.actor_id,excluded.actor_id),
-                    actor_name=COALESCE(reversal_retries.actor_name,excluded.actor_name)",
-                params![case.id, actor_id, actor_name],
-            )?;
+            begin_reversal_tx(&tx, &case, actor_id, &actor_name)?;
             tx.commit()?;
             Ok(())
-        }).await
+        })
+        .await
     }
 
     async fn claim_reversal_attempt(&self, case_id: &str) -> Result<(Option<i64>, Option<String>)> {

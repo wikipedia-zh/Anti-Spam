@@ -405,7 +405,7 @@ async fn migration_keeps_existing_reversal_cooldown() {
         Runtime::init_db(conn)?;
         Runtime::init_db(conn)?;
         assert_eq!(conn.query_row("SELECT not_before FROM telegram_retry_state",[],|r| r.get::<_,i64>(0))?,12345678900);
-        assert_eq!(conn.query_row("PRAGMA user_version",[],|r| r.get::<_,i64>(0))?,30);
+        assert_eq!(conn.query_row("PRAGMA user_version",[],|r| r.get::<_,i64>(0))?,31);
         Ok(())
     }).await.unwrap();
 }

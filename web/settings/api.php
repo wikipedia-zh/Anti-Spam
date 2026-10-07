@@ -28,9 +28,11 @@ if (($clientOrigin !== '' && $clientOrigin !== $origin)
 $route = $_GET['route'] ?? '';
 $paths = ['session' => '/api/miniapp/session', 'settings' => '/api/groups/current/settings',
     'host-query' => '/api/host/query', 'logout' => '/api/miniapp/logout', 'host-role' => '/api/host/role',
-    'host-group-link' => '/api/host/group-link'];
+    'host-group-link' => '/api/host/group-link', 'host-case' => '/api/host/case',
+    'host-case-reverse' => '/api/host/case/reverse'];
 if (!is_string($route) || !isset($paths[$route])) fail(404, 'invalid_request');
-if ((in_array($route, ['session', 'host-query', 'logout', 'host-group-link'], true) && $method !== 'POST')
+if ((in_array($route, ['session', 'host-query', 'logout', 'host-group-link', 'host-case'], true) && $method !== 'POST')
+    || ($route === 'host-case-reverse' && $method !== 'PATCH')
     || ($route === 'settings' && !in_array($method, ['GET', 'PATCH'], true))
     || ($route === 'host-role' && !in_array($method, ['POST', 'PATCH'], true))) {
     fail(405, 'invalid_request');
@@ -75,7 +77,7 @@ $ok = curl_exec($curl);
 $status = (int) curl_getinfo($curl, CURLINFO_HTTP_CODE);
 curl_close($curl);
 if ($ok === false || $status < 200 || $status >= 500) fail(503, $method === 'PATCH' ? 'save_failed' : 'temporarily_unavailable');
-if (!in_array($status, [200, 400, 401, 403, 409, 413, 429], true)) fail(502, 'temporarily_unavailable');
+if (!in_array($status, [200, 400, 401, 403, 404, 409, 413, 429], true)) fail(502, 'temporarily_unavailable');
 if (!is_array(json_decode($response, true))) fail(502, 'temporarily_unavailable');
 http_response_code($status);
 echo $response;

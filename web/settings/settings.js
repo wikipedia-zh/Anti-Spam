@@ -112,7 +112,7 @@
     }
   }
   async function request(route, method = 'GET', body) {
-    const knownError = key => Object.hasOwn(copy.en,key) || (hostMode && key === 'group_access_denied');
+    const knownError = key => Object.hasOwn(copy.en,key) || (hostMode && ['group_access_denied','case_not_found'].includes(key));
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 28000);
     try {
@@ -231,6 +231,7 @@
   window.addEventListener('beforeunload', event => { if (Object.keys(changes()).length) { event.preventDefault(); event.returnValue = ''; } });
   async function back() {
     if(hostMode && window.SPBRoleEditor.back()) return;
+    if(hostMode && window.SPBCasePanel.back()) return;
     if (busy) return;
     if ($('discard-dialog').open) { $('discard-dialog').close(); return; }
     if ($('review-dialog').open) { $('review-dialog').close(); return; }

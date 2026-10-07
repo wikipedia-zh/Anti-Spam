@@ -18,6 +18,7 @@ mod warning_queue;
 mod rule_updates;
 mod rule_notices;
 mod host_panel;
+mod host_cases;
 mod role_updates;
 use origin_retry::execute_auto_ban;
 use reliability::{passes_threshold, stable_probability};
@@ -741,6 +742,9 @@ impl Runtime {
         }
         if user_version < 30 {
             Self::migrate_v29_to_v30(conn)?;
+        }
+        if user_version < 31 {
+            Self::migrate_v30_to_v31(conn)?;
         }
         Ok(())
     }
@@ -8925,6 +8929,7 @@ mod tests {
     mod rule_updates;
     mod rule_notices;
     mod role_updates;
+    mod host_cases;
     mod captcha;
     mod edited_messages;
     mod notices;

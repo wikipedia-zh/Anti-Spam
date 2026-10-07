@@ -186,6 +186,89 @@ async fn group_admin_can_edit_ot_text_but_cannot_save_after_revocation() {
 }
 
 #[tokio::test]
+async fn host_case_api_enforces_scope_target_and_confirmation_revision() {
+    let api = TestApi::new().await;
+    let case = dummy_case(ActionKind::AutoBan, -100, 300, Utc::now());
+    api.runtime.persist_case(&case).await.unwrap();
+    let group = api.login(HOST_ID, -100).await;
+    for (method, path) in [
+        (reqwest::Method::POST, "/api/host/case"),
+        (reqwest::Method::PATCH, "/api/host/case/reverse"),
+    ] {
+        assert_eq!(
+            api.request(method, path)
+                .bearer_auth(&group)
+                .json(&serde_json::json!({"case_id":case.id}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+    }
+    let link = api.service.host_link(HOST_ID).await.unwrap();
+    let launch = link
+        .query_pairs()
+        .find(|(key, _)| key == "startapp")
+        .unwrap()
+        .1
+        .into_owned();
+    let session: serde_json::Value = api
+        .login_raw(&signed(
+            &api.runtime.config.bot_token,
+            HOST_ID,
+            &launch,
+            Utc::now().timestamp(),
+        ))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let token = session["token"].as_str().unwrap();
+    let read = api
+        .request(reqwest::Method::POST, "/api/host/case")
+        .bearer_auth(token)
+        .json(&serde_json::json!({"case_id":case.id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status(), 200);
+    let snapshot: serde_json::Value = read.json().await.unwrap();
+    let mut body = serde_json::json!({"case_id":case.id,"target_user_id":999,"request_id":Uuid::new_v4().to_string(),"expected_revision":snapshot["revision"]});
+    let write = |body: &serde_json::Value| {
+        api.request(reqwest::Method::PATCH, "/api/host/case/reverse")
+            .bearer_auth(token)
+            .json(body)
+    };
+    assert_eq!(write(&body).send().await.unwrap().status(), 409);
+    body["target_user_id"] = serde_json::json!(300);
+    let mut injected = body.clone();
+    injected["actor_id"] = serde_json::json!(123);
+    assert_eq!(write(&injected).send().await.unwrap().status(), 400);
+    assert_eq!(write(&body).send().await.unwrap().status(), 200);
+    assert_eq!(write(&body).send().await.unwrap().status(), 200);
+    body["request_id"] = serde_json::json!(Uuid::new_v4().to_string());
+    assert_eq!(write(&body).send().await.unwrap().status(), 409);
+    assert_eq!(
+        api.request(reqwest::Method::POST, "/api/host/case")
+            .bearer_auth(token)
+            .json(&serde_json::json!({"case_id":"missing"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    assert!(!api
+        .telegram
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(method, _)| method == "unbanchatmember"));
+}
+
+#[tokio::test]
 async fn host_sessions_are_separate_from_group_admin_and_maintainer_sessions() {
     let api = TestApi::new().await;
     api.runtime
