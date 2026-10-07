@@ -760,6 +760,9 @@ pub(super) fn spawn_origin_worker(bot: Bot, runtime: Arc<Runtime>) -> tokio::tas
             if let Err(err) = retry_origin_bans(&bot, &runtime).await {
                 log::warn!("original ban queue: {err}");
             }
+            if let Err(err) = report_delivery::retry(&bot, &runtime).await {
+                log::warn!("report delivery queue: {err}");
+            }
             if let Err(err) = moderation_queue::deliver_review_updates(&bot, &runtime, None).await {
                 log::warn!("review notification queue: {err}");
             }

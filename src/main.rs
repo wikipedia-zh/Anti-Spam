@@ -12,6 +12,7 @@ mod origin_retry;
 mod moderation_queue;
 mod restriction_retry;
 mod queue_status;
+mod report_delivery;
 use origin_retry::execute_auto_ban;
 use reliability::{passes_threshold, stable_probability};
 mod reversal_retry;
@@ -719,6 +720,9 @@ impl Runtime {
         }
         if user_version < 25 {
             Self::migrate_v24_to_v25(conn)?;
+        }
+        if user_version < 26 {
+            Self::migrate_v25_to_v26(conn)?;
         }
         Ok(())
     }
@@ -2743,19 +2747,14 @@ impl Runtime {
 
     /// Keeps the confirmation location even if the review wins the race
     /// against the original sendMessage response.
+    #[cfg(test)]
     async fn set_report_confirmation(&self, case_id: &str, chat_id: i64, message_id: i32) -> Result<()> {
         let case_id = case_id.to_string();
         let guard = self.review_guard(&case_id).await;
         self.with_conn(move |conn| {
             let _guard = guard;
             let tx = conn.transaction()?;
-            let updated = tx.execute("UPDATE review_updates SET confirmation_chat_id=?2,confirmation_message_id=?3,confirmation_status='',next_attempt_at=0 WHERE case_id=?1",
-                params![case_id,chat_id,message_id])?;
-            if updated == 0 { tx.execute(
-                "INSERT INTO report_confirmations (case_id, chat_id, message_id) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(case_id) DO UPDATE SET chat_id=excluded.chat_id, message_id=excluded.message_id",
-                params![case_id, chat_id, message_id],
-            )?; }
+            report_delivery::remember_confirmation(&tx, &case_id, chat_id, message_id)?;
             tx.commit()?;
             Ok(())
         })
@@ -7261,76 +7260,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             }
         }
         ModerationCommand::SpamReport => {
-            // Three rejected reports and the command is gone. Maintainers are
-            // exempt so a bad streak can't lock out the people who clear it.
-            let strikes = runtime.report_strikes(from_id).await;
-            if strikes >= REPORT_STRIKE_LIMIT && !runtime.is_maintainer(from_id).await {
-                reply_ephemeral(
-                    &bot,
-                    &message,
-                    format!("你已有 {strikes} 次舉報被拒絕，已暫停使用 /spam。如有疑問請透過 @SEELE_01_BOT 聯絡項目組。"),
-                )
-                .await?;
-                let _ = bot.delete_message(message.chat.id, message.id).await;
-                return Ok(());
-            }
-
-            let Some((target_id, target_name, source_id, evidence_text)) = extract_reply_context(&message).await else {
-                reply_ephemeral(&bot, &message, "請回覆一條疑似 spam 的訊息。").await?;
-                return Ok(());
-            };
-
-            let case_id = Uuid::new_v4().to_string();
-            let case = CaseRecord {
-                id: case_id.clone(),
-                action: ActionKind::PendingReport,
-                chat_id: message.chat.id.0,
-                target_user_id: target_id,
-                target_name: target_name.clone(),
-                actor_user_id: Some(from_id),
-                actor_name: Some(short_user(from)),
-                source_message_id: Some(source_id),
-                evidence_text: evidence_text.clone(),
-                model_score: None,
-                matched_rule_id: None,
-                matched_rule_pattern: None,
-                status: "pending_review".to_string(),
-                log_message_id: None,
-                created_at: Utc::now(),
-            };
-
-            let keyboard = InlineKeyboardMarkup::new(vec![vec![
-                InlineKeyboardButton::callback("受理並封禁", format!("review:approve:{case_id}")),
-                InlineKeyboardButton::callback("拒絕並標記正常", format!("review:reject:{case_id}")),
-            ]]);
-
-            let text = notices::review_card(&case, "待審核舉報 · /spam", "受理：封禁並訓練。\n拒絕：標記為正常，並記錄舉報者被拒次數。", None);
-
-            bot
-                .send_message(ChatId(runtime.config.report_channel_id), text)
-                .parse_mode(ParseMode::Html)
-                .reply_markup(keyboard)
-                .await?;
-
-            // log_message_id stays None here (not the report-review card's
-            // message id, which lives in report_channel_id, a different
-            // chat) - public_log_link() always builds its URL against
-            // log_channel_id, so storing a different chat's message id
-            // here previously produced a link to a numerically-coincidental
-            // but completely unrelated log-channel message. It's only ever
-            // meaningful once something actually calls log_action, which
-            // only the "approve" review outcome does; "reject" correctly
-            // leaves it unset, and /case already renders that as "-".
-            store_case(&runtime, &case).await.ok();
-
-            // Remember this confirmation so it can be updated to the outcome
-            // once a reviewer decides. Reply to the report command so it's
-            // clear whose report it belongs to.
-            let sent = bot
-                .send_message(message.chat.id, "已送交舉報處理頻道審核。")
-                .reply_parameters(teloxide::types::ReplyParameters::new(message.id))
-                .await?;
-            let _ = runtime.set_report_confirmation(&case_id, message.chat.id.0, sent.id.0).await;
+            report_delivery::handle(&bot, &runtime, &message).await?;
         }
         ModerationCommand::Queue(case_id) => {
             queue_status::handle(&bot,&runtime,&message,&case_id).await?;
@@ -9193,6 +9123,7 @@ mod tests {
     mod moderation_queue;
     mod restriction_retry;
     mod queue_status;
+    mod report_delivery;
     mod captcha;
     mod edited_messages;
     mod notices;

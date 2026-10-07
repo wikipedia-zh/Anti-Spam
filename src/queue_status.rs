@@ -47,6 +47,8 @@ const WORK: &str = "
     UNION ALL SELECT '解封',j.case_id,c.chat_id,j.attempts,j.next_attempt_at,j.last_error
         FROM reversal_retries j JOIN cases c ON c.id=j.case_id WHERE c.status='reversal_pending'
     UNION ALL SELECT '入群驗證',NULL,chat_id,attempts,next_attempt_at,last_error FROM captcha_jobs
+    UNION ALL SELECT '舉報送出',j.case_id,c.chat_id,j.attempts,j.next_attempt_at,j.last_error
+        FROM report_deliveries j JOIN cases c ON c.id=j.case_id WHERE j.state='pending'
     UNION ALL SELECT '審核通知',u.case_id,u.chat_id,u.attempts,u.next_attempt_at,u.last_error
         FROM review_updates u JOIN cases c ON c.id=u.case_id LEFT JOIN origin_ban_jobs j ON j.case_id=c.id
         WHERE u.review_status!=c.status||':'||COALESCE(j.state,'') OR u.confirmation_status!=c.status||':'||COALESCE(j.state,'')";
