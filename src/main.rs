@@ -17,6 +17,7 @@ mod captcha;
 use captcha::{check_captcha_and_act, start_captcha_challenge, spawn_captcha_worker};
 mod edited_messages;
 use edited_messages::moderate_edited_message;
+mod notices;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -3814,7 +3815,7 @@ const GIT_HASH: &str = env!("GIT_HASH");
 
 fn version_info_text() -> String {
     format!(
-        "🏓 Pong！Bot 已啟動並運作中。\n<b>Version</b>: <code>{}</code>\n<b>Commit</b>: <code>{}</code>",
+        "SPB 已啟動\n<b>版本</b>: <code>{}</code>\n<b>Commit</b>: <code>{}</code>",
         env!("CARGO_PKG_VERSION"),
         GIT_HASH,
     )
@@ -4287,31 +4288,23 @@ fn chinese_case_action(case: &CaseRecord) -> String {
         "reversal_pending" => return "撤銷處理中".to_string(),
         _ => {}
     }
-    if let Some(rule_id) = case.matched_rule_id {
-        format!("規則 #{}", rule_id)
-    } else {
-        match case.action {
-            ActionKind::AutoDelete => "自動刪除".to_string(),
-            ActionKind::AutoBan => "自動封禁".to_string(),
-            ActionKind::SpamBan => "封禁".to_string(),
-            ActionKind::Mute => "禁言".to_string(),
-            ActionKind::Kick => "踢出".to_string(),
-            ActionKind::PendingReport => "待審核".to_string(),
-            ActionKind::ReportApproved => "受理封禁".to_string(),
-            ActionKind::ReportRejected => "拒絕受理".to_string(),
-            ActionKind::Unbanned => "已撤銷封禁".to_string(),
-            ActionKind::Unmuted => "已解除禁言".to_string(),
-            ActionKind::FloodMute => "洗版禁言".to_string(),
-            ActionKind::CmdCleanMute => "指令濫用禁言".to_string(),
-            ActionKind::GuestBotBan => "訪客模式機器人封禁".to_string(),
-            ActionKind::GuestInvokerBan => "訪客模式召喚者封禁".to_string(),
-            ActionKind::ProjectBan => "項目層級封禁".to_string(),
-        }
+    match case.action {
+        ActionKind::AutoDelete => "自動刪除".to_string(),
+        ActionKind::AutoBan => "自動封禁".to_string(),
+        ActionKind::SpamBan => "封禁".to_string(),
+        ActionKind::Mute => "禁言".to_string(),
+        ActionKind::Kick => "踢出".to_string(),
+        ActionKind::PendingReport => "待審核".to_string(),
+        ActionKind::ReportApproved => "受理封禁".to_string(),
+        ActionKind::ReportRejected => "拒絕受理".to_string(),
+        ActionKind::Unbanned => "已撤銷封禁".to_string(),
+        ActionKind::Unmuted => "已解除禁言".to_string(),
+        ActionKind::FloodMute => "洗版禁言".to_string(),
+        ActionKind::CmdCleanMute => "指令濫用禁言".to_string(),
+        ActionKind::GuestBotBan => "訪客模式機器人封禁".to_string(),
+        ActionKind::GuestInvokerBan => "訪客模式召喚者封禁".to_string(),
+        ActionKind::ProjectBan => "項目層級封禁".to_string(),
     }
-}
-
-fn chinese_case_reason(case: &CaseRecord) -> String {
-    case.matched_rule_pattern.clone().unwrap_or_else(|| "-".to_string())
 }
 
 fn build_reason_link(reason: &str, link: &str) -> String {
@@ -4343,17 +4336,7 @@ fn build_blacklist_reason_text(_runtime: &Runtime) -> String {
 }
 
 fn format_case_lookup(case: &CaseRecord, link: &str, reason_link: &str) -> String {
-    format!(
-        "<b>案例</b>: <code>{}</code>\n<b>操作</b>: {}\n<b>狀態</b>: {}\n<b>對象</b>: {} ({})\n<b>原因</b>: {}\n<b>日誌</b>: {}\n<b>證據</b>: <blockquote>{}</blockquote>",
-        case.id,
-        chinese_case_action(case),
-        escape_html(&case.status),
-        escape_html(&case.target_name),
-        case.target_user_id,
-        format_public_reason(&chinese_case_reason(case), Some(reason_link)),
-        link,
-        escape_html(&case.evidence_text),
-    )
+    notices::case_lookup(case, link, reason_link)
 }
 
 
@@ -4773,21 +4756,7 @@ fn project_chat_link(chat_id: i64) -> String {
 }
 
 async fn log_action(bot: &Bot, runtime: &Runtime, case: &CaseRecord) -> ResponseResult<i32> {
-    let action_text = chinese_case_action(case);
-    let reason_text = escape_html(&chinese_case_reason(case));
-    let text = format!(
-        "<b>案例</b>: <code>{}</code>\n<b>操作</b>: {}\n<b>群組</b>: <code>{}</code>\n<b>對象</b>: <code>{}</code> {}\n<b>處理者</b>: {}\n<b>分數</b>: {}\n<b>原因</b>: {}\n<b>證據</b>:\n<blockquote>{}</blockquote>\n<b>時間</b>: {}",
-        case.id,
-        action_text,
-        case.chat_id,
-        case.target_user_id,
-        escape_html(&case.target_name),
-        case.actor_user_id.map(|id| id.to_string()).unwrap_or_else(|| "system".to_string()),
-        case.model_score.map(|s| format!("{s:.4}")).unwrap_or_else(|| "-".to_string()),
-        reason_text,
-        escape_html(&case.evidence_text),
-        utc8_display(case.created_at),
-    );
+    let text = notices::action_log(case);
     let sent = bot
         .send_message(ChatId(runtime.config.log_channel_id), text)
         .parse_mode(ParseMode::Html)
@@ -4796,15 +4765,18 @@ async fn log_action(bot: &Bot, runtime: &Runtime, case: &CaseRecord) -> Response
 }
 
 async fn log_callback_error(bot: &Bot, runtime: &Runtime, case: &CaseRecord, stage: &str, err: &str) {
-    eprintln!("[callback-error] stage={stage} case={} chat={} err={err}", case.id, case.chat_id);
+    let diagnostic = notices::diagnostic(&runtime.config, err);
+    log::warn!("case={} chat={} stage={stage}: {diagnostic}", case.id, case.chat_id);
     let text = format!(
-        "<b>回調錯誤</b>\n<b>階段</b>: <code>{}</code>\n<b>案例</b>: <code>{}</code>\n<b>群組</b>: <code>{}</code>\n<b>錯誤</b>:\n<blockquote>{}</blockquote>",
-        escape_html(stage),
+        "<b>{}失敗</b>\n<b>案例</b>: <code>{}</code>\n<b>群組</b>: <code>{}</code>\n<blockquote>{}</blockquote>",
+        notices::error_stage(stage),
         case.id,
         case.chat_id,
-        escape_html(err),
+        escape_html(&notices::preview(&diagnostic, 256)),
     );
-    let _ = bot.send_message(ChatId(runtime.config.log_channel_id), text).parse_mode(ParseMode::Html).await;
+    if let Err(err) = bot.send_message(ChatId(runtime.config.log_channel_id), text).parse_mode(ParseMode::Html).await {
+        log::warn!("could not send error notice for case={}: {}", case.id, notices::diagnostic(&runtime.config, &err.to_string()));
+    }
 }
 
 async fn delete_message_if_exists(bot: &Bot, chat_id: ChatId, message_id: MessageId) -> Result<()> {
@@ -4816,17 +4788,9 @@ async fn delete_message_if_exists(bot: &Bot, chat_id: ChatId, message_id: Messag
 }
 
 async fn notify_group(bot: &Bot, runtime: &Runtime, case: &CaseRecord, log_message_id: i32, header: &str) -> Result<()> {
-    let link = public_log_link(&runtime.config, log_message_id);
-    let reason_link = runtime.blacklist_reason_link().await.unwrap_or_else(|| link.clone());
-    let reason = case.matched_rule_pattern.as_deref().unwrap_or("-");
-    let text = format!(
-        "{header}\n\n<b>操作</b>: {}\n<b>對象</b>: <code>{}</code>\n<b>原因</b>: {}\n<b>證據</b>: <a href=\"{}\">查看日誌</a>\n<b>案例</b>: <code>{}</code>",
-        chinese_case_action(case),
-        case.target_user_id,
-        format_public_reason(reason, Some(&reason_link)),
-        link,
-        case.id
-    );
+    let link = (log_message_id > 0).then(|| public_log_link(&runtime.config, log_message_id));
+    let reason_link = runtime.blacklist_reason_link().await.or_else(|| link.clone());
+    let text = notices::group_notice(case, header, link.as_deref(), reason_link.as_deref());
     let sent = bot.send_message(ChatId(case.chat_id), text).parse_mode(ParseMode::Html).await?;
     let bot = bot.clone();
     let chat_id = ChatId(case.chat_id);
@@ -4848,7 +4812,7 @@ async fn notify_group(bot: &Bot, runtime: &Runtime, case: &CaseRecord, log_messa
 /// noise for group admins, not something that needs to stick around in the
 /// chat permanently.
 async fn notify_netban_sync(bot: &Bot, chat_id: ChatId, target_user_id: i64, case_id: &str) {
-    let text = format!("<b>跨群組黑名單同步封禁</b>\n用戶 <code>{target_user_id}</code> 已因跨群組黑名單同步封禁。\n原始案例: <code>{case_id}</code>");
+    let text = format!("<b>已同步跨群封禁</b>\n<b>對象</b>: <code>{target_user_id}</code>\n<b>案例</b>: <code>{case_id}</code>");
     let Ok(sent) = bot.send_message(chat_id, text).parse_mode(ParseMode::Html).await else { return };
     let bot = bot.clone();
     let message_id = sent.id;
@@ -4864,7 +4828,7 @@ async fn notify_netban_sync(bot: &Bot, chat_id: ChatId, target_user_id: i64, cas
 /// netban sync.
 async fn notify_project_ban_sync(bot: &Bot, chat_id: ChatId, target_user_id: i64, case_id: &str) {
     let text = format!(
-        "<b>項目層級封禁（PB）同步執行</b>\n用戶 <code>{target_user_id}</code> 已因項目層級封禁自動封禁。此封禁對所有群組強制生效，無法透過白名單或本群解封繞過，僅維護組可解除（見<a href=\"{TERMS_URL}#project-ban\">使用規範第 7 條</a>）。\n原始案例: <code>{case_id}</code>"
+        "<b>已執行項目封禁（PB）</b>\n<b>對象</b>: <code>{target_user_id}</code>\n<b>案例</b>: <code>{case_id}</code>\n所有群組均適用，白名單及本群解封無效，僅維護組可解除。<a href=\"{TERMS_URL}#project-ban\">使用規範第 7 條</a>"
     );
     let Ok(sent) = bot.send_message(chat_id, text).parse_mode(ParseMode::Html).await else { return };
     let bot = bot.clone();
@@ -4999,7 +4963,7 @@ async fn apply_warn_threshold_action(bot: &Bot, runtime: &Runtime, chat_id: Chat
 /// same-chat case - worth flagging to admins since a ban that let its
 /// target back in once might do so again, unlike a routine netban sync.
 async fn notify_reban_sync(bot: &Bot, chat_id: ChatId, target_user_id: i64, case_id: &str) {
-    let text = format!("<b>已封禁用戶再次發言</b>\n用戶 <code>{target_user_id}</code> 在本群仍有生效中的封禁記錄，但成功再次發言，已刪除訊息並重新封禁。\n原始案例: <code>{case_id}</code>");
+    let text = format!("<b>已重新封禁</b>\n<b>對象</b>: <code>{target_user_id}</code>\n本群封禁仍生效；因再次發言，已刪除訊息並重新封禁。\n<b>案例</b>: <code>{case_id}</code>");
     let Ok(sent) = bot.send_message(chat_id, text).parse_mode(ParseMode::Html).await else { return };
     let bot = bot.clone();
     let message_id = sent.id;
@@ -5179,37 +5143,24 @@ fn netban_eligible(action: &ActionKind, model_score: Option<f64>, global_thresho
 /// was caught. Receiving stays opt-in: only groups with netban enabled ever
 /// get a propagated ban (here) or enforce one (`check_netban_and_act`).
 ///
-/// Posts a `/sb`'s evidence to the report channel for a maintainer to
-/// accept or discard as training data. The ban itself already happened and
-/// isn't in question here - this only decides whether the text is allowed
-/// to move the shared model, which used to happen automatically the moment
-/// any group admin typed `/sb`.
-///
-/// Skipped when there's nothing a human could usefully label: an empty or
-/// token-less message (a sticker, a photo with no caption) would train on
-/// nothing, so it would only be noise in the review queue.
+/// Review a local `/sb` before training and promoting it to the network.
+/// Empty or token-less evidence cannot train the model.
 async fn queue_training_review(bot: &Bot, runtime: &Runtime, case: &CaseRecord) {
     if is_empty_ml_text(&case.evidence_text) {
         return;
     }
-    let body = format!(
-        "<b>待審核訓練樣本</b>（來自 /sb）\n\n<b>對象</b>: {} (<code>{}</code>)\n<b>操作者</b>: {}\n<b>群組</b>: <code>{}</code>\n<b>內容</b>: <blockquote>{}</blockquote>\n<b>案例</b>: <code>{}</code>\n\n批准後才會寫入模型；拒絕則只保留封禁、不影響模型。",
-        escape_html(&case.target_name),
-        case.target_user_id,
-        escape_html(case.actor_name.as_deref().unwrap_or("unknown")),
-        case.chat_id,
-        escape_html(&case.evidence_text),
-        case.id,
-    );
+    let body = notices::review_card(case, "待審核訓練樣本 · /sb", "批准：訓練並加入跨群黑名單。\n拒絕：不訓練，保留本群封禁。", None);
     let buttons = InlineKeyboardMarkup::new(vec![vec![
-        InlineKeyboardButton::callback("批准訓練", format!("train:approve:{}", case.id)),
+        InlineKeyboardButton::callback("訓練並加入黑名單", format!("train:approve:{}", case.id)),
         InlineKeyboardButton::callback("拒絕訓練", format!("train:reject:{}", case.id)),
     ]]);
-    let _ = bot
+    if let Err(err) = bot
         .send_message(ChatId(runtime.config.report_channel_id), body)
         .parse_mode(ParseMode::Html)
         .reply_markup(buttons)
-        .await;
+        .await {
+        log::warn!("could not send training review for case={}: {}", case.id, notices::diagnostic(&runtime.config, &err.to_string()));
+    }
 }
 
 /// A scored ban is judged against the **global** threshold, never the origin
@@ -5734,7 +5685,7 @@ async fn check_project_ban_promotion_bypass(bot: &Bot, runtime: &Arc<Runtime>, u
 
     let dest = runtime.audit_log_chat().await.unwrap_or(runtime.config.report_channel_id);
     let text = format!(
-        "<b>⚠ 項目層級封禁（PB）規避嘗試（已封禁）</b>\n<b>對象</b>: {} (<code>{target_id}</code>)\n<b>原始 PB 案例</b>: <code>{}</code>\n<b>群組</b>: <code>{}</code>\n<b>操作者</b>: {} (<code>{}</code>)\n\n該用戶剛在此群組被設為管理員，疑似意圖阻止機器人將其移出，但封禁已成功執行，威脅已排除。視情節可依<a href=\"{TERMS_URL}#project-ban\">使用規範第 7 條</a>對操作者使用 /pb。",
+        "<b>PB 用戶獲設為管理員，已封禁</b>\n<b>對象</b>: {} (<code>{target_id}</code>)\n<b>原始 PB 案例</b>: <code>{}</code>\n<b>群組</b>: <code>{}</code>\n<b>操作者</b>: {} (<code>{}</code>)\n\n請維護組按<a href=\"{TERMS_URL}#project-ban\">使用規範第 7 條</a>審視此操作。",
         mention_link(target_id, &short_user(target)),
         case.id,
         chat_id.0,
@@ -6558,13 +6509,13 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     "<b>判定</b>: 垃圾\n<b>分數</b>: {score:.6}\n<b>規則</b>: REGEX\n<b>說明</b>: {}",
                     escape_html(&rule.description),
                 ),
-                InspectionResult::Spam { score, .. } => {
+                InspectionResult::Spam { .. } => {
                     let report = runtime.score_debug(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
-                    format!("<b>判定</b>: 垃圾\n<b>分數</b>: {score:.6}\n{}", format_score_debug(&report))
+                    format!("<b>判定</b>: 垃圾\n{}", format_score_debug(&report))
                 }
-                InspectionResult::Ham { score } => {
+                InspectionResult::Ham { .. } => {
                     let report = runtime.score_debug(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
-                    format!("<b>判定</b>: 正常\n<b>分數</b>: {score:.6}\n{}", format_score_debug(&report))
+                    format!("<b>判定</b>: 正常\n{}", format_score_debug(&report))
                 }
             };
             bot.send_message(message.chat.id, response).parse_mode(ParseMode::Html).await?;
@@ -7515,17 +7466,10 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
 
             let keyboard = InlineKeyboardMarkup::new(vec![vec![
                 InlineKeyboardButton::callback("受理並封禁", format!("review:approve:{case_id}")),
-                InlineKeyboardButton::callback("拒絕並洗模型", format!("review:reject:{case_id}")),
+                InlineKeyboardButton::callback("拒絕並標記正常", format!("review:reject:{case_id}")),
             ]]);
 
-            let text = format!(
-                "<b>新的 /spam 申請</b>\n\n<b>對象</b>: {} ({})\n<b>發起人</b>: {}\n<b>內容</b>: <blockquote>{}</blockquote>\n<b>案例</b>: <code>{}</code>",
-                target_name,
-                target_id,
-                short_user(from),
-                evidence_text,
-                case_id
-            );
+            let text = notices::review_card(&case, "待審核舉報 · /spam", "受理：封禁並訓練。\n拒絕：標記為正常，並記錄舉報者被拒次數。", None);
 
             bot
                 .send_message(ChatId(runtime.config.report_channel_id), text)
@@ -7556,13 +7500,13 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         ModerationCommand::CaseLookup(case_id) => {
             match runtime.load_case(&case_id).await {
                 Ok(Some(case)) => {
-                    let link = case.log_message_id.map(|id| public_log_link(&runtime.config, id)).unwrap_or_else(|| "-".to_string());
+                    let link = case.log_message_id.filter(|id| *id > 0).map(|id| public_log_link(&runtime.config, id)).unwrap_or_else(|| "-".to_string());
                     let reason_link = runtime.blacklist_reason_link().await.unwrap_or_else(|| link.clone());
                     let text = format_case_lookup(&case, &link, &reason_link);
                     bot.send_message(message.chat.id, text).parse_mode(ParseMode::Html).await?;
                 }
                 _ => {
-                    bot.send_message(message.chat.id, "找不到該 Case。") .await?;
+                    bot.send_message(message.chat.id, "找不到該案例。") .await?;
                 }
             }
         }
@@ -8236,7 +8180,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 }
                 InspectionResult::Spam { score, .. } | InspectionResult::Ham { score } => {
                     let report = runtime.score_debug(&user_name, &text).await.map_err(|e| teloxide::RequestError::Io(std::io::Error::other(e.to_string()).into()))?;
-                    out.push_str(&format!("<b>判定</b>: {}\n<b>分數</b>: {score:.6}\n{}", if score >= runtime.effective_threshold(Some(message.chat.id.0)).await.unwrap_or(runtime.config.spam_threshold) { "垃圾" } else { "正常" }, format_score_debug(&report)));
+                    out.push_str(&format!("<b>判定</b>: {}\n{}", if score >= runtime.effective_threshold(Some(message.chat.id.0)).await.unwrap_or(runtime.config.spam_threshold) { "垃圾" } else { "正常" }, format_score_debug(&report)));
                 }
             }
             bot.send_message(message.chat.id, out).parse_mode(ParseMode::Html).await?;
@@ -8672,8 +8616,6 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
     let from = q.from.clone();
     let from_id = from.id.0 as i64;
 
-    eprintln!("[callback] from={} data={}", from_id, data);
-
     let mut parts = data.split(':');
     let kind = parts.next().unwrap_or("");
     let decision = parts.next().unwrap_or("");
@@ -8701,7 +8643,7 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
     let case = match runtime.load_case(case_id).await {
         Ok(case) => case,
         Err(_) => {
-            bot.answer_callback_query(q.id).text("讀取 Case 失敗").await?;
+            bot.answer_callback_query(q.id).text("無法讀取案例，請稍後重試").await?;
             return Ok(());
         }
     };
@@ -8716,9 +8658,7 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
         return Ok(());
     };
 
-    // The /sb training queue. Unlike the "review" flow below, nothing about
-    // the ban changes here either way - the ban already happened in the
-    // group. This decides only whether the text is allowed into the model.
+    // Approval trains the model and promotes the existing local ban to the network.
     if kind == "train" {
         match runtime.decide_training_review(&case.id, decision, from_id).await {
             Ok(true) => {}
@@ -8738,20 +8678,12 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
                 // it from a local ban to the shared blacklist.
                 commit_network_ban(&bot, &runtime, &case).await;
                 broadcast_ban_status(&bot, &runtime, case.target_user_id, true).await;
-                ("已批准並寫入模型，且已加入專案黑名單", "已批准並加入黑名單")
+                ("已訓練並加入跨群黑名單", "已批准並加入黑名單")
             }
-            "reject" => ("已拒絕，未寫入模型（封禁不受影響）", "已拒絕訓練"),
+            "reject" => ("已拒絕訓練，本群封禁保留", "已拒絕訓練"),
             _ => return Ok(()),
         };
-        let body = format!(
-            "<b>待審核訓練樣本</b>（來自 /sb）\n\n<b>對象</b>: {} (<code>{}</code>)\n<b>操作者</b>: {}\n<b>群組</b>: <code>{}</code>\n<b>內容</b>: <blockquote>{}</blockquote>\n<b>案例</b>: <code>{}</code>\n<b>狀態</b>: {note}\n<b>處理者</b>: <code>{from_id}</code>",
-            escape_html(&case.target_name),
-            case.target_user_id,
-            escape_html(case.actor_name.as_deref().unwrap_or("unknown")),
-            case.chat_id,
-            escape_html(&case.evidence_text),
-            case.id,
-        );
+        let body = notices::review_card(&case, note, "", Some(from_id));
         let _ = bot.edit_message_text(message.chat().id, message.id(), body).parse_mode(ParseMode::Html).await;
         let _ = bot.edit_message_reply_markup(message.chat().id, message.id()).await;
         bot.answer_callback_query(q.id).text(toast).await?;
@@ -8801,15 +8733,7 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
             }
             propagate_network_ban(&bot, &runtime, &updated).await;
             broadcast_ban_status(&bot, &runtime, updated.target_user_id, true).await;
-            let body = format!(
-                "<b>新的 /spam 申請</b>\n\n<b>對象</b>: {} ({})\n<b>發起人</b>: {}\n<b>內容</b>: <blockquote>{}</blockquote>\n<b>案例</b>: <code>{}</code>\n<b>狀態</b>: 已受理並封禁\n<b>處理者</b>: <code>{}</code>",
-                escape_html(&case.target_name),
-                case.target_user_id,
-                escape_html(case.actor_name.as_deref().unwrap_or("unknown")),
-                escape_html(&case.evidence_text),
-                case.id,
-                from_id
-            );
+            let body = notices::review_card(&case, "已受理並封禁", "", Some(from_id));
             let _ = bot.edit_message_text(message.chat().id, message.id(), body).parse_mode(ParseMode::Html).await;
             let _ = bot.edit_message_reply_markup(message.chat().id, message.id()).await;
             if let Some((chat_id, msg_id)) = runtime.take_report_confirmation(&case.id).await {
@@ -8844,16 +8768,7 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
             if let Err(err) = store_case(&runtime, &updated).await {
                 log_callback_error(&bot, &runtime, &case, "store_case", &err.to_string()).await;
             }
-            let body = format!(
-                "<b>新的 /spam 申請</b>\n\n<b>對象</b>: {} ({})\n<b>發起人</b>: {}\n<b>內容</b>: <blockquote>{}</blockquote>\n<b>案例</b>: <code>{}</code>\n<b>狀態</b>: 已拒絕受理\n<b>處理者</b>: <code>{}</code>{}",
-                escape_html(&case.target_name),
-                case.target_user_id,
-                escape_html(case.actor_name.as_deref().unwrap_or("unknown")),
-                escape_html(&case.evidence_text),
-                case.id,
-                from_id,
-                strike_note
-            );
+            let body = notices::review_card(&case, "已拒絕舉報", &strike_note, Some(from_id));
             let _ = bot.edit_message_text(message.chat().id, message.id(), body).parse_mode(ParseMode::Html).await;
             let _ = bot.edit_message_reply_markup(message.chat().id, message.id()).await;
             if let Some((chat_id, msg_id)) = runtime.take_report_confirmation(&case.id).await {
@@ -9207,7 +9122,7 @@ async fn main() -> Result<()> {
     // is why a stalled poller once went dark with no trace in kubectl logs.
     // Default to info so those diagnostics show; RUST_LOG can override.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    log::info!("spb starting: {}", version_info_text().replace('\n', " "));
+    log::info!("spb starting version={} commit={GIT_HASH}", env!("CARGO_PKG_VERSION"));
 
     let config = Config::from_env()?;
     let bot = Bot::new(config.bot_token.clone());
@@ -9229,6 +9144,7 @@ async fn main() -> Result<()> {
     // dead-but-Running poller no longer sits silently until someone notices.
     {
         let bot = bot.clone();
+        let config = runtime.config.clone();
         let hb_path = runtime
             .config
             .sqlite_path
@@ -9236,14 +9152,34 @@ async fn main() -> Result<()> {
             .map(|p| p.join("spb.heartbeat"))
             .unwrap_or_else(|| PathBuf::from("spb.heartbeat"));
         tokio::spawn(async move {
+            let mut connection_failures = notices::HealthFailures::default();
+            let mut file_failures = notices::HealthFailures::default();
             loop {
                 match bot.get_me().await {
                     Ok(_) => {
+                        if let Some(count) = connection_failures.recovered() {
+                            log::info!("heartbeat connection recovered after {count} failures");
+                        }
                         if let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-                            let _ = tokio::fs::write(&hb_path, dur.as_secs().to_string()).await;
+                            match tokio::fs::write(&hb_path, dur.as_secs().to_string()).await {
+                                Ok(()) => {
+                                    if let Some(count) = file_failures.recovered() {
+                                        log::info!("heartbeat file recovered after {count} failures");
+                                    }
+                                }
+                                Err(err) => {
+                                    if let Some(count) = file_failures.failed() {
+                                        log::warn!("heartbeat file write failed count={count}: {err}");
+                                    }
+                                }
+                            }
                         }
                     }
-                    Err(err) => log::warn!("heartbeat get_me failed: {err}"),
+                    Err(err) => {
+                        if let Some(count) = connection_failures.failed() {
+                            log::warn!("heartbeat get_me failed count={count}: {}", notices::diagnostic(&config, &err.to_string()));
+                        }
+                    }
                 }
                 sleep(Duration::from_secs(30)).await;
             }
@@ -9483,6 +9419,7 @@ mod tests {
     mod network_delivery;
     mod captcha;
     mod edited_messages;
+    mod notices;
 
     /// Exercise the real command handler without contacting Telegram.
     struct TelegramStub {
