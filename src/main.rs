@@ -15,6 +15,7 @@ mod queue_status;
 mod report_delivery;
 mod maintenance;
 mod warning_queue;
+mod rule_updates;
 use origin_retry::execute_auto_ban;
 use reliability::{passes_threshold, stable_probability};
 mod reversal_retry;
@@ -291,7 +292,7 @@ struct Runtime {
     model: Arc<Mutex<ModelState>>,
     review_locks: Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
     user_action_locks: Mutex<HashMap<i64, std::sync::Weak<Mutex<()>>>>,
-    spam_rules: RwLock<Vec<SpamRule>>,
+    spam_rules: Arc<RwLock<Vec<SpamRule>>>,
     mass_train_buffer: Mutex<HashMap<i64, Vec<String>>>,
     mass_train_mode: Mutex<HashMap<i64, String>>,
     pending_rule_additions: Mutex<HashMap<i64, String>>,
@@ -512,7 +513,7 @@ impl Runtime {
             model: Arc::new(Mutex::new(model)),
             review_locks: Mutex::new(HashMap::new()),
             user_action_locks: Mutex::new(HashMap::new()),
-            spam_rules: RwLock::new(spam_rules),
+            spam_rules: Arc::new(RwLock::new(spam_rules)),
             mass_train_buffer: Mutex::new(HashMap::new()),
             mass_train_mode: Mutex::new(HashMap::new()),
             pending_rule_additions: Mutex::new(HashMap::new()),
@@ -2133,13 +2134,6 @@ impl Runtime {
         self.current_threshold().await
     }
 
-    async fn refresh_spam_rules(&self) -> Result<()> {
-        let rules = self.with_conn(|conn| Runtime::load_spam_rules(conn)).await?;
-        let mut cache = self.spam_rules.write().await;
-        *cache = rules;
-        Ok(())
-    }
-
     async fn purge_training_by_text(&self, payload: &str) -> Result<usize> {
         let payload = payload.to_string();
         self.with_model_transaction(move |tx| {
@@ -2307,49 +2301,6 @@ impl Runtime {
                 > 0)
         })
         .await
-    }
-
-    async fn add_spam_rule(&self, pattern: &str, description: &str) -> Result<i64> {
-        FancyRegex::new(pattern).context("invalid regex pattern")?;
-        let pattern = pattern.to_string();
-        let description = description.to_string();
-        let id = self
-            .with_conn(move |conn| {
-                conn.execute(
-                    "INSERT INTO spam_rules (pattern, description) VALUES (?1, ?2)",
-                    params![pattern, description],
-                )?;
-                Ok(conn.last_insert_rowid())
-            })
-            .await?;
-        self.refresh_spam_rules().await?;
-        Ok(id)
-    }
-
-    async fn update_spam_rule_pattern(&self, rule_id: i64, pattern: &str) -> Result<bool> {
-        FancyRegex::new(pattern).context("invalid regex pattern")?;
-        let pattern = pattern.to_string();
-        let updated = self
-            .with_conn(move |conn| Ok(conn.execute("UPDATE spam_rules SET pattern = ?2 WHERE id = ?1", params![rule_id, pattern])?))
-            .await?;
-        if updated > 0 {
-            self.refresh_spam_rules().await?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    async fn delete_spam_rule(&self, rule_id: i64) -> Result<bool> {
-        let removed = self
-            .with_conn(move |conn| Ok(conn.execute("DELETE FROM spam_rules WHERE id = ?1", params![rule_id])?))
-            .await?;
-        if removed > 0 {
-            self.refresh_spam_rules().await?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
     }
 
     async fn list_spam_rules(&self) -> Result<Vec<(i64, String, String)>> {
@@ -9034,6 +8985,7 @@ mod tests {
     mod report_delivery;
     mod maintenance;
     mod warning_queue;
+    mod rule_updates;
     mod captcha;
     mod edited_messages;
     mod notices;
