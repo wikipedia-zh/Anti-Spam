@@ -14,6 +14,39 @@ fn review_callback(case_id: &str, kind: &str, decision: &str) -> CallbackQuery {
 }
 
 #[tokio::test]
+async fn reviewing_one_case_does_not_block_an_unrelated_case() {
+    let runtime = Arc::new(test_runtime().await);
+    let blocked = dummy_case(ActionKind::SpamBan, -100, 200, Utc::now());
+    let ready = dummy_case(ActionKind::SpamBan, -300, 201, Utc::now());
+    runtime.persist_case(&blocked).await.unwrap();
+    runtime.persist_case(&ready).await.unwrap();
+    let _guard = runtime.review_guard(&blocked.id).await;
+    let telegram = TelegramStub::new(vec![]);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        handle_callback(
+            telegram.bot.clone(),
+            runtime.clone(),
+            review_callback(&ready.id, "train", "approve"),
+        ),
+    )
+    .await
+    .expect("an unrelated case must remain available")
+    .unwrap();
+    assert!(runtime
+        .find_active_network_ban(201)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(runtime
+        .find_active_network_ban(200)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(runtime.model.lock().await.spam_docs, 1);
+}
+
+#[tokio::test]
 async fn concurrent_training_callbacks_apply_one_decision_despite_failed_keyboard_edits() {
     let runtime = Arc::new(test_runtime().await);
     let case = dummy_case(ActionKind::SpamBan, -100, 200, Utc::now());

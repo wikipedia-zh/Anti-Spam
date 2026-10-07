@@ -345,7 +345,7 @@ async fn startup_worker_recovers_legacy_pending_reversals_without_inventing_an_a
             }
             sleep(Duration::from_millis(10)).await;
         }
-        let _guard = restarted.review_lock.lock().await;
+        let _guard = restarted.review_guard(&case.id).await;
     })
     .await;
     worker.abort();

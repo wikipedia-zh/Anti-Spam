@@ -136,7 +136,7 @@ pub(super) async fn reverse_ban_case(
     actor_id: i64,
     actor_name: &str,
 ) -> Result<String, String> {
-    let _guard = runtime.review_lock.lock().await;
+    let _guard = runtime.review_guard(&case.id).await;
     let _action_guard = runtime.user_action_guard(case.target_user_id).await;
     let case = runtime
         .load_case(&case.id)
@@ -153,7 +153,7 @@ pub(super) async fn reverse_ban_case(
     attempt_reversal(bot, runtime, case).await
 }
 
-// Call with review_lock held so a manual retry cannot overlap the worker.
+// Hold the case review guard and user action guard across the attempt.
 async fn attempt_reversal(
     bot: &Bot,
     runtime: &Runtime,
@@ -276,7 +276,7 @@ pub(super) async fn retry_due_reversals(bot: &Bot, runtime: &Runtime) -> Result<
     }).await?;
     let mut attempted = 0;
     for case_id in case_ids {
-        let _guard = runtime.review_lock.lock().await;
+        let _guard = runtime.review_guard(&case_id).await;
         if !runtime.reversal_due(&case_id).await? {
             continue;
         }

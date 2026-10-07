@@ -73,6 +73,20 @@ fn write_sample(
 }
 
 impl Runtime {
+    pub(super) async fn review_guard(&self, case_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.review_locks.lock().await;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            let lock = locks
+                .get(case_id)
+                .and_then(std::sync::Weak::upgrade)
+                .unwrap_or_else(|| Arc::new(Mutex::new(())));
+            locks.insert(case_id.to_string(), Arc::downgrade(&lock));
+            lock
+        };
+        lock.lock_owned().await
+    }
+
     pub(super) fn migrate_v17_to_v18(conn: &mut Connection) -> Result<()> {
         let tx = conn.transaction()?;
         tx.execute_batch(

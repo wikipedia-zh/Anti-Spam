@@ -277,7 +277,7 @@ struct Runtime {
     /// persistence pattern as `project_chat`/`audit_log_chat`.
     exchange_channel: Mutex<Option<i64>>,
     model: Mutex<ModelState>,
-    review_lock: Mutex<()>,
+    review_locks: Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
     user_action_locks: Mutex<HashMap<i64, std::sync::Weak<Mutex<()>>>>,
     spam_rules: RwLock<Vec<SpamRule>>,
     mass_train_buffer: Mutex<HashMap<i64, Vec<String>>>,
@@ -497,7 +497,7 @@ impl Runtime {
             audit_log_chat: Mutex::new(audit_log_chat),
             exchange_channel: Mutex::new(exchange_channel),
             model: Mutex::new(model),
-            review_lock: Mutex::new(()),
+            review_locks: Mutex::new(HashMap::new()),
             user_action_locks: Mutex::new(HashMap::new()),
             spam_rules: RwLock::new(spam_rules),
             mass_train_buffer: Mutex::new(HashMap::new()),
@@ -8697,7 +8697,7 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
         return Ok(());
     }
 
-    let _review_guard = runtime.review_lock.lock().await;
+    let _review_guard = runtime.review_guard(case_id).await;
     let case = match runtime.load_case(case_id).await {
         Ok(case) => case,
         Err(_) => {
