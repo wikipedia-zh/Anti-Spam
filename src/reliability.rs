@@ -73,6 +73,25 @@ fn write_sample(
 }
 
 impl Runtime {
+    pub(super) async fn with_model_transaction<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<T> + Send + 'static,
+    {
+        let mut model = self.model.clone().lock_owned().await;
+        self.with_conn(move |conn| {
+            let tx = conn.transaction()?;
+            let value = f(&tx)?;
+            let next = Self::load_model(&tx)?;
+            tx.commit()?;
+            // spawn_blocking continues after its caller is cancelled. Keep
+            // the model lock and publish here, before another writer starts.
+            *model = next;
+            Ok(value)
+        })
+        .await
+    }
+
     pub(super) async fn review_guard(&self, case_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = {
             let mut locks = self.review_locks.lock().await;
@@ -111,18 +130,8 @@ impl Runtime {
         let label = label.to_string();
         let text = text.to_string();
         let case_id = case_id.map(str::to_string);
-        let mut model = self.model.lock().await;
-        let next = self
-            .with_conn(move |conn| {
-                let tx = conn.transaction()?;
-                write_sample(&tx, &label, &text, case_id.as_deref())?;
-                let next = Self::load_model(&tx)?;
-                tx.commit()?;
-                Ok(next)
-            })
-            .await?;
-        *model = next;
-        Ok(())
+        self.with_model_transaction(move |tx| write_sample(tx, &label, &text, case_id.as_deref()))
+            .await
     }
 
     /// The first decision wins, including rejection. Model changes and the
@@ -141,9 +150,7 @@ impl Runtime {
         let case_id = case_id.to_string();
         let decision = decision.to_string();
         let test_group_id = self.config.test_group_id;
-        let mut model = self.model.lock().await;
-        let (changed, next) = self.with_conn(move |conn| {
-            let tx = conn.transaction()?;
+        self.with_model_transaction(move |tx| {
             let (action, status, text): (String, String, String) = tx.query_row(
                 "SELECT action, status, evidence_text FROM cases WHERE id=?1", params![case_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -154,15 +161,11 @@ impl Runtime {
                 params![case_id, decision, actor_id, Utc::now().to_rfc3339()],
             )? != 0;
             if changed && decision == "approve" {
-                write_sample(&tx, "spam", &text, Some(&case_id))?;
-                network_delivery::enqueue_network_ban(&tx, &case_id, test_group_id)?;
+                write_sample(tx, "spam", &text, Some(&case_id))?;
+                network_delivery::enqueue_network_ban(tx, &case_id, test_group_id)?;
             }
-            let next = Self::load_model(&tx)?;
-            tx.commit()?;
-            Ok((changed, next))
-        }).await?;
-        *model = next;
-        Ok(changed)
+            Ok(changed)
+        }).await
     }
 
     pub(super) async fn remove_network_ban_target(

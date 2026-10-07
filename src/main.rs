@@ -282,7 +282,7 @@ struct Runtime {
     /// ticket bot's self-appeal bridge, set via `/set_exchange_channel`. Same
     /// persistence pattern as `project_chat`/`audit_log_chat`.
     exchange_channel: Mutex<Option<i64>>,
-    model: Mutex<ModelState>,
+    model: Arc<Mutex<ModelState>>,
     review_locks: Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
     user_action_locks: Mutex<HashMap<i64, std::sync::Weak<Mutex<()>>>>,
     spam_rules: RwLock<Vec<SpamRule>>,
@@ -503,7 +503,7 @@ impl Runtime {
             project_chat: Mutex::new(project_chat),
             audit_log_chat: Mutex::new(audit_log_chat),
             exchange_channel: Mutex::new(exchange_channel),
-            model: Mutex::new(model),
+            model: Arc::new(Mutex::new(model)),
             review_locks: Mutex::new(HashMap::new()),
             user_action_locks: Mutex::new(HashMap::new()),
             spam_rules: RwLock::new(spam_rules),
@@ -1607,9 +1607,7 @@ impl Runtime {
     /// actually undo the model's memory of the bad sample.
     async fn purge_training_by_case(&self, case_id: &str) -> Result<usize> {
         let case_id = case_id.to_string();
-        self.with_conn(move |conn| {
-            let tx = conn.transaction()?;
-
+        self.with_model_transaction(move |tx| {
             let mut samples = Vec::new();
             {
                 let mut stmt = tx.prepare("SELECT label, text FROM training_samples WHERE case_id = ?1")?;
@@ -1666,7 +1664,7 @@ impl Runtime {
             )?;
 
             let affected = tx.execute("DELETE FROM training_samples WHERE case_id = ?1", params![&case_id])?;
-            tx.commit()?;
+
             Ok(affected)
         })
         .await
@@ -1680,11 +1678,9 @@ impl Runtime {
     /// and deletes the row - same accounting as `purge_training_by_case`,
     /// just applied per-duplicate-row instead of per-case_id (many mass-
     /// imported duplicates never had a real case_id to key off of at all).
-    /// Returns (duplicates_removed, empty_removed). Caller must call
-    /// `rebuild_model()` afterward.
+    /// Returns (duplicates_removed, empty_removed) and refreshes the model.
     async fn dedupe_training_samples(&self) -> Result<(usize, usize)> {
-        self.with_conn(move |conn| {
-            let tx = conn.transaction()?;
+        self.with_model_transaction(move |tx| {
             let mut spam_docs: i64 = tx.query_row("SELECT COALESCE(value, '0') FROM model_meta WHERE key = 'spam_docs'", [], |row| row.get::<_, String>(0))?.parse().unwrap_or(0);
             let mut ham_docs: i64 = tx.query_row("SELECT COALESCE(value, '0') FROM model_meta WHERE key = 'ham_docs'", [], |row| row.get::<_, String>(0))?.parse().unwrap_or(0);
 
@@ -1762,7 +1758,7 @@ impl Runtime {
                         out
                     };
                     for rowid in extra_rowids {
-                        rollback(&tx, &text, &label)?;
+                        rollback(tx, &text, &label)?;
                         match label.as_str() {
                             "spam" => spam_docs = (spam_docs - 1).max(0),
                             "ham" => ham_docs = (ham_docs - 1).max(0),
@@ -1783,7 +1779,6 @@ impl Runtime {
                 params![ham_docs.to_string()],
             )?;
 
-            tx.commit()?;
             Ok((dup_removed, empty_removed))
         })
         .await
@@ -1813,8 +1808,7 @@ impl Runtime {
     /// Note this discards manual `/set` biases, which live in
     /// `word_frequencies` and have no backing sample to replay.
     async fn retrain_from_samples(&self) -> Result<(usize, usize)> {
-        self.with_conn(|conn| {
-            let tx = conn.transaction()?;
+        self.with_model_transaction(|tx| {
             let samples: Vec<(String, String)> = {
                 let mut stmt = tx.prepare("SELECT label, text FROM training_samples WHERE trim(text) != ''")?;
                 let mut rows = stmt.query([])?;
@@ -1851,7 +1845,7 @@ impl Runtime {
                 "INSERT INTO model_meta (key, value) VALUES ('ham_docs', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 params![ham_docs.to_string()],
             )?;
-            tx.commit()?;
+
             Ok((spam_docs, ham_docs))
         })
         .await
@@ -1864,10 +1858,12 @@ impl Runtime {
     async fn rebuild_model(&self) -> Result<ModelState> {
         // Lock before reading, so a concurrent training commit cannot be
         // overwritten by a snapshot read before that commit.
-        let mut model = self.model.lock().await;
-        let rebuilt = self.with_conn(|conn| Self::load_model(conn)).await?;
-        *model = rebuilt.clone();
-        Ok(rebuilt)
+        let mut model = self.model.clone().lock_owned().await;
+        self.with_conn(move |conn| {
+            let rebuilt = Self::load_model(conn)?;
+            *model = rebuilt.clone();
+            Ok(rebuilt)
+        }).await
     }
 
     async fn set_threshold(&self, value: f64) -> Result<()> {
@@ -2124,9 +2120,7 @@ impl Runtime {
 
     async fn purge_training_by_text(&self, payload: &str) -> Result<usize> {
         let payload = payload.to_string();
-        self.with_conn(move |conn| {
-            let tx = conn.transaction()?;
-
+        self.with_model_transaction(move |tx| {
             let mut samples = Vec::new();
             {
                 let mut stmt = tx.prepare("SELECT label, text FROM training_samples WHERE text LIKE ?1 OR text LIKE ?2")?;
@@ -2184,7 +2178,7 @@ impl Runtime {
                 "DELETE FROM training_samples WHERE text LIKE ?1 OR text LIKE ?2",
                 params![format!("%{payload}%"), payload],
             )?;
-            tx.commit()?;
+
             Ok(affected)
         })
         .await
@@ -2192,9 +2186,7 @@ impl Runtime {
 
     async fn undo_clean_training_sample_by_text(&self, text: &str) -> Result<usize> {
         let text = text.to_string();
-        self.with_conn(move |conn| {
-            let tx = conn.transaction()?;
-
+        self.with_model_transaction(move |tx| {
             let maybe_sample = {
                 let mut stmt = tx.prepare(
                     "SELECT id, text FROM training_samples WHERE label = 'ham' AND text = ?1 ORDER BY id DESC LIMIT 1",
@@ -2208,7 +2200,7 @@ impl Runtime {
             };
 
             let Some((sample_id, sample_text)) = maybe_sample else {
-                tx.commit()?;
+
                 return Ok(0);
             };
 
@@ -2243,7 +2235,7 @@ impl Runtime {
             )?;
 
             tx.execute("DELETE FROM training_samples WHERE id = ?1", params![sample_id])?;
-            tx.commit()?;
+
             Ok(1)
         })
         .await
@@ -9376,6 +9368,7 @@ mod tests {
     mod network_delivery;
     mod origin_retry;
     mod guest_delivery;
+    mod model_updates;
     mod captcha;
     mod edited_messages;
     mod notices;
