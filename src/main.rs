@@ -9,6 +9,8 @@
 
 mod reliability;
 use reliability::{execute_auto_ban, passes_threshold, stable_probability};
+mod reversal_retry;
+use reversal_retry::{reverse_ban_case, spawn_reversal_worker};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -689,6 +691,9 @@ impl Runtime {
         }
         if user_version < 18 {
             Self::migrate_v17_to_v18(conn)?;
+        }
+        if user_version < 19 {
+            Self::migrate_v18_to_v19(conn)?;
         }
         Ok(())
     }
@@ -5199,50 +5204,6 @@ fn unban_noop_reason(err: &teloxide::RequestError) -> Option<&'static str> {
     None
 }
 
-async fn reverse_ban_case(bot: &Bot, runtime: &Runtime, mut case: CaseRecord, actor_id: i64, actor_name: &str) -> Result<String, String> {
-    let _review_guard = runtime.review_lock.lock().await;
-    case = runtime.load_case(&case.id).await.map_err(|e| e.to_string())?
-        .ok_or_else(|| "案例不存在".to_string())?;
-    if case.status == "reversed" { return Ok("此案例已撤銷".to_string()); }
-    let starting = case.status != "reversal_pending";
-    if starting {
-        runtime.record_network_ban_target(&case.id, case.chat_id).await.map_err(|e| e.to_string())?;
-        case.status = "reversal_pending".to_string();
-        runtime.persist_case(&case).await.map_err(|e| e.to_string())?;
-    }
-    let removed = runtime.purge_training_by_case(&case.id).await.map_err(|e| e.to_string())?;
-    runtime.rebuild_model().await.map_err(|e| e.to_string())?;
-    let targets = runtime.list_network_ban_targets(&case.id).await.map_err(|e| e.to_string())?;
-    let mut errors = Vec::new();
-    let mut retained = 0;
-    for chat_id in targets {
-        if runtime.has_other_ban_in_chat(&case.id, chat_id, case.target_user_id).await.map_err(|e| e.to_string())? {
-            retained += 1;
-        } else if let Err(err) = bot.unban_chat_member(ChatId(chat_id), UserId(case.target_user_id as u64)).only_if_banned(true).await {
-            if unban_noop_reason(&err).is_none() {
-                errors.push(format!("群組 {chat_id}: {err}"));
-                continue;
-            }
-        }
-        runtime.remove_network_ban_target(&case.id, chat_id).await.map_err(|e| e.to_string())?;
-    }
-    if !errors.is_empty() {
-        return Err(format!("案例 {} 撤銷尚未完成；已保留失敗項目，可重新執行解封或撤銷指令。{}", case.id, errors.join("；")));
-    }
-    case.action = ActionKind::Unbanned;
-    case.status = "reversed".to_string();
-    case.actor_user_id = Some(actor_id);
-    case.actor_name = Some(actor_name.to_string());
-    runtime.persist_case(&case).await.map_err(|e| e.to_string())?;
-    if let Ok(id) = log_action(bot, runtime, &case).await {
-        case.log_message_id = Some(id);
-        runtime.persist_case(&case).await.map_err(|e| e.to_string())?;
-        let _ = notify_group(bot, runtime, &case, id, "<b>封禁案例已撤銷</b>").await;
-    }
-    broadcast_unban_if_fully_clear(bot, runtime, case.target_user_id).await;
-    Ok(format!("已撤銷 case <code>{}</code>、移除 {removed} 筆訓練樣本；{retained} 個群組因其他有效案件而保留限制。", case.id))
-}
-
 /// Reverses a mute case: restores full permissions in the case's chat and
 /// marks the case `Unmuted`. Shared by `/unmute`'s maintainer path and the
 /// `/revert` dispatcher.
@@ -8604,7 +8565,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             let reply = if errors.is_empty() {
                 format!("已解封用戶 <code>{target_user_id}</code>，撤銷 {reversed}/{total} 筆封禁案例並清除對應訓練樣本，同時移出跨群組黑名單。")
             } else {
-                format!("用戶 <code>{target_user_id}</code> 的撤銷尚未完成，已完成 {reversed}/{total} 筆案例。失敗項目已保留，請重試。\n{}", escape_html(&errors.join("；")))
+                format!("用戶 <code>{target_user_id}</code> 的撤銷尚未完成，已完成 {reversed}/{total} 筆案例。\n{}", escape_html(&errors.join("；")))
             };
             bot.send_message(message.chat.id, reply).parse_mode(ParseMode::Html).await?;
         }
@@ -9387,6 +9348,7 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     let bot = Bot::new(config.bot_token.clone());
     let runtime = Arc::new(Runtime::load(config).await?);
+    let reversal_worker = spawn_reversal_worker(bot.clone(), runtime.clone());
 
     if let Some(owner_id) = runtime.config.owner_id {
         // Best-effort: a restart is exactly when this is most useful, but it
@@ -9629,6 +9591,8 @@ async fn main() -> Result<()> {
         .build();
 
     dispatcher.dispatch().await;
+    reversal_worker.abort();
+    let _ = reversal_worker.await;
 
     Ok(())
 }
@@ -9637,6 +9601,7 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     mod reliability;
+    mod reversal_retry;
 
     /// Exercise the real command handler without contacting Telegram.
     struct TelegramStub {
@@ -9653,6 +9618,13 @@ mod tests {
         }
 
         fn with_failures(admin_ids: Vec<i64>, failures: Vec<(String, i64)>) -> Self {
+            let errors = failures.into_iter().map(|(method, chat)| {
+                (method, chat, serde_json::json!({"ok": false, "error_code": 400, "description": "Bad Request: injected failure"}))
+            }).collect();
+            Self::with_api_errors(admin_ids, errors)
+        }
+
+        fn with_api_errors(admin_ids: Vec<i64>, failures: Vec<(String, i64, serde_json::Value)>) -> Self {
             use std::io::{BufRead, Read, Write};
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
@@ -9667,7 +9639,7 @@ mod tests {
                     stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
                     let mut reader = std::io::BufReader::new(&mut stream);
                     let mut first = String::new();
-                    reader.read_line(&mut first).unwrap();
+                    if reader.read_line(&mut first).unwrap() == 0 { continue; }
                     let method = first.split_whitespace().nth(1).unwrap().rsplit('/').next().unwrap().to_ascii_lowercase();
                     let mut length = 0;
                     loop {
@@ -9697,8 +9669,8 @@ mod tests {
                         }),
                         _ => serde_json::json!(true),
                     };
-                    let response = if failures.iter().any(|(m, chat)| m == &method && args["chat_id"].as_i64() == Some(*chat)) {
-                        serde_json::json!({"ok": false, "error_code": 400, "description": "Bad Request: injected failure"})
+                    let response = if let Some((_, _, error)) = failures.iter().find(|(m, chat, _)| m == &method && args["chat_id"].as_i64() == Some(*chat)) {
+                        error.clone()
                     } else {
                         serde_json::json!({"ok": true, "result": result})
                     }.to_string();
