@@ -16,6 +16,7 @@ mod report_delivery;
 mod maintenance;
 mod warning_queue;
 mod rule_updates;
+mod rule_notices;
 use origin_retry::execute_auto_ban;
 use reliability::{passes_threshold, stable_probability};
 mod reversal_retry;
@@ -732,6 +733,9 @@ impl Runtime {
         }
         if user_version < 28 {
             Self::migrate_v27_to_v28(conn)?;
+        }
+        if user_version < 29 {
+            Self::migrate_v28_to_v29(conn)?;
         }
         Ok(())
     }
@@ -2289,16 +2293,6 @@ impl Runtime {
                 )
                 .ok();
             Ok((top_spam, top_ham))
-        })
-        .await
-    }
-
-    async fn spam_rule_pattern_exists(&self, pattern: &str) -> Result<bool> {
-        let pattern = pattern.to_string();
-        self.with_conn(move |conn| {
-            Ok(conn
-                .query_row("SELECT COUNT(*) FROM spam_rules WHERE pattern = ?1", params![pattern], |row| row.get::<_, i64>(0))?
-                > 0)
         })
         .await
     }
@@ -4021,45 +4015,6 @@ fn bot_mentions_only(text: &str) -> Option<Vec<String>> {
     }
     let mut seen = std::collections::HashSet::new();
     Some(bots.into_iter().filter(|b| seen.insert(b.clone())).collect())
-}
-
-/// Turns a pure bot-mention message into regex rules - one per handle - so
-/// the bot is caught deterministically wherever it appears next. Shared by
-/// the manual /sb path and the auto-ban path (a member pasting bot handles
-/// as an advert scores as spam and lands here too, not just guest-mode
-/// summons). Logs each created rule to the log channel for review. Returns
-/// true if `evidence` was a pure bot mention at all (whether or not new
-/// rules were created), so the caller can label the case BOTSPAM and skip
-/// ML training on a bare username.
-async fn capture_bot_spam_rules(bot: &Bot, runtime: &Runtime, chat_id: i64, evidence: &str) -> Result<bool> {
-    let Some(bots) = bot_mentions_only(evidence) else { return Ok(false); };
-    let mut created = Vec::new();
-    for b in &bots {
-        let pattern = format!("(?i)@{b}\\b");
-        if runtime.spam_rule_pattern_exists(&pattern).await? {
-            continue;
-        }
-        let id = runtime
-            .add_spam_rule(&pattern, &format!("純機器人提及 spam：@{b}（自動建立）"))
-            .await?;
-        created.push((id, b.clone()));
-    }
-    runtime.refresh_spam_rules().await?;
-    if !created.is_empty() {
-        let list = created
-            .iter()
-            .map(|(id, b)| format!("@{b}（規則 #{id}）"))
-            .collect::<Vec<_>>()
-            .join("、");
-        bot
-            .send_message(
-                ChatId(runtime.config.log_channel_id),
-                format!("<b>已自動建立機器人提及規則</b>\n來源：群組 <code>{chat_id}</code>\n{list}\n如為誤判請用 /del_rule 移除。"),
-            )
-            .parse_mode(ParseMode::Html)
-            .await?;
-    }
-    Ok(true)
 }
 
 fn strip_mentions(text: &str) -> String {
@@ -8986,6 +8941,7 @@ mod tests {
     mod maintenance;
     mod warning_queue;
     mod rule_updates;
+    mod rule_notices;
     mod captcha;
     mod edited_messages;
     mod notices;

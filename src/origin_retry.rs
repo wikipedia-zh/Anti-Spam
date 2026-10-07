@@ -652,14 +652,7 @@ pub(super) async fn attempt_origin_ban(
             .await?;
     }
     if job.banned && job.case.matched_rule_pattern.as_deref() == Some("BOTSPAM") {
-        if let Err(err) = api(capture_bot_spam_rules(
-            bot,
-            runtime,
-            job.case.chat_id,
-            &job.case.evidence_text,
-        ))
-        .await
-        {
+        if let Err(err) = api(rule_notices::capture(bot, runtime, &job.case)).await {
             record_error(runtime, &mut job, "bot_spam_rules", &err).await?;
             runtime.save_origin_job(&job, "pending", guards).await?;
             return Ok(true);
@@ -764,6 +757,9 @@ pub(super) fn spawn_origin_worker(bot: Bot, runtime: Arc<Runtime>) -> tokio::tas
         loop {
             if let Err(err) = retry_origin_bans(&bot, &runtime).await {
                 log::warn!("original ban queue: {err}");
+            }
+            if let Err(err) = rule_notices::retry(&bot, &runtime).await {
+                log::warn!("rule notice queue: {err}");
             }
             if let Err(err) = warning_queue::retry(&bot, &runtime).await {
                 log::warn!("warning queue: {err}");

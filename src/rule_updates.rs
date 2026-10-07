@@ -1,7 +1,7 @@
 use super::*;
 
 impl Runtime {
-    async fn with_rule_transaction<T: Send + 'static>(
+    pub(super) async fn with_rule_transaction<T: Send + 'static>(
         &self,
         change: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T> + Send + 'static,
     ) -> Result<T> {
@@ -18,6 +18,7 @@ impl Runtime {
         .await
     }
 
+    #[cfg(test)]
     pub(super) async fn refresh_spam_rules(&self) -> Result<()> {
         let mut cache = self.spam_rules.clone().write_owned().await;
         self.with_conn(move |conn| {
