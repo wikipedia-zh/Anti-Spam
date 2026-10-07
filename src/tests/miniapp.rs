@@ -249,6 +249,19 @@ async fn threshold_privileges_and_hidden_modules_match_existing_commands() {
     let api = TestApi::new().await;
     let token = api.login(200, -100).await;
     assert_eq!(
+        api.save(&token, 0, serde_json::json!({"threshold_override":0.5}))
+            .await
+            .status(),
+        403
+    );
+    assert!(api
+        .runtime
+        .get_group_modules(-100)
+        .await
+        .unwrap()
+        .spam_threshold_override
+        .is_none());
+    assert_eq!(
         api.save(&token, 0, serde_json::json!({"threshold_override":0.9}))
             .await
             .status(),

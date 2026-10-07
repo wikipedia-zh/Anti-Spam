@@ -34,6 +34,78 @@ async fn state(runtime: &Runtime, id: &str) -> (String, bool, bool) {
 }
 
 #[tokio::test]
+async fn lower_local_threshold_never_promotes_a_low_score_ban_to_other_groups() {
+    let runtime = test_runtime().await;
+    runtime.set_threshold(0.90).await.unwrap();
+    runtime.set_group_threshold(-100, Some(0.60)).await.unwrap();
+    runtime
+        .set_group_module(-300, "netban", true)
+        .await
+        .unwrap();
+    let mut case = dummy_case(ActionKind::AutoBan, -100, 200, Utc::now());
+    case.model_score = Some(0.70);
+    // Keep the job pending after the local ban, then exercise restart and retry.
+    let failed = TelegramStub::with_failures(vec![], vec![("sendmessage".into(), -1)]);
+    assert!(
+        execute_auto_ban(&failed.bot, &runtime, case.clone(), "test")
+            .await
+            .unwrap()
+    );
+    assert!(calls(&failed, "banchatmember")
+        .iter()
+        .any(|v| v["chat_id"] == -100));
+    assert!(runtime
+        .find_active_network_ban(200)
+        .await
+        .unwrap()
+        .is_none());
+    let restarted = Runtime::load(runtime.config.clone()).await.unwrap();
+    let success = TelegramStub::new(vec![]);
+    due_now(&restarted).await;
+    retry_origin_bans(&success.bot, &restarted).await.unwrap();
+    deliver_network_bans(&success.bot, &restarted, None)
+        .await
+        .unwrap();
+    assert!(calls(&success, "banchatmember").is_empty());
+    assert!(restarted
+        .find_active_network_ban(200)
+        .await
+        .unwrap()
+        .is_none());
+    let id = case.id.clone();
+    restarted
+        .with_conn(move |conn| {
+            assert_eq!(
+                conn.query_row("SELECT netban_eligible FROM cases WHERE id=?1", [id], |r| r
+                    .get::<_, i64>(0))?,
+                0
+            );
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM network_deliveries", [], |r| r
+                    .get::<_, i64>(0))?,
+                0
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    // A score meeting the global threshold still qualifies.
+    let mut higher = dummy_case(ActionKind::AutoBan, -100, 201, Utc::now());
+    higher.model_score = Some(0.95);
+    assert!(execute_auto_ban(&success.bot, &restarted, higher, "test")
+        .await
+        .unwrap());
+    assert!(restarted
+        .find_active_network_ban(201)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(calls(&success, "banchatmember")
+        .iter()
+        .any(|v| v["chat_id"] == -300 && v["user_id"] == 201));
+}
+
+#[tokio::test]
 async fn failed_original_ban_resumes_after_restart_without_repeating_deletion() {
     let runtime = test_runtime().await;
     runtime
