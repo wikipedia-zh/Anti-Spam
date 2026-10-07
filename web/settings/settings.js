@@ -112,16 +112,17 @@
     }
   }
   async function request(route, method = 'GET', body) {
+    const knownError = key => Object.hasOwn(copy.en,key) || (hostMode && key === 'group_access_denied');
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 28000);
     try {
       const response = await fetch(`api.php?route=${route}`,{method,headers:{'Content-Type':'application/json',...(token ? {Authorization:`Bearer ${token}`} : {})},credentials:'omit',cache:'no-store',redirect:'error',signal:controller.signal,...(body ? {body:JSON.stringify(body)} : {})});
       let data;
       try { data = await response.json(); } catch { throw new Error(method === 'PATCH' ? 'save_failed' : 'temporarily_unavailable'); }
-      if (!response.ok) throw new Error(Object.hasOwn(copy.en,data.error) ? data.error : 'temporarily_unavailable');
+      if (!response.ok) throw new Error(knownError(data.error) ? data.error : 'temporarily_unavailable');
       return data;
     } catch (error) {
-      if (Object.hasOwn(copy.en,error.message)) throw error;
+      if (knownError(error.message)) throw error;
       throw new Error(method === 'PATCH' ? 'save_failed' : 'temporarily_unavailable');
     } finally { clearTimeout(timer); }
   }

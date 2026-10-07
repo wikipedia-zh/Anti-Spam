@@ -59,7 +59,10 @@
     Object.assign(s,{auto_banned:s.ban_done,guest_bot_banned:s.ban_done,guest_invoker_banned:s.ban_done,approved_and_banned:s.ban_done,force_approved:s.ban_done});
     s.banned_delete_failed=language==='en'?'Banned; message deletion failed':language==='zh-Hans'?'已封禁，删消息失败':'已封禁，刪訊息失敗';
   }
-  let lang='zh-Hant',request,clearToken,root,view='overview',search='',filter='',offset=0,data=null,busy=false,closed=false,error='';
+  Object.assign(words['zh-Hant'],{groupSettings:'設定與自訂文字',openSettings:'前往群組設定 ↗',groupLinkNote:'此入口 5 分鐘內有效，只限你本人使用。開啟及儲存時會重新確認你和機器人的群組管理權限。',group_access_denied:'無法開啟此群設定。請確認你和機器人仍是該群管理員，且該群未被終止服務。'});
+  Object.assign(words['zh-Hans'],{groupSettings:'设置与自定义文字',openSettings:'前往群组设置 ↗',groupLinkNote:'此入口 5 分钟内有效，仅限你本人使用。打开及保存时会重新确认你和机器人的群组管理权限。',group_access_denied:'无法打开此群设置。请确认你和机器人仍是该群管理员，且该群未被终止服务。'});
+  Object.assign(words.en,{groupSettings:'Settings and group messages',openSettings:'Open group settings ↗',groupLinkNote:'This link is valid for 5 minutes and only works for you. Your group admin rights and the bot’s are checked again when opening and saving.',group_access_denied:'Unable to open this group’s settings. You and the bot must still be group admins, and the group must not be denied service.'});
+  let lang='zh-Hant',request,clearToken,root,view='overview',search='',filter='',offset=0,data=null,busy=false,closed=false,error='',groupLink=null;
   const t = key => words[lang][key] ?? key;
   const element = (tag,text,className) => {const el=document.createElement(tag); if(text!==undefined)el.textContent=text; if(className)el.className=className; return el;};
   function button(text,action) {const el=element('button',text);el.type='button';el.disabled=busy||closed;el.addEventListener('click',action);return el;}
@@ -100,13 +103,23 @@
       for(const item of data.items){const card=element('article',undefined,'host-record');card.append(element('h3',item.target_name||item.title||t(item.role)||item.case_id||item.id||t(view)));
         const brief=[item.target_user_id??item.user_id??item.chat_id,item.status?value('status',item.status):item.kind||'',item.created_at?date(item.created_at):''].filter(v=>v!==''&&v!==undefined).join(' · ');card.append(element('p',brief,'host-meta'));
         const detail=element('details');detail.append(element('summary',t('details')));const dl=element('dl');for(const key of fields[view])dl.append(element('dt',t(key)),element('dd',value(key,item[key])));detail.append(dl);
-        for(const key of ['evidence','detail','last_error'])if(item[key]){detail.append(element('h4',t(key)),element('pre',item[key]));}card.append(detail);if(view==='people'&&item.role!=='host')card.append(button(t('editRoles'),()=>editRole(item.user_id)));root.append(card);}
+        for(const key of ['evidence','detail','last_error'])if(item[key]){detail.append(element('h4',t(key)),element('pre',item[key]));}card.append(detail);if(view==='people'&&item.role!=='host')card.append(button(t('editRoles'),()=>editRole(item.user_id)));
+        if(view==='groups'){
+          card.append(button(t('groupSettings'),()=>prepareGroup(item.chat_id)));
+          if(groupLink?.chat_id===item.chat_id){
+            const link=element('a',t('openSettings'),'host-group-link');link.href=groupLink.url;
+            link.addEventListener('click',event=>{if(window.Telegram?.WebApp?.openTelegramLink){event.preventDefault();window.Telegram.WebApp.openTelegramLink(link.href);}});
+            card.append(link,element('p',t('groupLinkNote'),'host-note'));
+          }
+        }
+        root.append(card);}
       const pager=element('div',undefined,'host-pagination');const previous=button(t('previous'),()=>{offset-=25;load();});previous.disabled=busy||offset===0;const next=button(t('next'),()=>{offset+=25;load();});next.disabled=busy||!data.has_more||offset>=100000;pager.append(previous,element('span',`${t('page')} ${offset/25+1}`),next);root.append(pager);
     }
     if(['overview','groups'].includes(view))root.append(element('p',t('note'),'host-note'));
   }
   function editRole(userId){window.SPBRoleEditor.open({request,language:lang,userId,onAuthError:fail,onSaved:async id=>{view='people';search=String(id);offset=0;filter='';await load();}});}
-  async function load(){if(busy||closed)return;busy=true;error='';data=null;render();try{data=await request('host-query','POST',{view,search,filter,offset});}catch(e){fail(e);}finally{busy=false;render();}}
+  async function prepareGroup(chatId){if(busy||closed)return;busy=true;error='';groupLink=null;render();try{const result=await request('host-group-link','POST',{chat_id:chatId});const url=new URL(result.url);if(url.protocol!=='https:'||url.hostname!=='t.me'||url.username||url.password)throw new Error('temporarily_unavailable');groupLink={chat_id:chatId,url:url.href};}catch(e){fail(e);}finally{busy=false;render();}}
+  async function load(){if(busy||closed)return;busy=true;error='';data=null;groupLink=null;render();try{data=await request('host-query','POST',{view,search,filter,offset});}catch(e){fail(e);}finally{busy=false;render();}}
   function fail(e){error=Object.hasOwn(words.en,e.message)?e.message:'temporarily_unavailable';if(['session_expired','forbidden'].includes(error)){closed=true;data=null;clearToken?.();window.SPBRoleEditor.expire();}render();}
   async function logout(){if(busy||closed)return;busy=true;render();try{await request('logout','POST',{});closed=true;data=null;clearToken();error='signedOut';}catch(e){fail(e);}finally{busy=false;render();}}
   window.SPBHost={

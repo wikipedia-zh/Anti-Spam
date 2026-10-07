@@ -271,6 +271,189 @@ async fn host_sessions_are_separate_from_group_admin_and_maintainer_sessions() {
 }
 
 #[tokio::test]
+async fn host_group_links_preserve_group_scope_and_recheck_admin_rights() {
+    let api = TestApi::new().await;
+    let host_link = api.service.host_link(HOST_ID).await.unwrap();
+    let launch = host_link
+        .query_pairs()
+        .find(|(key, _)| key == "startapp")
+        .unwrap()
+        .1
+        .into_owned();
+    let response = api
+        .login_raw(&signed(
+            &api.runtime.config.bot_token,
+            HOST_ID,
+            &launch,
+            Utc::now().timestamp(),
+        ))
+        .await;
+    let session: serde_json::Value = response.json().await.unwrap();
+    let host_token = session["token"].as_str().unwrap();
+    let request = |token: &str, chat_id| {
+        api.request(reqwest::Method::POST, "/api/host/group-link")
+            .bearer_auth(token)
+            .json(&serde_json::json!({"chat_id":chat_id}))
+    };
+    for user in [200, HOST_ID] {
+        let token = api.login(user, -100).await;
+        assert_eq!(request(&token, -100).send().await.unwrap().status(), 403);
+    }
+    for chat in [0, HOST_ID, i64::MIN] {
+        assert_eq!(
+            request(host_token, chat).send().await.unwrap().status(),
+            400
+        );
+    }
+    let response = request(host_token, -100).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let url = Url::parse(body["url"].as_str().unwrap()).unwrap();
+    let launch = url
+        .query_pairs()
+        .find(|(key, _)| key == "startapp")
+        .unwrap()
+        .1
+        .into_owned();
+    let raw = signed(
+        &api.runtime.config.bot_token,
+        HOST_ID,
+        &launch,
+        Utc::now().timestamp(),
+    );
+    assert_eq!(
+        api.login_raw(&signed(
+            &api.runtime.config.bot_token,
+            200,
+            &launch,
+            Utc::now().timestamp()
+        ))
+        .await
+        .status(),
+        401
+    );
+    let response = api.login_raw(&raw).await;
+    assert_eq!(response.status(), 200);
+    let session: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(session["scope"], "group");
+    let group_token = session["token"].as_str().unwrap();
+    assert_eq!(api.login_raw(&raw).await.status(), 401);
+    assert_eq!(
+        request(group_token, -200).send().await.unwrap().status(),
+        403
+    );
+    assert_eq!(
+        api.request(reqwest::Method::POST, "/api/host/query")
+            .bearer_auth(group_token)
+            .json(&serde_json::json!({"view":"overview"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        api.save(
+            group_token,
+            0,
+            serde_json::json!({"ot_template":"{user} 請留意主題。"})
+        )
+        .await
+        .status(),
+        200
+    );
+    assert_eq!(
+        api.runtime
+            .get_warn_settings(-100)
+            .await
+            .unwrap()
+            .ot_template
+            .as_deref(),
+        Some("{user} 請留意主題。")
+    );
+    assert!(api
+        .runtime
+        .get_warn_settings(-200)
+        .await
+        .unwrap()
+        .ot_template
+        .is_none());
+
+    // Issue another link, then remove the host's group rights before it is opened.
+    let pending: serde_json::Value = request(host_token, -100)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let url = Url::parse(pending["url"].as_str().unwrap()).unwrap();
+    let launch = url
+        .query_pairs()
+        .find(|(key, _)| key == "startapp")
+        .unwrap()
+        .1
+        .into_owned();
+    api.telegram.members.lock().unwrap().insert((-100,HOST_ID),serde_json::json!({"status":"member","user":{"id":HOST_ID,"is_bot":false,"first_name":"Member"}}));
+    assert_eq!(
+        api.login_raw(&signed(
+            &api.runtime.config.bot_token,
+            HOST_ID,
+            &launch,
+            Utc::now().timestamp()
+        ))
+        .await
+        .status(),
+        403
+    );
+    assert_eq!(
+        api.save(group_token, 1, serde_json::json!({"ot_template":"changed"}))
+            .await
+            .status(),
+        403
+    );
+    let denied = request(host_token, -100).send().await.unwrap();
+    assert_eq!(denied.status(), 403);
+    assert_eq!(
+        denied.json::<serde_json::Value>().await.unwrap()["error"],
+        "group_access_denied"
+    );
+    api.telegram
+        .members
+        .lock()
+        .unwrap()
+        .remove(&(-100, HOST_ID));
+    api.telegram.members.lock().unwrap().insert(
+        (-100, 999),
+        serde_json::json!({"status":"member","user":{"id":999,"is_bot":true,"first_name":"Bot"}}),
+    );
+    assert_eq!(
+        request(host_token, -100).send().await.unwrap().status(),
+        403
+    );
+    api.telegram.members.lock().unwrap().remove(&(-100, 999));
+    api.runtime
+        .set_group_banned(-100, true, "test", Some(HOST_ID))
+        .await
+        .unwrap();
+    assert_eq!(
+        request(host_token, -100).send().await.unwrap().status(),
+        403
+    );
+    // Losing access to one group must not terminate the separate host session.
+    assert_eq!(
+        api.request(reqwest::Method::POST, "/api/host/query")
+            .bearer_auth(host_token)
+            .json(&serde_json::json!({"view":"overview"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+}
+
+#[tokio::test]
 async fn host_queries_paginate_filter_and_redact_private_diagnostics() {
     let runtime = test_runtime().await;
     for user in 100..127 {

@@ -489,6 +489,45 @@ async fn logout(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct GroupTarget {
+    chat_id: i64,
+}
+
+async fn host_group_link(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    payload: std::result::Result<Json<GroupTarget>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let host = session(&api, &headers).await?;
+    if host.scope != Scope::Host || !is_host(host.user_id) {
+        return Err(forbidden());
+    }
+    let Json(target) = payload.map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    if target.chat_id >= 0 || target.chat_id <= -(1_i64 << 52) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
+    }
+    let group = Grant {
+        chat_id: target.chat_id,
+        scope: Scope::Group,
+        ..host
+    };
+    permissions(&api, &group).await.map_err(|error| {
+        if error.0 == StatusCode::FORBIDDEN {
+            ApiError(StatusCode::FORBIDDEN, "group_access_denied")
+        } else {
+            error
+        }
+    })?;
+    let url = api
+        .service
+        .launch_link(group.user_id, group.chat_id)
+        .await
+        .map_err(|_| unavailable())?;
+    Ok(Json(serde_json::json!({"url":url.as_str()})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RoleTarget {
     user_id: i64,
 }
@@ -601,6 +640,7 @@ pub(super) fn router(api: Api) -> Router {
         .route("/api/miniapp/session", post(login))
         .route("/api/miniapp/logout", post(logout))
         .route("/api/host/query", post(host_query))
+        .route("/api/host/group-link", post(host_group_link))
         .route("/api/host/role", post(read_host_role).patch(save_host_role))
         .route(
             "/api/groups/current/settings",

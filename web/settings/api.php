@@ -27,9 +27,10 @@ if (($clientOrigin !== '' && $clientOrigin !== $origin)
 }
 $route = $_GET['route'] ?? '';
 $paths = ['session' => '/api/miniapp/session', 'settings' => '/api/groups/current/settings',
-    'host-query' => '/api/host/query', 'logout' => '/api/miniapp/logout', 'host-role' => '/api/host/role'];
+    'host-query' => '/api/host/query', 'logout' => '/api/miniapp/logout', 'host-role' => '/api/host/role',
+    'host-group-link' => '/api/host/group-link'];
 if (!is_string($route) || !isset($paths[$route])) fail(404, 'invalid_request');
-if ((in_array($route, ['session', 'host-query', 'logout'], true) && $method !== 'POST')
+if ((in_array($route, ['session', 'host-query', 'logout', 'host-group-link'], true) && $method !== 'POST')
     || ($route === 'settings' && !in_array($method, ['GET', 'PATCH'], true))
     || ($route === 'host-role' && !in_array($method, ['POST', 'PATCH'], true))) {
     fail(405, 'invalid_request');
