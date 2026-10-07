@@ -13,6 +13,9 @@ async fn upgrade_check_preserves_uncheckpointed_data_and_restores_the_old_schema
     runtime.with_conn(|conn| {
         conn.execute_batch("PRAGMA user_version=24;
             DROP TABLE restriction_jobs; DROP TABLE report_deliveries; DROP TABLE warning_requests; DROP TABLE warning_removals; DROP TABLE rule_captures; DROP TABLE rule_notice_jobs;
+            DROP TRIGGER maintainers_revision_INSERT; DROP TRIGGER maintainers_revision_UPDATE; DROP TRIGGER maintainers_revision_DELETE;
+            DROP TRIGGER reviewers_revision_INSERT; DROP TRIGGER reviewers_revision_UPDATE; DROP TRIGGER reviewers_revision_DELETE;
+            DROP TABLE host_role_requests; DROP TABLE role_revision;
             DROP TRIGGER group_text_revision_insert; DROP TRIGGER group_text_revision_update; DROP TRIGGER group_text_revision_delete;")?;
         Ok(())
     }).await.unwrap();
@@ -27,7 +30,7 @@ async fn upgrade_check_preserves_uncheckpointed_data_and_restores_the_old_schema
     let report = crate::maintenance::check_upgrade(&runtime.config.sqlite_path, &output).unwrap();
     let json = serde_json::to_value(report).unwrap();
     assert_eq!(json["schema_before"], 24);
-    assert_eq!(json["schema_after"], 29);
+    assert_eq!(json["schema_after"], 30);
     assert_eq!(json["restore"], "ok");
     assert_eq!(
         writer

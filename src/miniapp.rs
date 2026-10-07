@@ -487,6 +487,63 @@ async fn logout(
     Ok(Json(serde_json::json!({"logged_out":true})))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoleTarget {
+    user_id: i64,
+}
+
+async fn read_host_role(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    payload: std::result::Result<Json<RoleTarget>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<role_updates::Snapshot>, ApiError> {
+    let grant = session(&api, &headers).await?;
+    if grant.scope != Scope::Host || !is_host(grant.user_id) {
+        return Err(forbidden());
+    }
+    let Json(target) = payload.map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    if !role_updates::valid_user(target.user_id) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
+    }
+    Ok(Json(
+        api.runtime
+            .role_snapshot(target.user_id)
+            .await
+            .map_err(storage_error)?,
+    ))
+}
+
+async fn save_host_role(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    payload: std::result::Result<
+        Json<role_updates::Patch>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> std::result::Result<Json<role_updates::Snapshot>, ApiError> {
+    let grant = session(&api, &headers).await?;
+    if grant.scope != Scope::Host || !is_host(grant.user_id) {
+        return Err(forbidden());
+    }
+    let Json(patch) = payload.map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    match api
+        .runtime
+        .save_host_role(grant.user_id, patch)
+        .await
+        .map_err(storage_error)?
+    {
+        role_updates::SaveResult::Saved(snapshot) => Ok(Json(snapshot)),
+        role_updates::SaveResult::Conflict => {
+            Err(ApiError(StatusCode::CONFLICT, "settings_changed"))
+        }
+        role_updates::SaveResult::Invalid => {
+            Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"))
+        }
+        role_updates::SaveResult::Forbidden => Err(forbidden()),
+    }
+}
+
 async fn read_settings(
     State(api): State<Api>,
     headers: HeaderMap,
@@ -544,6 +601,7 @@ pub(super) fn router(api: Api) -> Router {
         .route("/api/miniapp/session", post(login))
         .route("/api/miniapp/logout", post(logout))
         .route("/api/host/query", post(host_query))
+        .route("/api/host/role", post(read_host_role).patch(save_host_role))
         .route(
             "/api/groups/current/settings",
             get(read_settings).patch(save_settings),

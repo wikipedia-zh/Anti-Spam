@@ -76,6 +76,18 @@ test('management queries use fixed authenticated POST routes', async () => {
     assert.equal(seen.at(-1).headers['x-spb-proxy-key'],key);
   }
 });
+test('role reads and changes require authentication and fixed methods', async () => {
+  const before=seen.length;
+  assert.equal((await request('host-role','GET')).status,405);
+  assert.equal((await request('host-role','PATCH',{Authorization:''},'{}')).status,401);
+  assert.equal((await request('host-role','POST',{Origin:'https://other.example'},'{}')).status,403);
+  assert.equal(seen.length,before);
+  for(const method of ['POST','PATCH']){
+    const payload=JSON.stringify({user_id:300,role:'maintainer',enabled:true});
+    assert.equal((await request('host-role',method,{},payload)).status,200);
+    assert.equal(seen.at(-1).path,'/api/host/role');assert.equal(seen.at(-1).body,payload);
+  }
+});
 test('conflicts survive the proxy and upstream failures stay private', async () => {
   responseStatus=409; responseBody=JSON.stringify({error:'settings_changed'});
   const conflict=await request(); assert.equal(conflict.status,409);

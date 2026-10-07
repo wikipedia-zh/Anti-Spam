@@ -51,9 +51,9 @@
     'zh-Hans':{auto_ban:'自动封禁',spam_ban:'人工封禁',pending_report:'待审核举报',report_approved:'举报已批准',report_rejected:'举报已拒绝',guest_bot_ban:'访客机器人封禁',guest_invoker_ban:'访客召唤者封禁',mute:'禁言',kick:'踢出群组',flood_mute:'刷屏禁言',project_ban:'项目封禁',pending_review:'待审核',ban_done:'已封禁',done:'已完成',ban_pending:'待封禁',ban_failed:'封禁失败',reversed:'已撤销',reversal_pending:'正在撤销',action_failed:'操作失败',action_unconfirmed:'结果未确认',action_cancelled:'已取消',action_pending:'待执行'},
     en:{auto_ban:'Automatic ban',spam_ban:'Manual ban',pending_report:'Report awaiting review',report_approved:'Approved report',report_rejected:'Rejected report',guest_bot_ban:'Guest bot ban',guest_invoker_ban:'Guest invoker ban',mute:'Mute',kick:'Kick',flood_mute:'Flood mute',project_ban:'Project ban',pending_review:'Awaiting review',ban_done:'Banned',done:'Completed',ban_pending:'Ban pending',ban_failed:'Ban failed',reversed:'Reversed',reversal_pending:'Reversal pending',action_failed:'Action failed',action_unconfirmed:'Result unconfirmed',action_cancelled:'Cancelled',action_pending:'Action pending'}
   };
-  Object.assign(words['zh-Hant'],{details:'查看記錄'});
-  Object.assign(words['zh-Hans'],{details:'查看记录'});
-  Object.assign(words.en,{details:'View record'});
+  Object.assign(words['zh-Hant'],{details:'查看記錄',manageRoles:'管理權限',editRoles:'修改權限',userSearch:'用戶 ID',queueSearch:'群組 ID 或案件 ID',auditSearch:'操作人 ID、群組 ID 或操作 ID'});
+  Object.assign(words['zh-Hans'],{details:'查看记录',manageRoles:'管理权限',editRoles:'修改权限',userSearch:'用户 ID',queueSearch:'群组 ID 或案件 ID',auditSearch:'操作人 ID、群组 ID 或操作 ID'});
+  Object.assign(words.en,{details:'View record',manageRoles:'Manage roles',editRoles:'Edit roles',userSearch:'User ID',queueSearch:'Group or case ID',auditSearch:'Actor, group or action ID'});
   for(const language of Object.keys(states)){
     const s=states[language];
     Object.assign(s,{auto_banned:s.ban_done,guest_bot_banned:s.ban_done,guest_invoker_banned:s.ban_done,approved_and_banned:s.ban_done,force_approved:s.ban_done});
@@ -85,8 +85,9 @@
     if(filter)root.append(element('p',t({pending_review:'pending_reports',failed:'failed_work',network:'pending_network'}[filter]),'host-note'));
     const form=element('form',undefined,'host-tools');form.addEventListener('submit',event=>{event.preventDefault();if(!busy){search=input.value.trim();offset=0;load();}});
     const input=element('input');input.type='search';input.maxLength=100;input.value=search;input.disabled=busy;input.id='host-search';
-    if(view!=='overview'){const label=element('label',t(view==='groups'?'groupSearch':'search'));label.htmlFor=input.id;label.append(input);const submit=element('button',t('find'));submit.type='submit';submit.disabled=busy;form.append(label,submit);}
+    if(view!=='overview'){const label=element('label',t({groups:'groupSearch',people:'userSearch',queue:'queueSearch',audit:'auditSearch'}[view]||'search'));label.htmlFor=input.id;label.append(input);const submit=element('button',t('find'));submit.type='submit';submit.disabled=busy;form.append(label,submit);}
     form.append(button(t('refresh'),load));root.append(form);
+    if(view==='people')root.append(button(t('manageRoles'),()=>editRole()));
     if(!data)return;
     if(view==='overview'){
       const summary=data.items[0];const grid=element('div',undefined,'host-summary');
@@ -99,16 +100,17 @@
       for(const item of data.items){const card=element('article',undefined,'host-record');card.append(element('h3',item.target_name||item.title||t(item.role)||item.case_id||item.id||t(view)));
         const brief=[item.target_user_id??item.user_id??item.chat_id,item.status?value('status',item.status):item.kind||'',item.created_at?date(item.created_at):''].filter(v=>v!==''&&v!==undefined).join(' · ');card.append(element('p',brief,'host-meta'));
         const detail=element('details');detail.append(element('summary',t('details')));const dl=element('dl');for(const key of fields[view])dl.append(element('dt',t(key)),element('dd',value(key,item[key])));detail.append(dl);
-        for(const key of ['evidence','detail','last_error'])if(item[key]){detail.append(element('h4',t(key)),element('pre',item[key]));}card.append(detail);root.append(card);}
+        for(const key of ['evidence','detail','last_error'])if(item[key]){detail.append(element('h4',t(key)),element('pre',item[key]));}card.append(detail);if(view==='people'&&item.role!=='host')card.append(button(t('editRoles'),()=>editRole(item.user_id)));root.append(card);}
       const pager=element('div',undefined,'host-pagination');const previous=button(t('previous'),()=>{offset-=25;load();});previous.disabled=busy||offset===0;const next=button(t('next'),()=>{offset+=25;load();});next.disabled=busy||!data.has_more||offset>=100000;pager.append(previous,element('span',`${t('page')} ${offset/25+1}`),next);root.append(pager);
     }
-    root.append(element('p',t('note'),'host-note'));
+    if(['overview','groups'].includes(view))root.append(element('p',t('note'),'host-note'));
   }
+  function editRole(userId){window.SPBRoleEditor.open({request,language:lang,userId,onAuthError:fail,onSaved:async id=>{view='people';search=String(id);offset=0;filter='';await load();}});}
   async function load(){if(busy||closed)return;busy=true;error='';data=null;render();try{data=await request('host-query','POST',{view,search,filter,offset});}catch(e){fail(e);}finally{busy=false;render();}}
-  function fail(e){error=Object.hasOwn(words.en,e.message)?e.message:'temporarily_unavailable';if(['session_expired','forbidden'].includes(error)){closed=true;data=null;clearToken?.();}render();}
+  function fail(e){error=Object.hasOwn(words.en,e.message)?e.message:'temporarily_unavailable';if(['session_expired','forbidden'].includes(error)){closed=true;data=null;clearToken?.();window.SPBRoleEditor.expire();}render();}
   async function logout(){if(busy||closed)return;busy=true;render();try{await request('logout','POST',{});closed=true;data=null;clearToken();error='signedOut';}catch(e){fail(e);}finally{busy=false;render();}}
   window.SPBHost={
     async start(api,language,clear){request=api;lang=language;clearToken=clear;document.body.classList.add('host-mode');root=document.querySelector('main');document.getElementById('save-bar').hidden=true;await load();},
-    setLanguage(language){lang=language;render();},fail
+    setLanguage(language){lang=language;render();window.SPBRoleEditor.setLanguage(language);},fail
   };
 })();

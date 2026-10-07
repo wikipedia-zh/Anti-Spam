@@ -18,6 +18,7 @@ mod warning_queue;
 mod rule_updates;
 mod rule_notices;
 mod host_panel;
+mod role_updates;
 use origin_retry::execute_auto_ban;
 use reliability::{passes_threshold, stable_probability};
 mod reversal_retry;
@@ -333,7 +334,7 @@ struct Runtime {
     /// message (moderation exemption) and every maintainer command. The
     /// host is not stored here - it is a source constant - so this can be
     /// empty while the host still has full authority.
-    maintainers: RwLock<std::collections::HashSet<i64>>,
+    maintainers: Arc<RwLock<std::collections::HashSet<i64>>>,
     /// This bot's own account id, resolved once. `get_me()` was being called
     /// per message via `ensure_bot_can_moderate` (and again per bot-authored
     /// message via the guest-mode check) purely to learn an id that cannot
@@ -525,7 +526,7 @@ impl Runtime {
             group_seen_flush: Mutex::new(HashMap::new()),
             banned_groups: RwLock::new(banned_groups),
             banned_users: RwLock::new(banned_users),
-            maintainers: RwLock::new(maintainers),
+            maintainers: Arc::new(RwLock::new(maintainers)),
             me_id: OnceLock::new(),
             miniapp: OnceLock::new(),
         })
@@ -737,6 +738,9 @@ impl Runtime {
         }
         if user_version < 29 {
             Self::migrate_v28_to_v29(conn)?;
+        }
+        if user_version < 30 {
+            Self::migrate_v29_to_v30(conn)?;
         }
         Ok(())
     }
@@ -2750,28 +2754,6 @@ impl Runtime {
         is_host(user_id) || self.maintainers.read().await.contains(&user_id)
     }
 
-    async fn set_maintainer(&self, user_id: i64, enabled: bool, added_by: Option<i64>) -> Result<()> {
-        self.with_conn(move |conn| {
-            if enabled {
-                conn.execute(
-                    "INSERT OR IGNORE INTO maintainers (user_id, added_by, created_at) VALUES (?1, ?2, ?3)",
-                    params![user_id, added_by, Utc::now().to_rfc3339()],
-                )?;
-            } else {
-                conn.execute("DELETE FROM maintainers WHERE user_id = ?1", params![user_id])?;
-            }
-            Ok(())
-        })
-        .await?;
-        let mut cache = self.maintainers.write().await;
-        if enabled {
-            cache.insert(user_id);
-        } else {
-            cache.remove(&user_id);
-        }
-        Ok(())
-    }
-
     /// Granted maintainers only (the host is a constant, not a row here).
     async fn list_maintainers(&self) -> Result<Vec<(i64, String)>> {
         self.with_conn(|conn| {
@@ -2801,21 +2783,6 @@ impl Runtime {
 
     async fn can_review(&self, user_id: i64) -> bool {
         self.is_maintainer(user_id).await || self.is_reviewer(user_id).await
-    }
-
-    async fn set_reviewer(&self, user_id: i64, enabled: bool, added_by: Option<i64>) -> Result<()> {
-        self.with_conn(move |conn| {
-            if enabled {
-                conn.execute(
-                    "INSERT OR IGNORE INTO reviewers (user_id, added_by, created_at) VALUES (?1, ?2, ?3)",
-                    params![user_id, added_by, Utc::now().to_rfc3339()],
-                )?;
-            } else {
-                conn.execute("DELETE FROM reviewers WHERE user_id = ?1", params![user_id])?;
-            }
-            Ok(())
-        })
-        .await
     }
 
     async fn list_reviewers(&self) -> Result<Vec<(i64, String)>> {
@@ -6557,7 +6524,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                         return Ok(());
                     }
                     let enabled = verb == "add";
-                    runtime.set_maintainer(target_id, enabled, Some(from_id)).await.ok();
+                    if let Err(error) = runtime.set_maintainer(target_id, enabled, Some(from_id)).await {
+                        log::warn!("role update failed: {}", notices::diagnostic(&runtime.config,&error.to_string()));
+                        bot.send_message(message.chat.id, "未能保存權限，請稍後再試。").await?;
+                        return Ok(());
+                    }
                     log_maintainer_action(
                         &bot, &runtime, from_id, &short_user(from), None, "/maintainer",
                         &format!("{} 維護組 user_id={target_id}", if enabled { "新增" } else { "移除" }),
@@ -6598,7 +6569,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                         return Ok(());
                     };
                     let enabled = verb == "add";
-                    runtime.set_reviewer(target_id, enabled, Some(from_id)).await.ok();
+                    if let Err(error) = runtime.set_reviewer(target_id, enabled, Some(from_id)).await {
+                        log::warn!("role update failed: {}", notices::diagnostic(&runtime.config,&error.to_string()));
+                        bot.send_message(message.chat.id, "未能保存權限，請稍後再試。").await?;
+                        return Ok(());
+                    }
                     log_maintainer_action(
                         &bot,
                         &runtime,
@@ -8949,6 +8924,7 @@ mod tests {
     mod warning_queue;
     mod rule_updates;
     mod rule_notices;
+    mod role_updates;
     mod captcha;
     mod edited_messages;
     mod notices;

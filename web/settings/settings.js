@@ -229,6 +229,7 @@
   });
   window.addEventListener('beforeunload', event => { if (Object.keys(changes()).length) { event.preventDefault(); event.returnValue = ''; } });
   async function back() {
+    if(hostMode && window.SPBRoleEditor.back()) return;
     if (busy) return;
     if ($('discard-dialog').open) { $('discard-dialog').close(); return; }
     if ($('review-dialog').open) { $('review-dialog').close(); return; }

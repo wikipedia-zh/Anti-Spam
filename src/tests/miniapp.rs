@@ -338,6 +338,108 @@ async fn host_queries_paginate_filter_and_redact_private_diagnostics() {
 }
 
 #[tokio::test]
+async fn role_api_rejects_group_tokens_and_checks_revision_and_target() {
+    let api = TestApi::new().await;
+    let group_token = api.login(HOST_ID, -100).await;
+    let body = serde_json::json!({"request_id":Uuid::new_v4().to_string(),"user_id":300,"role":"maintainer","enabled":true,"expected_revision":0});
+    for method in [reqwest::Method::POST, reqwest::Method::PATCH] {
+        assert_eq!(
+            api.request(method, "/api/host/role")
+                .bearer_auth(&group_token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+    }
+    let link = api.service.host_link(HOST_ID).await.unwrap();
+    let launch = link
+        .query_pairs()
+        .find(|(key, _)| key == "startapp")
+        .unwrap()
+        .1
+        .into_owned();
+    let response = api
+        .login_raw(&signed(
+            &api.runtime.config.bot_token,
+            HOST_ID,
+            &launch,
+            Utc::now().timestamp(),
+        ))
+        .await;
+    let session: serde_json::Value = response.json().await.unwrap();
+    let token = session["token"].as_str().unwrap();
+    let read = api
+        .request(reqwest::Method::POST, "/api/host/role")
+        .bearer_auth(token)
+        .json(&serde_json::json!({"user_id":300}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status(), 200);
+    assert_eq!(
+        read.json::<serde_json::Value>().await.unwrap()["maintainer"],
+        false
+    );
+    let write = api
+        .request(reqwest::Method::PATCH, "/api/host/role")
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(write.status(), 200);
+    assert!(api.runtime.is_maintainer(300).await);
+    let mut stale = body.clone();
+    stale["request_id"] = serde_json::json!(Uuid::new_v4().to_string());
+    stale["enabled"] = serde_json::json!(false);
+    assert_eq!(
+        api.request(reqwest::Method::PATCH, "/api/host/role")
+            .bearer_auth(token)
+            .json(&stale)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        409
+    );
+    stale["user_id"] = serde_json::json!(HOST_ID);
+    assert_eq!(
+        api.request(reqwest::Method::PATCH, "/api/host/role")
+            .bearer_auth(token)
+            .json(&stale)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        api.request(reqwest::Method::POST, "/api/host/role")
+            .bearer_auth(token)
+            .json(&serde_json::json!({"user_id":-100}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    stale["actor_id"] = serde_json::json!(HOST_ID);
+    assert_eq!(
+        api.request(reqwest::Method::PATCH, "/api/host/role")
+            .bearer_auth(token)
+            .json(&stale)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+}
+
+#[tokio::test]
 async fn only_the_bound_user_can_redeem_a_launch_and_only_once() {
     let api = TestApi::new().await;
     let raw = api.init(200, -100).await;
