@@ -13,6 +13,7 @@ mod moderation_queue;
 mod restriction_retry;
 mod queue_status;
 mod report_delivery;
+mod maintenance;
 use origin_retry::execute_auto_ban;
 use reliability::{passes_threshold, stable_probability};
 mod reversal_retry;
@@ -8817,8 +8818,15 @@ async fn handle_exchange_post(bot: Bot, runtime: Arc<Runtime>, post: Message) ->
 async fn main() -> Result<()> {
     let args: Vec<_> = env::args_os().skip(1).collect();
     if !args.is_empty() {
-        anyhow::ensure!(args.len() == 2 && args[0] == "--evaluate-samples", "usage: --evaluate-samples <snapshot.json>");
-        return evaluation::run_offline(std::path::Path::new(&args[1]));
+        if args.len() == 2 && args[0] == "--evaluate-samples" {
+            return evaluation::run_offline(std::path::Path::new(&args[1]));
+        }
+        if args.len() == 3 && args[0] == "--check-upgrade" {
+            let report = maintenance::check_upgrade(std::path::Path::new(&args[1]), std::path::Path::new(&args[2]))?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            return Ok(());
+        }
+        anyhow::bail!("usage: --evaluate-samples <snapshot.json> | --check-upgrade <source.db> <new-directory>");
     }
     // teloxide logs getUpdates failures, network retries and dispatcher
     // errors through the `log` crate. Without a backend those vanish - which
@@ -9132,6 +9140,7 @@ mod tests {
     mod restriction_retry;
     mod queue_status;
     mod report_delivery;
+    mod maintenance;
     mod captcha;
     mod edited_messages;
     mod notices;
