@@ -19,7 +19,7 @@ pub(super) fn passes_threshold(score: f64, threshold: f64) -> bool {
         && score >= threshold
 }
 
-fn write_sample(
+pub(super) fn write_sample(
     tx: &rusqlite::Transaction<'_>,
     label: &str,
     text: &str,
@@ -137,11 +137,23 @@ impl Runtime {
     /// The first decision wins, including rejection. Model changes and the
     /// decision are one transaction; API callbacks cannot label twice, even
     /// after a restart or if editing the Telegram keyboard fails.
+    #[cfg(test)]
     pub(super) async fn decide_training_review(
         &self,
         case_id: &str,
         decision: &str,
         actor_id: i64,
+    ) -> Result<bool> {
+        self.decide_training_review_at(case_id, decision, actor_id, None)
+            .await
+    }
+
+    pub(super) async fn decide_training_review_at(
+        &self,
+        case_id: &str,
+        decision: &str,
+        actor_id: i64,
+        location: Option<(i64, i32)>,
     ) -> Result<bool> {
         anyhow::ensure!(
             matches!(decision, "approve" | "reject"),
@@ -163,6 +175,12 @@ impl Runtime {
             if changed && decision == "approve" {
                 write_sample(tx, "spam", &text, Some(&case_id))?;
                 network_delivery::enqueue_network_ban(tx, &case_id, test_group_id)?;
+            }
+            if changed {
+                if let Some((chat,message))=location {
+                    tx.execute("INSERT INTO review_updates(case_id,kind,decision,chat_id,message_id,actor_id) VALUES (?1,'train',?2,?3,?4,?5)",
+                        params![case_id,decision,chat,message,actor_id])?;
+                }
             }
             Ok(changed)
         }).await

@@ -22,7 +22,7 @@ async fn long_evidence_is_clipped_in_notices_but_preserved_in_storage() {
     case.matched_rule_pattern = Some("<rule & 😀>".repeat(1000));
     runtime.persist_case(&case).await.unwrap();
     log_action(&telegram.bot, &runtime, &case).await.unwrap();
-    queue_training_review(&telegram.bot, &runtime, &case).await;
+    queue_training_review(&telegram.bot, &runtime, &case).await.unwrap();
     let requests = telegram.requests.lock().unwrap().clone();
     let cards: Vec<_> = requests
         .iter()

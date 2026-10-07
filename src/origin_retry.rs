@@ -16,13 +16,65 @@ struct OriginJob {
     announced: String,
     broadcast: bool,
     error: Option<String>,
+    training_mode: String,
+    trained: bool,
+    review_sent: bool,
+    audit_id: Option<i64>,
+    audit_done: bool,
 }
 
 fn supported_action(action: &ActionKind) -> bool {
     matches!(
         action,
-        ActionKind::AutoBan | ActionKind::GuestBotBan | ActionKind::GuestInvokerBan
+        ActionKind::AutoBan
+            | ActionKind::GuestBotBan
+            | ActionKind::GuestInvokerBan
+            | ActionKind::SpamBan
+            | ActionKind::ReportApproved
     )
+}
+
+pub(super) fn insert_origin_case(
+    tx: &rusqlite::Transaction<'_>,
+    case: &CaseRecord,
+    header: &str,
+) -> Result<bool> {
+    let guest = matches!(
+        case.action,
+        ActionKind::GuestBotBan | ActionKind::GuestInvokerBan
+    );
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO cases (id,action,chat_id,target_user_id,target_name,
+     actor_user_id,actor_name,source_message_id,evidence_text,model_score,
+     matched_rule_id,matched_rule_pattern,status,log_message_id,created_at)
+     SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'ban_pending',NULL,?13
+     WHERE ?14=0 OR NOT EXISTS(SELECT 1 FROM cases WHERE (action=?2 OR (action='unbanned' AND matched_rule_pattern=?12)) AND chat_id=?3
+         AND target_user_id=?4 AND source_message_id=?8)",
+        params![
+            case.id,
+            case.action.as_str(),
+            case.chat_id,
+            case.target_user_id,
+            case.target_name,
+            case.actor_user_id,
+            case.actor_name,
+            case.source_message_id,
+            case.evidence_text,
+            case.model_score,
+            case.matched_rule_id,
+            case.matched_rule_pattern,
+            case.created_at.to_rfc3339(),
+            guest
+        ],
+    )?;
+    // Replays must not revive a reversed case or adopt a historical failure.
+    if inserted != 0 {
+        tx.execute(
+            "INSERT INTO origin_ban_jobs(case_id,header,delete_done) VALUES (?1,?2,?3)",
+            params![case.id, header, case.source_message_id.is_none()],
+        )?;
+    }
+    Ok(inserted != 0)
 }
 
 impl Runtime {
@@ -62,7 +114,10 @@ impl Runtime {
 
     pub(super) async fn queue_origin_bans(&self, cases: Vec<(CaseRecord, String)>) -> Result<()> {
         anyhow::ensure!(
-            cases.iter().all(|(case, _)| supported_action(&case.action)),
+            cases.iter().all(|(case, _)| matches!(
+                case.action,
+                ActionKind::AutoBan | ActionKind::GuestBotBan | ActionKind::GuestInvokerBan
+            )),
             "unsupported original ban action"
         );
         let mut ids: Vec<_> = cases.iter().map(|(c, _)| c.id.clone()).collect();
@@ -85,41 +140,7 @@ impl Runtime {
             let _guards = (review_guards, user_guards);
             let tx = conn.transaction()?;
             for (case, header) in cases {
-                let guest = matches!(
-                    case.action,
-                    ActionKind::GuestBotBan | ActionKind::GuestInvokerBan
-                );
-                let inserted = tx.execute(
-                    "INSERT OR IGNORE INTO cases (id,action,chat_id,target_user_id,target_name,
-                 actor_user_id,actor_name,source_message_id,evidence_text,model_score,
-                 matched_rule_id,matched_rule_pattern,status,log_message_id,created_at)
-                 SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'ban_pending',NULL,?13
-                 WHERE ?14=0 OR NOT EXISTS(SELECT 1 FROM cases WHERE (action=?2 OR (action='unbanned' AND matched_rule_pattern=?12)) AND chat_id=?3
-                     AND target_user_id=?4 AND source_message_id=?8)",
-                    params![
-                        case.id,
-                        case.action.as_str(),
-                        case.chat_id,
-                        case.target_user_id,
-                        case.target_name,
-                        case.actor_user_id,
-                        case.actor_name,
-                        case.source_message_id,
-                        case.evidence_text,
-                        case.model_score,
-                        case.matched_rule_id,
-                        case.matched_rule_pattern,
-                        case.created_at.to_rfc3339(),
-                        guest
-                    ],
-                )?;
-                // Replays must not revive a reversed case or adopt a historical failure.
-                if inserted != 0 {
-                    tx.execute(
-                        "INSERT INTO origin_ban_jobs(case_id,header,delete_done) VALUES (?1,?2,?3)",
-                        params![case.id, header, case.source_message_id.is_none()],
-                    )?;
-                }
+                insert_origin_case(&tx, &case, &header)?;
             }
             tx.commit()?;
             Ok(())
@@ -137,12 +158,15 @@ impl Runtime {
             let tx = conn.transaction()?;
             let now = Utc::now().timestamp();
             let job = tx.query_row(
-                "SELECT header,ban_done,delete_done,outcome_unknown,announced_status,broadcast_done,attempts
-                 FROM origin_ban_jobs WHERE case_id=?1 AND state='pending' AND next_attempt_at<=?2
+                "SELECT j.header,j.ban_done,j.delete_done,j.outcome_unknown,j.announced_status,j.broadcast_done,j.attempts,
+                 COALESCE(f.training_mode,'none'),COALESCE(f.training_done,1),COALESCE(f.review_sent,1),f.audit_id,COALESCE(f.audit_done,1)
+                 FROM origin_ban_jobs j LEFT JOIN ban_followups f ON f.case_id=j.case_id
+                 WHERE j.case_id=?1 AND j.state='pending' AND j.next_attempt_at<=?2
                  AND (SELECT not_before FROM telegram_retry_state WHERE id=1)<=?2",
                 params![case.id,now], |r| Ok((OriginJob {
                     case: case.clone(), header:r.get(0)?, banned:r.get(1)?, deleted:r.get(2)?,
                     unknown:r.get(3)?, announced:r.get(4)?, broadcast:r.get(5)?, error:None,
+                    training_mode:r.get(7)?,trained:r.get(8)?,review_sent:r.get(9)?,audit_id:r.get(10)?,audit_done:r.get(11)?,
                 },r.get::<_,u32>(6)?)),
             ).optional()?;
             let Some((job,attempts)) = job else { return Ok(None); };
@@ -180,10 +204,11 @@ impl Runtime {
                 params![job.case.id,state,job.banned,job.deleted,job.unknown,job.announced,job.broadcast,job.error],
             )?;
             if changed != 0 {
-                tx.execute("UPDATE cases SET status=?2,log_message_id=?3 WHERE id=?1 AND action IN ('auto_ban','guest_bot_ban','guest_invoker_ban')
+                tx.execute("UPDATE cases SET status=?2,log_message_id=?3 WHERE id=?1 AND action IN ('auto_ban','guest_bot_ban','guest_invoker_ban','spam_ban','report_approved')
                     AND status NOT IN ('reversed','reversal_pending')",
                     params![job.case.id,job.case.status,job.case.log_message_id])?;
-                if job.banned && netban_eligible(&job.case.action,job.case.model_score,threshold,job.case.matched_rule_pattern.as_deref()) {
+                if job.banned && job.trained && (matches!(job.training_mode.as_str(),"direct"|"report")
+                    || netban_eligible(&job.case.action,job.case.model_score,threshold,job.case.matched_rule_pattern.as_deref())) {
                     network_delivery::enqueue_network_ban(&tx,&job.case.id,test_group)?;
                 }
             }
@@ -191,12 +216,63 @@ impl Runtime {
             Ok(())
         }).await
     }
+
+    async fn finish_ban_training(&self, job: &OriginJob, guards: Arc<ActionGuards>) -> Result<()> {
+        let job = job.clone();
+        let test_group = self.config.test_group_id;
+        self.with_model_transaction(move |tx| {
+            let guards = guards;
+            if job.training_mode == "report"
+                || (job.training_mode == "direct"
+                    && job.case.matched_rule_pattern.as_deref() != Some("BOTSPAM"))
+            {
+                reliability::write_sample(tx, "spam", &job.case.evidence_text, Some(&job.case.id))?;
+            }
+            tx.execute(
+                "UPDATE ban_followups SET training_done=1 WHERE case_id=?1",
+                params![job.case.id],
+            )?;
+            if matches!(job.training_mode.as_str(), "direct" | "report") {
+                network_delivery::enqueue_network_ban(tx, &job.case.id, test_group)?;
+            }
+            // Return the guard with the value so it survives the transaction
+            // commit and model publication inside with_model_transaction.
+            Ok(guards)
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn finish_ban_followup(
+        &self,
+        id: &str,
+        stage: &'static str,
+        guards: Arc<ActionGuards>,
+    ) -> Result<()> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            let _guards = guards;
+            anyhow::ensure!(
+                matches!(stage, "review_sent" | "audit_done"),
+                "invalid followup stage"
+            );
+            conn.execute(
+                &format!("UPDATE ban_followups SET {stage}=1 WHERE case_id=?1"),
+                params![id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
 }
 
-async fn api<T>(request: impl std::future::Future<Output = ResponseResult<T>>) -> Result<T> {
-    Ok(tokio::time::timeout(Duration::from_secs(30), request)
+async fn api<T, E: Into<anyhow::Error>>(
+    request: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T> {
+    tokio::time::timeout(Duration::from_secs(30), request)
         .await
-        .context("Telegram request timed out")??)
+        .context("Telegram request timed out")?
+        .map_err(Into::into)
 }
 
 async fn record_error(
@@ -221,6 +297,12 @@ async fn record_error(
 }
 
 async fn policy_still_enabled(runtime: &Runtime, case: &CaseRecord) -> Result<bool> {
+    if matches!(
+        case.action,
+        ActionKind::SpamBan | ActionKind::ReportApproved
+    ) {
+        return Ok(true);
+    }
     if matches!(
         case.action,
         ActionKind::GuestBotBan | ActionKind::GuestInvokerBan
@@ -252,6 +334,69 @@ async fn policy_still_enabled(runtime: &Runtime, case: &CaseRecord) -> Result<bo
     }))
 }
 
+fn ban_status(job: &OriginJob) -> &'static str {
+    if !job.banned {
+        return "ban_failed";
+    }
+    if !job.deleted {
+        return "banned_delete_failed";
+    }
+    match job.case.action {
+        ActionKind::GuestBotBan => "guest_bot_banned",
+        ActionKind::GuestInvokerBan => "guest_invoker_banned",
+        ActionKind::ReportApproved => "approved_and_banned",
+        ActionKind::SpamBan if job.training_mode == "direct" => "force_approved",
+        ActionKind::SpamBan => "done",
+        _ => "auto_banned",
+    }
+}
+
+async fn ban_pending(
+    bot: &Bot,
+    runtime: &Runtime,
+    job: &mut OriginJob,
+    guards: Arc<ActionGuards>,
+) -> Result<bool> {
+    if job.banned {
+        return Ok(true);
+    }
+    let previously_unknown = job.unknown;
+    job.unknown = true;
+    runtime
+        .save_origin_job(job, "pending", guards.clone())
+        .await?;
+    let mut limited = false;
+    match api(async {
+        bot.ban_chat_member(
+            ChatId(job.case.chat_id),
+            UserId(job.case.target_user_id as u64),
+        )
+        .await
+    })
+    .await
+    {
+        Ok(_) => {
+            job.banned = true;
+            job.unknown = false;
+        }
+        Err(err) => {
+            let definite_failure = matches!(
+                err.downcast_ref::<teloxide::RequestError>(),
+                Some(
+                    teloxide::RequestError::Api(_)
+                        | teloxide::RequestError::MigrateToChatId(_)
+                        | teloxide::RequestError::RetryAfter(_)
+                )
+            );
+            job.unknown = previously_unknown || !definite_failure;
+            limited = record_error(runtime, job, "ban", &err).await?;
+        }
+    }
+    job.case.status = ban_status(job).to_string();
+    runtime.save_origin_job(job, "pending", guards).await?;
+    Ok(!limited)
+}
+
 pub(super) async fn attempt_origin_ban(
     bot: &Bot,
     runtime: &Runtime,
@@ -261,21 +406,59 @@ pub(super) async fn attempt_origin_ban(
     let Some(case) = runtime.load_case(&case.id).await? else {
         return Ok(false);
     };
+    let previously_banned = supported_action(&case.action)
+        && !matches!(
+            case.status.as_str(),
+            "ban_pending" | "ban_failed" | "reversed" | "reversal_pending"
+        );
     let Some(mut job) = runtime.claim_origin_ban(case, guards.clone()).await? else {
-        return Ok(false);
+        return Ok(previously_banned);
     };
 
     if !job.banned {
+        let manual = matches!(
+            job.case.action,
+            ActionKind::SpamBan | ActionKind::ReportApproved
+        );
+        if manual {
+            let actor = job.case.actor_user_id.context("missing approving actor")?;
+            let allowed = if job.training_mode == "review" {
+                match api(async {
+                    bot.get_chat_member(ChatId(job.case.chat_id), UserId(actor as u64))
+                        .await
+                })
+                .await
+                {
+                    Ok(member) => member.kind.is_privileged(),
+                    Err(err) => {
+                        record_error(runtime, &mut job, "check_actor", &err).await?;
+                        runtime.save_origin_job(&job, "pending", guards).await?;
+                        return Ok(false);
+                    }
+                }
+            } else {
+                runtime.can_review(actor).await
+            };
+            if !allowed {
+                job.case.status = "ban_failed".into();
+                job.error = Some(
+                    "Approving actor no longer has permission; pending action cancelled".into(),
+                );
+                runtime.save_origin_job(&job, "cancelled", guards).await?;
+                return Ok(false);
+            }
+        }
         let exempt = !policy_still_enabled(runtime, &job.case).await?
             || runtime.is_maintainer(job.case.target_user_id).await
             || is_platform_pseudo_user(job.case.target_user_id)
             || runtime.is_group_banned(job.case.chat_id).await
-            || runtime
-                .is_global_whitelisted(job.case.target_user_id)
-                .await?
-            || runtime
-                .is_group_whitelisted(job.case.chat_id, job.case.target_user_id)
-                .await?;
+            || (!manual
+                && (runtime
+                    .is_global_whitelisted(job.case.target_user_id)
+                    .await?
+                    || runtime
+                        .is_group_whitelisted(job.case.chat_id, job.case.target_user_id)
+                        .await?));
         let admin = if exempt {
             true
         } else {
@@ -312,7 +495,15 @@ pub(super) async fn attempt_origin_ban(
         }
     }
 
-    if !job.deleted {
+    let manual = matches!(
+        job.case.action,
+        ActionKind::SpamBan | ActionKind::ReportApproved
+    );
+    if manual && !ban_pending(bot, runtime, &mut job, guards.clone()).await? {
+        return Ok(job.banned);
+    }
+
+    if !job.deleted && (!manual || job.banned) {
         let id = job
             .case
             .source_message_id
@@ -339,57 +530,26 @@ pub(super) async fn attempt_origin_ban(
             .await?;
     }
 
-    if !job.banned {
-        let previously_unknown = job.unknown;
-        job.unknown = true;
-        runtime
-            .save_origin_job(&job, "pending", guards.clone())
-            .await?;
-        match api(async {
-            bot.ban_chat_member(
-                ChatId(job.case.chat_id),
-                UserId(job.case.target_user_id as u64),
-            )
-            .await
-        })
-        .await
-        {
-            Ok(_) => {
-                job.banned = true;
-                job.unknown = false;
-            }
-            Err(err) => {
-                let definite_failure = matches!(
-                    err.downcast_ref::<teloxide::RequestError>(),
-                    Some(
-                        teloxide::RequestError::Api(_)
-                            | teloxide::RequestError::MigrateToChatId(_)
-                            | teloxide::RequestError::RetryAfter(_)
-                    )
-                );
-                job.unknown = previously_unknown || !definite_failure;
-                job.case.status = "ban_failed".into();
-                if record_error(runtime, &mut job, "ban", &err).await? {
-                    runtime.save_origin_job(&job, "pending", guards).await?;
-                    return Ok(false);
-                }
-            }
-        }
+    if !manual && !ban_pending(bot, runtime, &mut job, guards.clone()).await? {
+        return Ok(job.banned);
     }
-    job.case.status = match (job.banned, job.deleted) {
-        (true, true) => match job.case.action {
-            ActionKind::GuestBotBan => "guest_bot_banned",
-            ActionKind::GuestInvokerBan => "guest_invoker_banned",
-            _ => "auto_banned",
-        },
-        (true, false) => "banned_delete_failed",
-        (false, _) => "ban_failed",
-    }
-    .into();
+    job.case.status = ban_status(&job).to_string();
     // Applying the ban and queuing its cross-group deliveries commit together.
     runtime
         .save_origin_job(&job, "pending", guards.clone())
         .await?;
+
+    if job.banned && !job.trained {
+        if let Err(err) = runtime.finish_ban_training(&job, guards.clone()).await {
+            record_error(runtime, &mut job, "training", &err).await?;
+            runtime.save_origin_job(&job, "pending", guards).await?;
+            return Ok(true);
+        }
+        job.trained = true;
+        runtime
+            .save_origin_job(&job, "pending", guards.clone())
+            .await?;
+    }
 
     if job.announced != job.case.status {
         let log_result = if let Some(id) = job.case.log_message_id {
@@ -432,17 +592,23 @@ pub(super) async fn attempt_origin_ban(
         };
         // sendMessage has no idempotency key. An interrupted acknowledgement
         // may duplicate a notice; known log IDs are reused on ordinary retries.
-        let result = tokio::time::timeout(
-            Duration::from_secs(30),
-            notify_group(
-                bot,
-                runtime,
-                &job.case,
-                job.case.log_message_id.context("missing log message")?,
-                title,
-            ),
-        )
-        .await;
+        let result = if job.case.action == ActionKind::ReportApproved
+            || (job.case.action == ActionKind::SpamBan && !job.banned)
+        {
+            Ok(Ok(()))
+        } else {
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                notify_group(
+                    bot,
+                    runtime,
+                    &job.case,
+                    job.case.log_message_id.context("missing log message")?,
+                    title,
+                ),
+            )
+            .await
+        };
         match result {
             Ok(Ok(())) => job.announced = job.case.status.clone(),
             result => {
@@ -481,9 +647,68 @@ pub(super) async fn attempt_origin_ban(
             .await?;
     }
     if job.banned && job.case.matched_rule_pattern.as_deref() == Some("BOTSPAM") {
-        capture_bot_spam_rules(bot, runtime, job.case.chat_id, &job.case.evidence_text).await;
+        if let Err(err) = api(capture_bot_spam_rules(
+            bot,
+            runtime,
+            job.case.chat_id,
+            &job.case.evidence_text,
+        ))
+        .await
+        {
+            record_error(runtime, &mut job, "bot_spam_rules", &err).await?;
+            runtime.save_origin_job(&job, "pending", guards).await?;
+            return Ok(true);
+        }
     }
-    let done = job.banned && job.deleted && job.broadcast && job.announced == job.case.status;
+    if job.banned && !job.review_sent {
+        if job.training_mode == "review"
+            && job.case.matched_rule_pattern.as_deref() != Some("BOTSPAM")
+        {
+            if let Err(err) = api(queue_training_review(bot, runtime, &job.case)).await {
+                record_error(runtime, &mut job, "training_review", &err).await?;
+                runtime.save_origin_job(&job, "pending", guards).await?;
+                return Ok(true);
+            }
+        }
+        runtime
+            .finish_ban_followup(&job.case.id, "review_sent", guards.clone())
+            .await?;
+        job.review_sent = true;
+    }
+    if job.banned && !job.audit_done {
+        if let (Some(id), Some(chat)) = (job.audit_id, runtime.audit_log_chat().await) {
+            let actor = job.case.actor_user_id.context("missing audit actor")?;
+            let name = escape_html(job.case.actor_name.as_deref().unwrap_or(""));
+            let command = if job.training_mode == "direct" {
+                "/sb -f"
+            } else {
+                "/sb"
+            };
+            let text=format!("<b>維護操作 #{id}</b>\n<b>指令</b>: <code>{command}</code>\n<b>操作者</b>: {name} (<code>{actor}</code>)\n<b>群組</b>: <code>{}</code>\n<b>內容</b>: {} 對象={}\n復原：<code>/revert {id}</code>",job.case.chat_id,chinese_case_action(&job.case),job.case.target_user_id);
+            if let Err(err) = api(async {
+                bot.send_message(ChatId(chat), text)
+                    .parse_mode(ParseMode::Html)
+                    .await
+            })
+            .await
+            {
+                record_error(runtime, &mut job, "audit", &err).await?;
+                runtime.save_origin_job(&job, "pending", guards).await?;
+                return Ok(true);
+            }
+        }
+        runtime
+            .finish_ban_followup(&job.case.id, "audit_done", guards.clone())
+            .await?;
+        job.audit_done = true;
+    }
+    let done = job.banned
+        && job.deleted
+        && job.broadcast
+        && job.announced == job.case.status
+        && job.trained
+        && job.review_sent
+        && job.audit_done;
     if done {
         job.error = None;
     }
@@ -534,6 +759,9 @@ pub(super) fn spawn_origin_worker(bot: Bot, runtime: Arc<Runtime>) -> tokio::tas
         loop {
             if let Err(err) = retry_origin_bans(&bot, &runtime).await {
                 log::warn!("original ban queue: {err}");
+            }
+            if let Err(err) = moderation_queue::deliver_review_updates(&bot, &runtime, None).await {
+                log::warn!("review notification queue: {err}");
             }
             sleep(Duration::from_secs(5)).await;
         }

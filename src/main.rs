@@ -9,6 +9,7 @@
 
 mod reliability;
 mod origin_retry;
+mod moderation_queue;
 use origin_retry::execute_auto_ban;
 use reliability::{passes_threshold, stable_probability};
 mod reversal_retry;
@@ -710,6 +711,9 @@ impl Runtime {
         }
         if user_version < 23 {
             Self::migrate_v22_to_v23(conn)?;
+        }
+        if user_version < 24 {
+            Self::migrate_v23_to_v24(conn)?;
         }
         Ok(())
     }
@@ -2277,16 +2281,14 @@ impl Runtime {
         .await
     }
 
-    async fn spam_rule_pattern_exists(&self, pattern: &str) -> bool {
+    async fn spam_rule_pattern_exists(&self, pattern: &str) -> Result<bool> {
         let pattern = pattern.to_string();
         self.with_conn(move |conn| {
             Ok(conn
-                .query_row("SELECT COUNT(*) FROM spam_rules WHERE pattern = ?1", params![pattern], |row| row.get::<_, i64>(0))
-                .unwrap_or(0)
+                .query_row("SELECT COUNT(*) FROM spam_rules WHERE pattern = ?1", params![pattern], |row| row.get::<_, i64>(0))?
                 > 0)
         })
         .await
-        .unwrap_or(false)
     }
 
     async fn add_spam_rule(&self, pattern: &str, description: &str) -> Result<i64> {
@@ -2733,41 +2735,25 @@ impl Runtime {
         Ok(())
     }
 
-    /// Records the reporter-confirmation message for a case, so
-    /// `take_report_confirmation` can find it when the report is decided.
+    /// Keeps the confirmation location even if the review wins the race
+    /// against the original sendMessage response.
     async fn set_report_confirmation(&self, case_id: &str, chat_id: i64, message_id: i32) -> Result<()> {
         let case_id = case_id.to_string();
+        let guard = self.review_guard(&case_id).await;
         self.with_conn(move |conn| {
-            conn.execute(
+            let _guard = guard;
+            let tx = conn.transaction()?;
+            let updated = tx.execute("UPDATE review_updates SET confirmation_chat_id=?2,confirmation_message_id=?3,confirmation_status='',next_attempt_at=0 WHERE case_id=?1",
+                params![case_id,chat_id,message_id])?;
+            if updated == 0 { tx.execute(
                 "INSERT INTO report_confirmations (case_id, chat_id, message_id) VALUES (?1, ?2, ?3)
                  ON CONFLICT(case_id) DO UPDATE SET chat_id=excluded.chat_id, message_id=excluded.message_id",
                 params![case_id, chat_id, message_id],
-            )?;
+            )?; }
+            tx.commit()?;
             Ok(())
         })
         .await
-    }
-
-    /// Returns and removes the stored confirmation location for a case - it
-    /// is only edited once, so the row is consumed on read.
-    async fn take_report_confirmation(&self, case_id: &str) -> Option<(i64, i32)> {
-        let case_id = case_id.to_string();
-        self.with_conn(move |conn| {
-            let found = conn
-                .query_row(
-                    "SELECT chat_id, message_id FROM report_confirmations WHERE case_id = ?1",
-                    params![&case_id],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i32>(1)?)),
-                )
-                .ok();
-            if found.is_some() {
-                conn.execute("DELETE FROM report_confirmations WHERE case_id = ?1", params![&case_id])?;
-            }
-            Ok(found)
-        })
-        .await
-        .ok()
-        .flatten()
     }
 
     /// `/spam` three-strike rule. A third of reports were being rejected,
@@ -2786,18 +2772,6 @@ impl Runtime {
         })
         .await
         .unwrap_or(0)
-    }
-
-    async fn add_report_strike(&self, user_id: i64) -> Result<i64> {
-        self.with_conn(move |conn| {
-            conn.execute(
-                "INSERT INTO report_offenses (user_id, rejected_count, last_rejected_at) VALUES (?1, 1, ?2)
-                 ON CONFLICT(user_id) DO UPDATE SET rejected_count = rejected_count + 1, last_rejected_at = excluded.last_rejected_at",
-                params![user_id, Utc::now().to_rfc3339()],
-            )?;
-            Ok(conn.query_row("SELECT rejected_count FROM report_offenses WHERE user_id = ?1", params![user_id], |row| row.get(0))?)
-        })
-        .await
     }
 
     async fn clear_report_strikes(&self, user_id: i64) -> Result<()> {
@@ -4087,36 +4061,35 @@ fn bot_mentions_only(text: &str) -> Option<Vec<String>> {
 /// true if `evidence` was a pure bot mention at all (whether or not new
 /// rules were created), so the caller can label the case BOTSPAM and skip
 /// ML training on a bare username.
-async fn capture_bot_spam_rules(bot: &Bot, runtime: &Runtime, chat_id: i64, evidence: &str) -> bool {
-    let Some(bots) = bot_mentions_only(evidence) else { return false; };
+async fn capture_bot_spam_rules(bot: &Bot, runtime: &Runtime, chat_id: i64, evidence: &str) -> Result<bool> {
+    let Some(bots) = bot_mentions_only(evidence) else { return Ok(false); };
     let mut created = Vec::new();
     for b in &bots {
         let pattern = format!("(?i)@{b}\\b");
-        if runtime.spam_rule_pattern_exists(&pattern).await {
+        if runtime.spam_rule_pattern_exists(&pattern).await? {
             continue;
         }
-        if let Ok(id) = runtime
+        let id = runtime
             .add_spam_rule(&pattern, &format!("純機器人提及 spam：@{b}（自動建立）"))
-            .await
-        {
-            created.push((id, b.clone()));
-        }
+            .await?;
+        created.push((id, b.clone()));
     }
+    runtime.refresh_spam_rules().await?;
     if !created.is_empty() {
         let list = created
             .iter()
             .map(|(id, b)| format!("@{b}（規則 #{id}）"))
             .collect::<Vec<_>>()
             .join("、");
-        let _ = bot
+        bot
             .send_message(
                 ChatId(runtime.config.log_channel_id),
                 format!("<b>已自動建立機器人提及規則</b>\n來源：群組 <code>{chat_id}</code>\n{list}\n如為誤判請用 /del_rule 移除。"),
             )
             .parse_mode(ParseMode::Html)
-            .await;
+            .await?;
     }
-    true
+    Ok(true)
 }
 
 fn strip_mentions(text: &str) -> String {
@@ -4721,14 +4694,6 @@ async fn log_callback_error(bot: &Bot, runtime: &Runtime, case: &CaseRecord, sta
     }
 }
 
-async fn delete_message_if_exists(bot: &Bot, chat_id: ChatId, message_id: MessageId) -> Result<()> {
-    match bot.delete_message(chat_id, message_id).await {
-        Ok(_) => Ok(()),
-        Err(err) if err.to_string().contains("message to delete not found") => Ok(()),
-        Err(err) => Err(err.into()),
-    }
-}
-
 async fn notify_group(bot: &Bot, runtime: &Runtime, case: &CaseRecord, log_message_id: i32, header: &str) -> Result<()> {
     let link = (log_message_id > 0).then(|| public_log_link(&runtime.config, log_message_id));
     let reason_link = runtime.blacklist_reason_link().await.or_else(|| link.clone());
@@ -5087,42 +5052,27 @@ fn netban_eligible(action: &ActionKind, model_score: Option<f64>, global_thresho
 ///
 /// Review a local `/sb` before training and promoting it to the network.
 /// Empty or token-less evidence cannot train the model.
-async fn queue_training_review(bot: &Bot, runtime: &Runtime, case: &CaseRecord) {
+async fn queue_training_review(bot: &Bot, runtime: &Runtime, case: &CaseRecord) -> Result<()> {
     if is_empty_ml_text(&case.evidence_text) {
-        return;
+        return Ok(());
     }
+    let id=case.id.clone();
+    let decided=runtime.with_conn(move |conn| Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM training_reviews WHERE case_id=?1)",params![id],|r|r.get::<_,bool>(0))?)).await?;
+    if decided {return Ok(());}
     let body = notices::review_card(case, "待審核訓練樣本 · /sb", "批准：訓練並加入跨群黑名單。\n拒絕：不訓練，保留本群封禁。", None);
     let buttons = InlineKeyboardMarkup::new(vec![vec![
         InlineKeyboardButton::callback("訓練並加入黑名單", format!("train:approve:{}", case.id)),
         InlineKeyboardButton::callback("拒絕訓練", format!("train:reject:{}", case.id)),
     ]]);
-    if let Err(err) = bot
+    bot
         .send_message(ChatId(runtime.config.report_channel_id), body)
         .parse_mode(ParseMode::Html)
         .reply_markup(buttons)
-        .await {
-        log::warn!("could not send training review for case={}: {}", case.id, notices::diagnostic(&runtime.config, &err.to_string()));
-    }
+        .await?;
+    Ok(())
 }
 
-/// A scored ban is judged against the **global** threshold, never the origin
-/// group's own - a group running a lowered `spam_threshold_override` bans at
-/// its own bar locally, but can't push those below-bar bans onto everyone
-/// else. See `netban_eligible` for which actions qualify at all.
-async fn propagate_network_ban(bot: &Bot, runtime: &Runtime, case: &CaseRecord) {
-    let global = runtime.current_threshold().await.unwrap_or(runtime.config.spam_threshold);
-    if !netban_eligible(&case.action, case.model_score, global, case.matched_rule_pattern.as_deref()) {
-        return;
-    }
-    commit_network_ban(bot, runtime, case).await;
-}
-
-/// Adds a case to the shared blacklist and bans its target in every
-/// subscribed (netban-enabled) group. Eligibility is the caller's call -
-/// `propagate_network_ban` gates on `netban_eligible`, while a reviewer
-/// approving a /sb promotes that ban here directly (one admin's /sb stays
-/// local; a reviewer approving it is the second gate that makes it
-/// project-wide).
+/// Delivers a ban to subscribed groups after the caller checks eligibility.
 async fn commit_network_ban(bot: &Bot, runtime: &Runtime, case: &CaseRecord) {
     if let Err(err) = runtime.enqueue_network_deliveries(&case.id).await {
         log::error!("could not queue network ban {}: {err}", case.id);
@@ -6060,23 +6010,33 @@ async fn handle_ban_mute_kick(bot: Bot, runtime: Arc<Runtime>, message: Message,
                 created_at: Utc::now(),
             };
 
-            match action {
-                ActionKind::SpamBan => {
-                    if force {
-                        if let Err(err) = ban_user(&bot, message.chat.id, target_id).await {
-                            reply_ephemeral(&bot, &message, format!("封禁失敗，未執行訓練或 netban 同步：{err}")).await?;
-                            return Ok(());
+            if action == ActionKind::SpamBan {
+                let id = match runtime.queue_manual_ban(case, force, message.id.0).await {
+                    Ok(id) => id,
+                    Err(err) => {
+                        log::error!("could not save manual ban: {err}");
+                        reply_ephemeral(&bot, &message, "無法保存封禁請求，未執行操作，請稍後重試。").await?;
+                        return Ok(());
+                    }
+                };
+                match runtime.load_case(&id).await {
+                    Ok(Some(saved)) => {
+                        match origin_retry::attempt_origin_ban(&bot, &runtime, saved).await {
+                            Ok(false) => { reply_ephemeral(&bot, &message, format!("封禁尚未完成。案件：<code>{id}</code>，可用 /case 查詢進度。")).await?; }
+                            Ok(true) => {}
+                            Err(err) => { log::warn!("manual ban {id}: {}", notices::diagnostic(&runtime.config, &err.to_string())); }
                         }
                     }
-                    if let Some(sid) = source_id {
-                        let _ = bot.delete_message(message.chat.id, MessageId(sid)).await;
-                    }
-                    if !force {
-                        ban_user(&bot, message.chat.id, target_id).await.ok();
-                    }
-                    // Training happens after the case is saved, so the
-                    // sample is linked to the case for appeals and /revert.
+                    result => log::error!("could not load queued ban {id}: {result:?}"),
                 }
+                if let Err(err) = deliver_network_bans(&bot, &runtime, Some(&id)).await {
+                    log::warn!("manual network ban {id}: {}", notices::diagnostic(&runtime.config, &err.to_string()));
+                }
+                let _ = bot.delete_message(message.chat.id, message.id).await;
+                return Ok(());
+            }
+
+            match action {
                 ActionKind::Mute => {
                     mute_user(&bot, message.chat.id, target_id).await.ok();
                 }
@@ -6094,40 +6054,12 @@ async fn handle_ban_mute_kick(bot: Bot, runtime: Arc<Runtime>, message: Message,
                 return Ok(());
             }
             notify_group(&bot, &runtime, &case, log_message_id, "<b>已執行管理操作</b>").await.ok();
-            if action == ActionKind::SpamBan {
-                if force {
-                    // Empty/media-only evidence and bare bot handles keep
-                    // their existing treatment: no empty/username ML samples.
-                    if bot_spam.is_none() && !is_empty_ml_text(&evidence_text) {
-                        if let Err(err) = train_spam(&runtime, &evidence_text, Some(&case.id)).await {
-                            log_callback_error(&bot, &runtime, &case, "train_spam", &err.to_string()).await;
-                            reply_ephemeral(&bot, &message, "直接訓練失敗；本群封禁已執行，尚未加入 netban。").await?;
-                            return Ok(());
-                        }
-                    }
-                    commit_network_ban(&bot, &runtime, &case).await;
-                } else {
-                    propagate_network_ban(&bot, &runtime, &case).await;
-                }
-                broadcast_ban_status(&bot, &runtime, case.target_user_id, true).await;
-                if bot_spam.is_some() {
-                    // A bare username is not useful ML signal; the rule does
-                    // the work, so skip the training-review queue.
-                    capture_bot_spam_rules(&bot, &runtime, message.chat.id.0, &evidence_text).await;
-                } else if !force && !evidence_text.trim().is_empty() {
-                    // A /sb by bare user_id (no reply) has no message text at
-                    // all - nothing to queue for training review.
-                    queue_training_review(&bot, &runtime, &case).await;
-                }
-            }
-
             // Reuses the case's own case_id as the revert handle - no new ID
             // needed, /revert for a Case just calls the same
             // reverse_ban_case/reverse_mute_case the case_id form of
             // /unban and /unmute already use. A kick has nothing persistent
             // to undo (it's just a ban immediately followed by an unban).
             let (command_name, undo) = match action {
-                ActionKind::SpamBan => (if force { "/sb -f" } else { "/sb" }, UndoData::Case { case_id: case_id.clone(), kind: CaseKind::Ban }),
                 ActionKind::Mute => ("/mute", UndoData::Case { case_id: case_id.clone(), kind: CaseKind::Mute }),
                 _ => ("/kick", UndoData::NotRevertible),
             };
@@ -8595,7 +8527,7 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
 
     // Approval trains the model and promotes the existing local ban to the network.
     if kind == "train" {
-        match runtime.decide_training_review(&case.id, decision, from_id).await {
+        match runtime.decide_training_review_at(&case.id, decision, from_id, Some((message.chat().id.0, message.id().0))).await {
             Ok(true) => {}
             Ok(false) => {
                 bot.answer_callback_query(q.id).text("此訓練樣本已處理，未重複執行").await?;
@@ -8607,20 +8539,20 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
                 return Ok(());
             }
         }
-        let (note, toast) = match decision {
+        let toast = match decision {
             "approve" => {
                 // A reviewer approving a /sb is the second gate that promotes
                 // it from a local ban to the shared blacklist.
                 commit_network_ban(&bot, &runtime, &case).await;
-                broadcast_ban_status(&bot, &runtime, case.target_user_id, true).await;
-                ("已訓練並加入跨群黑名單", "已批准並加入黑名單")
+                "已批准並加入黑名單"
             }
-            "reject" => ("已拒絕訓練，本群封禁保留", "已拒絕訓練"),
+            "reject" => "已拒絕訓練",
             _ => return Ok(()),
         };
-        let body = notices::review_card(&case, note, "", Some(from_id));
-        let _ = bot.edit_message_text(message.chat().id, message.id(), body).parse_mode(ParseMode::Html).await;
-        let _ = bot.edit_message_reply_markup(message.chat().id, message.id()).await;
+        drop(_review_guard);
+        if let Err(err)=moderation_queue::deliver_review_updates(&bot,&runtime,Some(&case.id)).await {
+            log::warn!("training review notification {}: {}",case.id,notices::diagnostic(&runtime.config,&err.to_string()));
+        }
         bot.answer_callback_query(q.id).text(toast).await?;
         return Ok(());
     }
@@ -8629,93 +8561,35 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
         bot.answer_callback_query(q.id).text("此舉報已處理，未重複執行").await?;
         return Ok(());
     }
-    match decision {
-        "approve" => {
-            if let Err(err) = ban_user(&bot, ChatId(case.chat_id), case.target_user_id).await {
-                log_callback_error(&bot, &runtime, &case, "ban", &err.to_string()).await;
-                bot.answer_callback_query(q.id).text("封禁失敗").await?;
-                return Ok(());
-            }
-            if let Some(source_id) = case.source_message_id {
-                if let Err(err) = delete_message_if_exists(&bot, ChatId(case.chat_id), MessageId(source_id)).await {
-                    log_callback_error(&bot, &runtime, &case, "delete_message", &err.to_string()).await;
-                }
-            }
-            if let Err(err) = train_spam(&runtime, &case.evidence_text, Some(&case.id)).await {
-                log_callback_error(&bot, &runtime, &case, "train_spam", &err.to_string()).await;
-            }
-            let mut updated = case.clone();
-            updated.action = ActionKind::ReportApproved;
-            updated.status = "approved_and_banned".to_string();
-            updated.actor_user_id = Some(from_id);
-            updated.actor_name = Some(short_user(&from));
-            if let Err(err) = store_case(&runtime, &updated).await {
-                log_callback_error(&bot, &runtime, &case, "store_case", &err.to_string()).await;
-            }
-            let log_message_id = match log_action(&bot, &runtime, &updated).await {
-                Ok(id) => id,
-                Err(err) => {
-                    log_callback_error(&bot, &runtime, &case, "log_action", &err.to_string()).await;
-                    0
-                }
-            };
-            if log_message_id != 0 {
-                let mut logged = updated.clone();
-                logged.log_message_id = Some(log_message_id);
-                if let Err(err) = store_case(&runtime, &logged).await {
-                    log_callback_error(&bot, &runtime, &case, "store_case", &err.to_string()).await;
-                }
-            }
-            propagate_network_ban(&bot, &runtime, &updated).await;
-            broadcast_ban_status(&bot, &runtime, updated.target_user_id, true).await;
-            let body = notices::review_card(&case, "已受理並封禁", "", Some(from_id));
-            let _ = bot.edit_message_text(message.chat().id, message.id(), body).parse_mode(ParseMode::Html).await;
-            let _ = bot.edit_message_reply_markup(message.chat().id, message.id()).await;
-            if let Some((chat_id, msg_id)) = runtime.take_report_confirmation(&case.id).await {
-                let _ = bot
-                    .edit_message_text(ChatId(chat_id), MessageId(msg_id), "✅ 舉報已受理，對象已被封禁。")
-                    .await;
-            }
-            bot.answer_callback_query(q.id).text("已受理並封禁").await?;
+    match runtime.decide_report(&case, decision, (from_id, short_user(&from)), (message.chat().id.0, message.id().0), _review_guard).await {
+        Ok(true) => {}
+        Ok(false) => {
+            bot.answer_callback_query(q.id).text("此舉報已處理，未重複執行").await?;
+            return Ok(());
         }
-        "reject" => {
-            if let Err(err) = train_ham(&runtime, &case.evidence_text, Some(&case.id)).await {
-                log_callback_error(&bot, &runtime, &case, "train_ham", &err.to_string()).await;
-            }
-            // Strike the reporter. Read from `case`, not `updated`: the
-            // lines below overwrite actor_user_id with the reviewer.
-            let mut strike_note = String::new();
-            if let Some(reporter) = case.actor_user_id {
-                if !runtime.is_maintainer(reporter).await {
-                    let count = runtime.add_report_strike(reporter).await.unwrap_or(0);
-                    strike_note = if count >= REPORT_STRIKE_LIMIT {
-                        format!("\n<b>舉報者</b>: <code>{reporter}</code> 已累計 {count} 次被拒，已暫停使用 /spam")
-                    } else {
-                        format!("\n<b>舉報者</b>: <code>{reporter}</code> 已累計 {count}/{REPORT_STRIKE_LIMIT} 次被拒")
-                    };
-                }
-            }
-            let mut updated = case.clone();
-            updated.action = ActionKind::ReportRejected;
-            updated.status = "rejected_and_cleaned".to_string();
-            updated.actor_user_id = Some(from_id);
-            updated.actor_name = Some(short_user(&from));
-            if let Err(err) = store_case(&runtime, &updated).await {
-                log_callback_error(&bot, &runtime, &case, "store_case", &err.to_string()).await;
-            }
-            let body = notices::review_card(&case, "已拒絕舉報", &strike_note, Some(from_id));
-            let _ = bot.edit_message_text(message.chat().id, message.id(), body).parse_mode(ParseMode::Html).await;
-            let _ = bot.edit_message_reply_markup(message.chat().id, message.id()).await;
-            if let Some((chat_id, msg_id)) = runtime.take_report_confirmation(&case.id).await {
-                let _ = bot
-                    .edit_message_text(ChatId(chat_id), MessageId(msg_id), "此舉報未被受理。")
-                    .await;
-            }
-            bot.answer_callback_query(q.id).text("已拒絕受理").await?;
+        Err(err) => {
+            log::warn!("report decision {}: {}", case.id, notices::diagnostic(&runtime.config, &err.to_string()));
+            bot.answer_callback_query(q.id).text("審核未保存，請稍後重試").await?;
+            return Ok(());
         }
-        _ => {}
     }
-
+    let mut banned = false;
+    if decision == "approve" {
+        if let Ok(Some(approved)) = runtime.load_case(&case.id).await {
+            match origin_retry::attempt_origin_ban(&bot, &runtime, approved).await {
+                Ok(done) => banned = done,
+                Err(err) => log::warn!("report ban {}: {}", case.id, notices::diagnostic(&runtime.config, &err.to_string())),
+            }
+        }
+        if let Err(err) = deliver_network_bans(&bot, &runtime, Some(&case.id)).await {
+            log::warn!("report network ban {}: {}", case.id, notices::diagnostic(&runtime.config, &err.to_string()));
+        }
+    }
+    if let Err(err) = moderation_queue::deliver_review_updates(&bot, &runtime, Some(&case.id)).await {
+        log::warn!("report notification {}: {}", case.id, notices::diagnostic(&runtime.config, &err.to_string()));
+    }
+    let toast = if decision == "reject" { "已拒絕受理" } else if banned { "已受理並封禁" } else { "已受理，封禁待處理" };
+    bot.answer_callback_query(q.id).text(toast).await?;
     Ok(())
 }
 
@@ -9369,6 +9243,7 @@ mod tests {
     mod origin_retry;
     mod guest_delivery;
     mod model_updates;
+    mod moderation_queue;
     mod captcha;
     mod edited_messages;
     mod notices;
@@ -10294,9 +10169,15 @@ mod tests {
         let runtime = test_runtime().await;
         assert_eq!(runtime.report_strikes(555).await, 0);
 
-        assert_eq!(runtime.add_report_strike(555).await.unwrap(), 1);
-        assert_eq!(runtime.add_report_strike(555).await.unwrap(), 2);
-        let third = runtime.add_report_strike(555).await.unwrap();
+        for _ in 0..3 {
+            let mut case = dummy_case(ActionKind::PendingReport, -100, 200, Utc::now());
+            case.status = "pending_review".into();
+            case.actor_user_id = Some(555);
+            runtime.persist_case(&case).await.unwrap();
+            let guard = runtime.review_guard(&case.id).await;
+            runtime.decide_report(&case, "reject", (HOST_ID, "Host".into()), (-1, 10), guard).await.unwrap();
+        }
+        let third = runtime.report_strikes(555).await;
         assert_eq!(third, REPORT_STRIKE_LIMIT, "third rejection should hit the limit");
         assert_eq!(runtime.report_strikes(666).await, 0, "strikes are per reporter");
 
@@ -10430,19 +10311,25 @@ mod tests {
     }
 
     // A /spam confirmation must be findable when the review lands (possibly
-    // after a restart), and consumed exactly once so a later reject can't
-    // re-edit a message an approve already rewrote.
+    // after a restart), then attached to the accepted review decision.
     #[tokio::test]
-    async fn report_confirmation_is_stored_and_taken_once() {
+    async fn report_confirmation_survives_restart_and_moves_to_the_delivery_queue() {
         let runtime = test_runtime().await;
-        assert!(runtime.take_report_confirmation("case-x").await.is_none());
-
-        runtime.set_report_confirmation("case-x", -100, 42).await.unwrap();
-        assert_eq!(runtime.take_report_confirmation("case-x").await, Some((-100, 42)));
-        // Consumed on read - a second decision finds nothing to edit.
-        assert!(runtime.take_report_confirmation("case-x").await.is_none());
+        let mut case = dummy_case(ActionKind::PendingReport, -100, 200, Utc::now());
+        case.status = "pending_review".into();
+        runtime.persist_case(&case).await.unwrap();
+        runtime.set_report_confirmation(&case.id, -100, 42).await.unwrap();
+        let restarted = Runtime::load(runtime.config.clone()).await.unwrap();
+        let guard = restarted.review_guard(&case.id).await;
+        assert!(restarted.decide_report(&case, "reject", (HOST_ID, "Host".into()), (-1, 10), guard).await.unwrap());
+        let guard = restarted.review_guard(&case.id).await;
+        assert!(!restarted.decide_report(&case, "approve", (HOST_ID, "Host".into()), (-1, 10), guard).await.unwrap());
+        restarted.with_conn(|conn| {
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM report_confirmations", [], |r| r.get::<_,i64>(0))?, 0);
+            assert_eq!(conn.query_row("SELECT confirmation_chat_id,confirmation_message_id FROM review_updates", [], |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i32>(1)?)))?, (-100,42));
+            Ok(())
+        }).await.unwrap();
     }
-
     // A /sb on a pure bot-mention message becomes a regex rule, not an ML
     // sample. The detection has to accept the real summon shapes (bare
     // handle, several handles, a trailing emoji) and reject anything with
