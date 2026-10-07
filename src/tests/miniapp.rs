@@ -549,6 +549,8 @@ async fn host_queries_paginate_filter_and_redact_private_diagnostics() {
         search: search.into(),
         offset,
         filter: String::new(),
+        created_from: None,
+        created_before: None,
     };
     let first = runtime.host_query(query("cases", "", 0)).await.unwrap();
     assert_eq!(first["items"].as_array().unwrap().len(), 25);
@@ -601,6 +603,134 @@ async fn host_queries_paginate_filter_and_redact_private_diagnostics() {
         .as_array()
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn host_date_filters_include_full_days_and_keep_pagination_inside_the_range() {
+    let runtime = test_runtime().await;
+    let timestamp = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().timestamp();
+    let from = timestamp("2026-10-08T00:00:00+08:00");
+    let before = timestamp("2026-10-09T00:00:00+08:00");
+    let dates = [
+        "2026-10-07T23:59:59.999999+08:00",
+        "2026-10-08T00:00:00+08:00",
+        "2026-10-08T23:59:59.999999+08:00",
+        "2026-10-09T00:00:00+08:00",
+    ];
+    for (n, date) in dates.iter().enumerate() {
+        let mut case = dummy_case(ActionKind::AutoBan, -100, 200 + n as i64, Utc::now());
+        case.created_at = DateTime::parse_from_rfc3339(date)
+            .unwrap()
+            .with_timezone(&Utc);
+        runtime.persist_case(&case).await.unwrap();
+    }
+    // Mix offset timestamps and UTC timestamps, including sub-millisecond values.
+    for user in 300..325 {
+        let mut case = dummy_case(ActionKind::AutoBan, -100, user, Utc::now());
+        case.created_at = DateTime::parse_from_rfc3339("2026-10-08T10:00:00.999999Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        runtime.persist_case(&case).await.unwrap();
+    }
+    let query = |view: &str, offset| {
+        serde_json::from_value::<crate::host_panel::Query>(serde_json::json!({"view":view,"offset":offset,"created_from":from,"created_before":before})).unwrap()
+    };
+    let first = runtime.host_query(query("cases", 0)).await.unwrap();
+    assert_eq!(first["items"].as_array().unwrap().len(), 25);
+    assert_eq!(first["has_more"], true);
+    let last = runtime.host_query(query("cases", 25)).await.unwrap();
+    assert_eq!(last["has_more"], false);
+    let ids: Vec<_> = last["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["target_user_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, [202, 201]);
+    let mut only_user = query("cases", 0);
+    only_user.search = "202".into();
+    assert_eq!(
+        runtime.host_query(only_user).await.unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let mut before_only = query("cases", 0);
+    before_only.created_from = None;
+    assert_eq!(
+        runtime.host_query(before_only).await.unwrap()["has_more"],
+        true
+    );
+    runtime.with_conn(move |conn| {
+        for date in dates {
+            conn.execute("INSERT INTO maintainer_actions(actor_id,actor_name,chat_id,command,summary,undo_data,created_at) VALUES (?1,'host',-100,'test','test',?2,?3)", params![HOST_ID,serde_json::to_string(&UndoData::NotRevertible)?,date])?;
+        }
+        Ok(())
+    }).await.unwrap();
+    let audit = runtime.host_query(query("audit", 0)).await.unwrap();
+    assert_eq!(audit["items"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn host_result_filters_do_not_treat_pending_or_uncertain_actions_as_done() {
+    let runtime = test_runtime().await;
+    let cases = [
+        (ActionKind::AutoBan, "ban_pending"),
+        (ActionKind::AutoBan, "ban_failed"),
+        (ActionKind::AutoBan, "banned_delete_failed"),
+        (ActionKind::AutoBan, "auto_banned"),
+        (ActionKind::SpamBan, "done"),
+        (ActionKind::Mute, "done"),
+        (ActionKind::Mute, "action_unconfirmed"),
+        (ActionKind::Mute, "action_failed"),
+        (ActionKind::Mute, "action_pending"),
+        (ActionKind::Mute, "action_cancelled"),
+        (ActionKind::AutoBan, "reversal_pending"),
+        (ActionKind::AutoBan, "reversed"),
+        (ActionKind::ReportRejected, "rejected_and_cleaned"),
+        (ActionKind::PendingReport, "pending_review"),
+    ];
+    for (index, (action, status)) in cases.into_iter().enumerate() {
+        let mut case = dummy_case(action, -100, 200 + index as i64, Utc::now());
+        case.status = status.into();
+        runtime.persist_case(&case).await.unwrap();
+    }
+    for (filter, expected) in [
+        ("banned", vec![204, 203, 202]),
+        ("pending", vec![208, 200]),
+        ("failed", vec![207, 202, 201]),
+        ("unconfirmed", vec![206]),
+        ("cancelled", vec![209]),
+        ("reversal_pending", vec![210]),
+        ("reversed", vec![211]),
+        ("rejected", vec![212]),
+        ("pending_review", vec![213]),
+    ] {
+        let query =
+            serde_json::from_value(serde_json::json!({"view":"cases","filter":filter})).unwrap();
+        let rows = runtime.host_query(query).await.unwrap();
+        let ids: Vec<_> = rows["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["target_user_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, expected, "{filter}");
+    }
+    for payload in [
+        serde_json::json!({"view":"cases","filter":"' OR 1=1 --"}),
+        serde_json::json!({"view":"cases","created_from":100,"created_before":100}),
+        serde_json::json!({"view":"cases","created_from":101,"created_before":100}),
+        serde_json::json!({"view":"cases","created_from":-1}),
+        serde_json::json!({"view":"cases","created_before":253402300800_i64}),
+        serde_json::json!({"view":"groups","created_from":0}),
+    ] {
+        assert!(runtime
+            .host_query(serde_json::from_value(payload).unwrap())
+            .await
+            .is_err());
+    }
 }
 
 #[tokio::test]

@@ -1,6 +1,13 @@
 use super::*;
 use serde_json::{json, Value};
 
+// Bounds are whole seconds. Remove fractions before SQLite parses them: its
+// millisecond rounding would otherwise move 23:59:59.999999 into the next day.
+const CREATED_SECONDS: &str = "CAST(strftime('%s',substr(created_at,1,19) || CASE
+    WHEN substr(created_at,-1)='Z' THEN 'Z'
+    WHEN substr(created_at,-6,1) IN ('+','-') THEN substr(created_at,-6)
+    ELSE '' END) AS INTEGER)";
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Query {
@@ -11,6 +18,10 @@ pub(super) struct Query {
     pub offset: u32,
     #[serde(default)]
     pub filter: String,
+    #[serde(default)]
+    pub created_from: Option<i64>,
+    #[serde(default)]
+    pub created_before: Option<i64>,
 }
 
 impl Query {
@@ -19,10 +30,29 @@ impl Query {
             self.view.as_str(),
             "overview" | "cases" | "groups" | "people" | "audit" | "queue"
         ) && (self.filter.is_empty()
-            || (self.view == "cases" && self.filter == "pending_review")
+            || (self.view == "cases"
+                && matches!(
+                    self.filter.as_str(),
+                    "pending_review"
+                        | "banned"
+                        | "pending"
+                        | "failed"
+                        | "unconfirmed"
+                        | "reversal_pending"
+                        | "reversed"
+                        | "rejected"
+                        | "cancelled"
+                ))
             || (self.view == "queue" && matches!(self.filter.as_str(), "failed" | "network")))
             && self.search.chars().count() <= 100
             && self.offset <= 100_000
+            && ([self.created_from, self.created_before]
+                .iter()
+                .flatten()
+                .all(|n| (0..=253_402_300_799).contains(n)))
+            && (self.created_from.is_none() && self.created_before.is_none()
+                || matches!(self.view.as_str(), "cases" | "audit"))
+            && !matches!((self.created_from, self.created_before), (Some(from), Some(before)) if from >= before)
     }
 }
 
@@ -77,14 +107,25 @@ impl Runtime {
                     summary["global_threshold"] = json!(Self::load_threshold(&tx)?.unwrap_or(config.spam_threshold));
                     vec![summary]
                 },
-                "cases" => rows(&tx, "SELECT id,action,chat_id,target_user_id,target_name,
+                "cases" => rows(&tx, &format!("SELECT id,action,chat_id,target_user_id,target_name,
                     status,model_score,matched_rule_pattern AS reason,netban_eligible,
                     evidence_text AS evidence,created_at,
                     (SELECT COUNT(*) FROM network_deliveries n WHERE n.case_id=c.id AND n.state='done') AS network_done,
                     (SELECT COUNT(*) FROM network_deliveries n WHERE n.case_id=c.id AND n.state='pending') AS network_pending
                     FROM cases c WHERE (?1='' OR id=?1 OR target_user_id=?2 OR chat_id=?2)
-                    AND (?4='' OR (action='pending_report' AND status='pending_review'))
-                    ORDER BY rowid DESC LIMIT 26 OFFSET ?3", params![search,id,query.offset,query.filter])?,
+                    AND (?4=''
+                        OR (?4='pending_review' AND action='pending_report' AND status='pending_review')
+                        OR (?4='banned' AND (status IN ('ban_done','auto_banned','guest_bot_banned','guest_invoker_banned','approved_and_banned','force_approved','banned_delete_failed')
+                            OR (status='done' AND action IN ('spam_ban','project_ban'))))
+                        OR (?4='pending' AND status IN ('ban_pending','action_pending'))
+                        OR (?4='failed' AND status IN ('ban_failed','action_failed','banned_delete_failed'))
+                        OR (?4='unconfirmed' AND status='action_unconfirmed')
+                        OR (?4 IN ('reversal_pending','reversed') AND status=?4)
+                        OR (?4='rejected' AND action='report_rejected')
+                        OR (?4='cancelled' AND status='action_cancelled'))
+                    AND (?5 IS NULL OR {CREATED_SECONDS}>=?5)
+                    AND (?6 IS NULL OR {CREATED_SECONDS}<?6)
+                    ORDER BY rowid DESC LIMIT 26 OFFSET ?3"), params![search,id,query.offset,query.filter,query.created_from,query.created_before])?,
                 "groups" => rows(&tx, "SELECT g.chat_id,title,last_seen,netban,
                     spam_threshold_override,settings_revision,
                     EXISTS(SELECT 1 FROM banned_groups b WHERE b.chat_id=g.chat_id) AS service_denied
@@ -96,13 +137,15 @@ impl Runtime {
                     UNION ALL SELECT 'reviewer',user_id,added_by,created_at FROM reviewers WHERE user_id!=?4)
                     WHERE (?1='' OR user_id=?2) ORDER BY role,user_id LIMIT 26 OFFSET ?3",
                     params![search,id,query.offset,HOST_ID])?,
-                "audit" => rows(&tx, "SELECT * FROM (
+                "audit" => rows(&tx, &format!("SELECT * FROM (
                     SELECT CAST(action_id AS TEXT) AS id,'command' AS source,actor_id AS actor_user_id,chat_id,
                         command AS action,summary AS detail,reverted,created_at FROM maintainer_actions
                     UNION ALL SELECT request_id,'settings',actor_user_id,chat_id,'settings',
                         changes_json,0,created_at FROM group_settings_audit)
                     WHERE (?1='' OR id=?1 OR actor_user_id=?2 OR chat_id=?2)
-                    ORDER BY created_at DESC,source,id DESC LIMIT 26 OFFSET ?3", params)?,
+                    AND (?4 IS NULL OR {CREATED_SECONDS}>=?4)
+                    AND (?5 IS NULL OR {CREATED_SECONDS}<?5)
+                    ORDER BY created_at DESC,source,id DESC LIMIT 26 OFFSET ?3"), params![search,id,query.offset,query.created_from,query.created_before])?,
                 "queue" => rows(&tx, &format!("SELECT kind,case_id,chat_id,attempts,next_attempt_at,
                     last_error FROM ({})
                     WHERE (?1='' OR case_id=?1 OR chat_id=?2)

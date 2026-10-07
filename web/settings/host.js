@@ -63,11 +63,17 @@
   Object.assign(words['zh-Hans'],{groupSettings:'设置与自定义文字',openSettings:'前往群组设置 ↗',groupLinkNote:'此入口 5 分钟内有效，仅限你本人使用。打开及保存时会重新确认你和机器人的群组管理权限。',group_access_denied:'无法打开此群设置。请确认你和机器人仍是该群管理员，且该群未被终止服务。'});
   Object.assign(words.en,{groupSettings:'Settings and group messages',openSettings:'Open group settings ↗',groupLinkNote:'This link is valid for 5 minutes and only works for you. Your group admin rights and the bot’s are checked again when opening and saving.',group_access_denied:'Unable to open this group’s settings. You and the bot must still be group admins, and the group must not be denied service.'});
   Object.assign(words['zh-Hant'],{caseDetails:'案件詳情與撤銷'});Object.assign(words['zh-Hans'],{caseDetails:'案件详情与撤销'});Object.assign(words.en,{caseDetails:'Case details and reversal'});
-  let lang='zh-Hant',request,clearToken,root,view='overview',search='',filter='',offset=0,data=null,busy=false,closed=false,error='',groupLink=null;
+  Object.assign(words['zh-Hant'],{resultFilter:'處理結果',allResults:'全部',fromDate:'開始日期',throughDate:'結束日期',clearFilters:'清除篩選',dateNote:'日期包含首尾兩天；按裝置時區：',invalid_request:'請檢查搜尋條件及日期範圍。',banned:'封禁已生效',pending:'待執行',failed:'操作失敗（含部分失敗）',unconfirmed:'結果未確認',rejected:'舉報已拒絕',cancelled:'已取消'});
+  Object.assign(words['zh-Hans'],{resultFilter:'处理结果',allResults:'全部',fromDate:'开始日期',throughDate:'结束日期',clearFilters:'清除筛选',dateNote:'日期包含首尾两天；按设备时区：',invalid_request:'请检查搜索条件和日期范围。',banned:'封禁已生效',pending:'待执行',failed:'操作失败（含部分失败）',unconfirmed:'结果未确认',rejected:'举报已拒绝',cancelled:'已取消'});
+  Object.assign(words.en,{resultFilter:'Result',allResults:'All',fromDate:'From date',throughDate:'Through date',clearFilters:'Clear filters',dateNote:'Dates include both days; device time zone: ',invalid_request:'Check the search filters and date range.',banned:'Ban in effect',pending:'Awaiting action',failed:'Failed or partly failed',unconfirmed:'Result unconfirmed',rejected:'Report rejected',cancelled:'Cancelled'});
+  const caseFilters=['','pending_review','banned','pending','failed','unconfirmed','reversal_pending','reversed','rejected','cancelled'];
+  let lang='zh-Hant',request,clearToken,root,view='overview',search='',filter='',fromDate='',throughDate='',createdFrom=null,createdBefore=null,offset=0,data=null,busy=false,closed=false,error='',groupLink=null;
   const t = key => words[lang][key] ?? key;
   const element = (tag,text,className) => {const el=document.createElement(tag); if(text!==undefined)el.textContent=text; if(className)el.className=className; return el;};
   function button(text,action) {const el=element('button',text);el.type='button';el.disabled=busy||closed;el.addEventListener('click',action);return el;}
   function date(value) {return value ? new Date(typeof value==='number'?value*1000:value).toLocaleString(lang) : t('unknown');}
+  function resetFilters(){search='';filter='';fromDate='';throughDate='';createdFrom=null;createdBefore=null;offset=0;}
+  function dateBoundary(value,nextDay=false){if(!value)return null;const parts=value.split('-').map(Number);const date=new Date(parts[0],parts[1]-1,parts[2]);if(nextDay)date.setDate(date.getDate()+1);return date.getTime()/1000;}
   function value(key,v) {
     if(v===null||v===undefined)return key==='spam_threshold_override'?t('global'):t('unknown');
     if(['netban_eligible','netban','service_denied','reverted'].includes(key))return t(v?'yes':'no');
@@ -85,17 +91,28 @@
     const status=element('p',error?t(error):busy?t('loading'):data?`${t('updated')} ${date(data.updated_at)}`:'','host-meta');status.setAttribute('role','status');status.setAttribute('aria-live','polite');if(error)status.classList.add('host-error');root.append(status);
     if(closed)return;
     const nav=element('nav',undefined,'host-nav');nav.setAttribute('aria-label',t('title'));
-    for(const name of views){const item=button(t(name),()=>{view=name;search='';filter='';offset=0;load();});if(name===view)item.setAttribute('aria-current','page');nav.append(item);}root.append(nav);
-    if(filter)root.append(element('p',t({pending_review:'pending_reports',failed:'failed_work',network:'pending_network'}[filter]),'host-note'));
-    const form=element('form',undefined,'host-tools');form.addEventListener('submit',event=>{event.preventDefault();if(!busy){search=input.value.trim();offset=0;load();}});
+    for(const name of views){const item=button(t(name),()=>{view=name;resetFilters();load();});if(name===view)item.setAttribute('aria-current','page');nav.append(item);}root.append(nav);
+    if(view==='queue'&&filter)root.append(element('p',t({failed:'failed_work',network:'pending_network'}[filter]),'host-note'));
+    const dates={};const form=element('form',undefined,'host-tools');form.addEventListener('submit',event=>{event.preventDefault();if(!busy){const from=dateBoundary(dates.fromDate?.value),before=dateBoundary(dates.throughDate?.value,true);if((from!==null&&!Number.isFinite(from))||(before!==null&&!Number.isFinite(before))||(from!==null&&before!==null&&from>=before)){dates.throughDate?.setCustomValidity(t('invalid_request'));dates.throughDate?.reportValidity();return;}search=input.value.trim();filter=resultSelect?.value??filter;fromDate=dates.fromDate?.value||'';throughDate=dates.throughDate?.value||'';createdFrom=from;createdBefore=before;offset=0;load();}});
     const input=element('input');input.type='search';input.maxLength=100;input.value=search;input.disabled=busy;input.id='host-search';
-    if(view!=='overview'){const label=element('label',t({groups:'groupSearch',people:'userSearch',queue:'queueSearch',audit:'auditSearch'}[view]||'search'));label.htmlFor=input.id;label.append(input);const submit=element('button',t('find'));submit.type='submit';submit.disabled=busy;form.append(label,submit);}
+    if(view!=='overview'){const label=element('label',t({groups:'groupSearch',people:'userSearch',queue:'queueSearch',audit:'auditSearch'}[view]||'search'));label.htmlFor=input.id;label.append(input);form.append(label);}
+    let resultSelect;
+    if(view==='cases'){
+      const label=element('label',t('resultFilter'));resultSelect=element('select');resultSelect.id='host-result';label.htmlFor=resultSelect.id;resultSelect.disabled=busy;
+      for(const name of caseFilters){const option=element('option',name==='pending_review'?t('pending_reports'):name?(states[lang][name]||t(name)):t('allResults'));option.value=name;resultSelect.append(option);}resultSelect.value=filter;label.append(resultSelect);form.append(label);
+    }
+    if(['cases','audit'].includes(view)){
+      for(const key of ['fromDate','throughDate']){const label=element('label',t(key));const field=element('input');field.type='date';field.id=`host-${key}`;field.min='1970-01-01';field.max='9998-12-31';field.value=key==='fromDate'?fromDate:throughDate;field.disabled=busy;field.addEventListener('input',()=>dates.throughDate?.setCustomValidity(''));dates[key]=field;label.htmlFor=field.id;label.append(field);form.append(label);}
+    }
+    if(view!=='overview'){const submit=element('button',t('find'));submit.type='submit';submit.disabled=busy;form.append(submit);}
+    if(['cases','audit'].includes(view))form.append(button(t('clearFilters'),()=>{resetFilters();load();}));
     form.append(button(t('refresh'),load));root.append(form);
+    if(['cases','audit'].includes(view))root.append(element('p',t('dateNote')+Intl.DateTimeFormat().resolvedOptions().timeZone,'host-note'));
     if(view==='people')root.append(button(t('manageRoles'),()=>editRole()));
     if(!data)return;
     if(view==='overview'){
       const summary=data.items[0];const grid=element('div',undefined,'host-summary');
-      for(const key of ['pending_reports','pending_work','failed_work','pending_network']){const card=button('',()=>{view=key==='pending_reports'?'cases':'queue';filter={pending_reports:'pending_review',failed_work:'failed',pending_network:'network'}[key]||'';search='';offset=0;load();});card.className='host-stat';card.append(element('span',t(key)),element('strong',value(key,summary[key])));grid.append(card);}root.append(grid);
+      for(const key of ['pending_reports','pending_work','failed_work','pending_network']){const card=button('',()=>{view=key==='pending_reports'?'cases':'queue';resetFilters();filter={pending_reports:'pending_review',failed_work:'failed',pending_network:'network'}[key]||'';load();});card.className='host-stat';card.append(element('span',t(key)),element('strong',value(key,summary[key])));grid.append(card);}root.append(grid);
       const info=element('article',undefined,'host-record');const dl=element('dl');for(const key of ['known_groups','rules','global_threshold','version','schema'])dl.append(element('dt',t(key)),element('dd',value(key,summary[key])));info.append(dl);root.append(info);
       if(summary.telegram_not_before>Date.now()/1000)root.append(element('p',t('cooldown')+date(summary.telegram_not_before),'host-note'));
       root.append(element('p',t('modelNote'),'host-note'));
@@ -119,9 +136,9 @@
     }
     if(['overview','groups'].includes(view))root.append(element('p',t('note'),'host-note'));
   }
-  function editRole(userId){window.SPBRoleEditor.open({request,language:lang,userId,onAuthError:fail,onSaved:async id=>{view='people';search=String(id);offset=0;filter='';await load();}});}
+  function editRole(userId){window.SPBRoleEditor.open({request,language:lang,userId,onAuthError:fail,onSaved:async id=>{view='people';resetFilters();search=String(id);await load();}});}
   async function prepareGroup(chatId){if(busy||closed)return;busy=true;error='';groupLink=null;render();try{const result=await request('host-group-link','POST',{chat_id:chatId});const url=new URL(result.url);if(url.protocol!=='https:'||url.hostname!=='t.me'||url.username||url.password)throw new Error('temporarily_unavailable');groupLink={chat_id:chatId,url:url.href};}catch(e){fail(e);}finally{busy=false;render();}}
-  async function load(){if(busy||closed)return;busy=true;error='';data=null;groupLink=null;render();try{data=await request('host-query','POST',{view,search,filter,offset});}catch(e){fail(e);}finally{busy=false;render();}}
+  async function load(){if(busy||closed)return;busy=true;error='';data=null;groupLink=null;render();try{data=await request('host-query','POST',{view,search,filter,offset,created_from:createdFrom,created_before:createdBefore});}catch(e){fail(e);}finally{busy=false;render();}}
   function fail(e){error=Object.hasOwn(words.en,e.message)?e.message:'temporarily_unavailable';if(['session_expired','forbidden'].includes(error)){closed=true;data=null;clearToken?.();window.SPBRoleEditor.expire();window.SPBCasePanel.expire();}render();}
   async function logout(){if(busy||closed)return;busy=true;render();try{await request('logout','POST',{});closed=true;data=null;clearToken();error='signedOut';}catch(e){fail(e);}finally{busy=false;render();}}
   window.SPBHost={
