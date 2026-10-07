@@ -11,6 +11,7 @@ mod reliability;
 mod origin_retry;
 mod moderation_queue;
 mod restriction_retry;
+mod queue_status;
 use origin_retry::execute_auto_ban;
 use reliability::{passes_threshold, stable_probability};
 mod reversal_retry;
@@ -3269,6 +3270,7 @@ enum ModerationCommand {
     Kick(String),
     SpamReport,
     CaseLookup(String),
+    Queue(String),
     MlTrainSpam,
     MlCleanSpam,
     MlUndoCleanSpam,
@@ -3361,6 +3363,7 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/hostctl" => ModerationCommand::HostCtl(text.split_once(char::is_whitespace).map(|x| x.1).unwrap_or("").trim().to_string()),
         "/spam" | "/report" => ModerationCommand::SpamReport,
         "/case" | "/lookup" => ModerationCommand::CaseLookup(text.split_whitespace().nth(1).unwrap_or("").to_string()),
+        "/queue" => ModerationCommand::Queue(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/ml_score" | "/score" => ModerationCommand::ScoreTest(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
         "/setchat" => ModerationCommand::SetChat(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/leave" => ModerationCommand::Leave(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
@@ -3898,6 +3901,7 @@ fn help_op_text(section: &str) -> String {
             "<code>/pol show</code> 查詢本群警告次數\n",
             "<code>/pol clear</code> 清除警告\n",
             "<code>/ping</code> 版本與 commit\n",
+            "<code>/queue [案例ID]</code> 私聊查詢未完成工作\n",
             "<code>/maintainerdoc</code> 取得上手文件密碼\n",
             "· 加 <code>new</code> 更換，舊密碼失效\n",
             "\n<b>日誌與橋接</b>\n",
@@ -7328,6 +7332,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 .await?;
             let _ = runtime.set_report_confirmation(&case_id, message.chat.id.0, sent.id.0).await;
         }
+        ModerationCommand::Queue(case_id) => {
+            queue_status::handle(&bot,&runtime,&message,&case_id).await?;
+        }
         ModerationCommand::CaseLookup(case_id) => {
             match runtime.load_case(&case_id).await {
                 Ok(Some(case)) => {
@@ -9185,6 +9192,7 @@ mod tests {
     mod model_updates;
     mod moderation_queue;
     mod restriction_retry;
+    mod queue_status;
     mod captcha;
     mod edited_messages;
     mod notices;
