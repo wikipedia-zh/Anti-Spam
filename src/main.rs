@@ -7,6 +7,9 @@
 // Only the copyright holder and those they authorize may operate it. See
 // the LICENSE file.
 
+mod reliability;
+use reliability::{execute_auto_ban, passes_threshold, stable_probability};
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use jieba_rs::Jieba;
@@ -266,6 +269,7 @@ struct Runtime {
     /// persistence pattern as `project_chat`/`audit_log_chat`.
     exchange_channel: Mutex<Option<i64>>,
     model: Mutex<ModelState>,
+    review_lock: Mutex<()>,
     spam_rules: RwLock<Vec<SpamRule>>,
     mass_train_buffer: Mutex<HashMap<i64, Vec<String>>>,
     mass_train_mode: Mutex<HashMap<i64, String>>,
@@ -495,6 +499,7 @@ impl Runtime {
             audit_log_chat: Mutex::new(audit_log_chat),
             exchange_channel: Mutex::new(exchange_channel),
             model: Mutex::new(model),
+            review_lock: Mutex::new(()),
             spam_rules: RwLock::new(spam_rules),
             mass_train_buffer: Mutex::new(HashMap::new()),
             mass_train_mode: Mutex::new(HashMap::new()),
@@ -681,6 +686,9 @@ impl Runtime {
         }
         if user_version < 17 {
             Self::migrate_v16_to_v17(conn)?;
+        }
+        if user_version < 18 {
+            Self::migrate_v17_to_v18(conn)?;
         }
         Ok(())
     }
@@ -1296,7 +1304,8 @@ impl Runtime {
         self.with_conn(move |conn| {
             let placeholders = actions.iter().enumerate().map(|(i, _)| format!("?{}", i + 3)).collect::<Vec<_>>().join(",");
             let sql = format!(
-                r#"SELECT id, action, chat_id, target_user_id, target_name, actor_user_id, actor_name, source_message_id, evidence_text, model_score, matched_rule_id, matched_rule_pattern, status, log_message_id, created_at FROM cases WHERE chat_id = ?1 AND target_user_id = ?2 AND action IN ({placeholders}) ORDER BY created_at DESC LIMIT 1"#
+                r#"SELECT id, action, chat_id, target_user_id, target_name, actor_user_id, actor_name, source_message_id, evidence_text, model_score, matched_rule_id, matched_rule_pattern, status, log_message_id, created_at FROM cases WHERE chat_id = ?1 AND target_user_id = ?2
+                 AND status NOT IN ('ban_pending','ban_failed') AND action IN ({placeholders}) ORDER BY created_at DESC LIMIT 1"#
             );
             let mut stmt = conn.prepare(&sql)?;
             let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&chat_id, &target_user_id];
@@ -1347,6 +1356,7 @@ impl Runtime {
                 "SELECT id, action, chat_id, target_user_id, target_name, actor_user_id, actor_name, source_message_id, evidence_text, model_score, matched_rule_id, matched_rule_pattern, status, log_message_id, created_at
                  FROM cases
                  WHERE target_user_id = ?1 AND netban_eligible = 1
+                   AND status NOT IN ('ban_pending','ban_failed','reversal_pending')
                    AND action IN ('auto_ban', 'spam_ban', 'report_approved', 'guest_bot_ban', 'guest_invoker_ban')
                  ORDER BY created_at DESC LIMIT 1",
             )?;
@@ -1367,7 +1377,7 @@ impl Runtime {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, action, chat_id, target_user_id, target_name, actor_user_id, actor_name, source_message_id, evidence_text, model_score, matched_rule_id, matched_rule_pattern, status, log_message_id, created_at
-                 FROM cases WHERE target_user_id = ?1 AND action = 'project_ban'
+                 FROM cases WHERE target_user_id = ?1 AND action = 'project_ban' AND status != 'reversal_pending'
                  ORDER BY created_at DESC LIMIT 1",
             )?;
             let mut rows = stmt.query(params![user_id])?;
@@ -1399,7 +1409,8 @@ impl Runtime {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, action, chat_id, target_user_id, target_name, actor_user_id, actor_name, source_message_id, evidence_text, model_score, matched_rule_id, matched_rule_pattern, status, log_message_id, created_at
-                 FROM cases WHERE chat_id = ?1 AND target_user_id = ?2 AND action IN ('auto_ban', 'spam_ban', 'report_approved')
+                 FROM cases WHERE chat_id = ?1 AND target_user_id = ?2
+                 AND status NOT IN ('ban_pending','ban_failed','reversal_pending') AND action IN ('auto_ban', 'spam_ban', 'report_approved')
                  ORDER BY created_at DESC LIMIT 1",
             )?;
             let mut rows = stmt.query(params![chat_id, user_id])?;
@@ -1418,7 +1429,7 @@ impl Runtime {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, action, chat_id, target_user_id, target_name, actor_user_id, actor_name, source_message_id, evidence_text, model_score, matched_rule_id, matched_rule_pattern, status, log_message_id, created_at
-                 FROM cases WHERE target_user_id = ?1 AND action IN ('auto_ban', 'spam_ban', 'report_approved', 'guest_bot_ban', 'guest_invoker_ban', 'project_ban')
+                 FROM cases WHERE target_user_id = ?1 AND status NOT IN ('ban_pending','ban_failed') AND action IN ('auto_ban', 'spam_ban', 'report_approved', 'guest_bot_ban', 'guest_invoker_ban', 'project_ban')
                  ORDER BY created_at DESC",
             )?;
             let mut rows = stmt.query(params![user_id])?;
@@ -1437,7 +1448,7 @@ impl Runtime {
     async fn count_ban_strikes_for_user(&self, user_id: i64) -> Result<i64> {
         self.with_conn(move |conn| {
             Ok(conn.query_row(
-                "SELECT COUNT(*) FROM cases WHERE target_user_id = ?1 AND action IN ('auto_ban', 'spam_ban', 'report_approved', 'unbanned')",
+                "SELECT COUNT(*) FROM cases WHERE target_user_id = ?1 AND status NOT IN ('ban_pending','ban_failed') AND action IN ('auto_ban', 'spam_ban', 'report_approved', 'unbanned')",
                 params![user_id],
                 |row| row.get(0),
             )?)
@@ -1474,6 +1485,7 @@ impl Runtime {
         .await
     }
 
+    #[cfg(test)]
     async fn clear_network_ban_targets(&self, case_id: &str) -> Result<()> {
         let case_id = case_id.to_string();
         self.with_conn(move |conn| {
@@ -1564,20 +1576,6 @@ impl Runtime {
         .await
     }
 
-    async fn insert_training_sample(&self, label: &str, text: &str, case_id: Option<&str>) -> Result<()> {
-        let label = label.to_string();
-        let text = text.to_string();
-        let case_id = case_id.map(|s| s.to_string());
-        self.with_conn(move |conn| {
-            conn.execute(
-                "INSERT INTO training_samples (label, text, case_id, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![label, text, case_id, Utc::now().to_rfc3339()],
-            )?;
-            Ok(())
-        })
-        .await
-    }
-
     /// Deletes the training sample(s) tied to `case_id` and rolls back the
     /// word_frequencies counts and doc totals they contributed - mirrors
     /// `purge_training_by_text` below. Previously this only deleted the
@@ -1598,8 +1596,10 @@ impl Runtime {
                 }
             }
 
-            let mut spam_docs: i64 = tx.query_row("SELECT COALESCE(value, '0') FROM model_meta WHERE key = 'spam_docs'", [], |row| row.get::<_, String>(0))?.parse().unwrap_or(0);
-            let mut ham_docs: i64 = tx.query_row("SELECT COALESCE(value, '0') FROM model_meta WHERE key = 'ham_docs'", [], |row| row.get::<_, String>(0))?.parse().unwrap_or(0);
+            // A case may never have trained anything, so model_meta can be
+            // empty. Derive counts from the authoritative samples instead.
+            let mut spam_docs: i64 = tx.query_row("SELECT COUNT(*) FROM training_samples WHERE label = 'spam'", [], |row| row.get(0))?;
+            let mut ham_docs: i64 = tx.query_row("SELECT COUNT(*) FROM training_samples WHERE label = 'ham'", [], |row| row.get(0))?;
 
             for (label, text) in &samples {
                 let tokens = tokenize(text);
@@ -1833,7 +1833,7 @@ impl Runtime {
         for t in thresholds {
             let (mut tp, mut fp, mut fnn) = (0usize, 0usize, 0usize);
             for (is_spam, score) in &scored {
-                match (*is_spam, *score >= t) {
+                match (*is_spam, passes_threshold(*score, t)) {
                     (true, true) => tp += 1,
                     (false, true) => fp += 1,
                     (true, false) => fnn += 1,
@@ -1911,57 +1911,12 @@ impl Runtime {
     /// purge, undo, retrain, ...) have already persisted their
     /// specific changes, so there is nothing to write back here.
     async fn rebuild_model(&self) -> Result<ModelState> {
-        let rebuilt = self
-            .with_conn(|conn| {
-                // See load_model's comment: derived from training_samples,
-                // not the separately-tracked model_meta counters, so this
-                // self-heals any drift between the two instead of persisting it.
-                let spam_docs = conn.query_row("SELECT COUNT(*) FROM training_samples WHERE label = 'spam'", [], |row| row.get::<_, i64>(0))? as u64;
-                let ham_docs = conn.query_row("SELECT COUNT(*) FROM training_samples WHERE label = 'ham'", [], |row| row.get::<_, i64>(0))? as u64;
-                let mut rebuilt = ModelState { spam_docs, ham_docs, ..Default::default() };
-                let mut stmt = conn.prepare("SELECT word, spam_count, ham_count FROM word_frequencies ORDER BY word ASC")?;
-                let mut rows = stmt.query([])?;
-                while let Some(row) = rows.next()? {
-                    let word: String = row.get(0)?;
-                    let spam_count: u64 = row.get(1)?;
-                    let ham_count: u64 = row.get(2)?;
-                    if spam_count > 0 {
-                        rebuilt.spam_tokens.insert(word.clone(), spam_count);
-                    }
-                    if ham_count > 0 {
-                        rebuilt.ham_tokens.insert(word, ham_count);
-                    }
-                }
-                Ok(rebuilt)
-            })
-            .await?;
-
+        // Lock before reading, so a concurrent training commit cannot be
+        // overwritten by a snapshot read before that commit.
         let mut model = self.model.lock().await;
+        let rebuilt = self.with_conn(|conn| Self::load_model(conn)).await?;
         *model = rebuilt.clone();
         Ok(rebuilt)
-    }
-
-    /// Persists only the aggregate doc counters. Per-token counts are written
-    /// directly by whoever changes them (train_spam/train_ham/etc.) — this
-    /// used to also rewrite every token in the vocabulary on every call, which
-    /// got slower as the vocabulary grew for no benefit.
-    async fn persist_doc_counts(&self) -> Result<()> {
-        let (spam_docs, ham_docs) = {
-            let model = self.model.lock().await;
-            (model.spam_docs, model.ham_docs)
-        };
-        self.with_conn(move |conn| {
-            conn.execute(
-                "INSERT INTO model_meta (key, value) VALUES ('spam_docs', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                params![spam_docs.to_string()],
-            )?;
-            conn.execute(
-                "INSERT INTO model_meta (key, value) VALUES ('ham_docs', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                params![ham_docs.to_string()],
-            )?;
-            Ok(())
-        })
-        .await
     }
 
     async fn set_threshold(&self, value: f64) -> Result<()> {
@@ -4316,6 +4271,13 @@ fn utc8_display(dt: DateTime<Utc>) -> String {
 }
 
 fn chinese_case_action(case: &CaseRecord) -> String {
+    match case.status.as_str() {
+        "ban_pending" => return "封禁待確認".to_string(),
+        "ban_failed" => return "封禁失敗".to_string(),
+        "banned_delete_failed" => return "已封禁；刪除失敗".to_string(),
+        "reversal_pending" => return "撤銷處理中".to_string(),
+        _ => {}
+    }
     if let Some(rule_id) = case.matched_rule_id {
         format!("規則 #{}", rule_id)
     } else {
@@ -5238,51 +5200,47 @@ fn unban_noop_reason(err: &teloxide::RequestError) -> Option<&'static str> {
 }
 
 async fn reverse_ban_case(bot: &Bot, runtime: &Runtime, mut case: CaseRecord, actor_id: i64, actor_name: &str) -> Result<String, String> {
-    let mut noop_note = String::new();
-    if let Err(err) = bot.unban_chat_member(ChatId(case.chat_id), UserId(case.target_user_id as u64)).await {
-        match unban_noop_reason(&err) {
-            // Already not banned. Carry on with the rest of the reversal -
-            // the case still has to be closed, the training sample removed,
-            // and the netban entry cleared, none of which happens if we
-            // return here.
-            Some(reason) => noop_note = format!("（{reason}）"),
-            None => return Err(format!("解封失敗：{err}")),
+    let _review_guard = runtime.review_lock.lock().await;
+    case = runtime.load_case(&case.id).await.map_err(|e| e.to_string())?
+        .ok_or_else(|| "案例不存在".to_string())?;
+    if case.status == "reversed" { return Ok("此案例已撤銷".to_string()); }
+    let starting = case.status != "reversal_pending";
+    if starting {
+        runtime.record_network_ban_target(&case.id, case.chat_id).await.map_err(|e| e.to_string())?;
+        case.status = "reversal_pending".to_string();
+        runtime.persist_case(&case).await.map_err(|e| e.to_string())?;
+    }
+    let removed = runtime.purge_training_by_case(&case.id).await.map_err(|e| e.to_string())?;
+    runtime.rebuild_model().await.map_err(|e| e.to_string())?;
+    let targets = runtime.list_network_ban_targets(&case.id).await.map_err(|e| e.to_string())?;
+    let mut errors = Vec::new();
+    let mut retained = 0;
+    for chat_id in targets {
+        if runtime.has_other_ban_in_chat(&case.id, chat_id, case.target_user_id).await.map_err(|e| e.to_string())? {
+            retained += 1;
+        } else if let Err(err) = bot.unban_chat_member(ChatId(chat_id), UserId(case.target_user_id as u64)).only_if_banned(true).await {
+            if unban_noop_reason(&err).is_none() {
+                errors.push(format!("群組 {chat_id}: {err}"));
+                continue;
+            }
         }
+        runtime.remove_network_ban_target(&case.id, chat_id).await.map_err(|e| e.to_string())?;
     }
-
-    let removed = runtime.purge_training_by_case(&case.id).await.unwrap_or(0);
-    if removed > 0 {
-        let _ = runtime.rebuild_model().await;
+    if !errors.is_empty() {
+        return Err(format!("案例 {} 撤銷尚未完成；已保留失敗項目，可重新執行解封或撤銷指令。{}", case.id, errors.join("；")));
     }
-
-    // If netban had propagated this ban elsewhere, undo it everywhere it
-    // actually landed - not just wherever's currently opted in, since that
-    // can have changed since the ban happened.
-    let network_targets = runtime.list_network_ban_targets(&case.id).await.unwrap_or_default();
-    for target_chat_id in &network_targets {
-        let _ = bot.unban_chat_member(ChatId(*target_chat_id), UserId(case.target_user_id as u64)).await;
-    }
-    if !network_targets.is_empty() {
-        let _ = runtime.clear_network_ban_targets(&case.id).await;
-    }
-
     case.action = ActionKind::Unbanned;
     case.status = "reversed".to_string();
     case.actor_user_id = Some(actor_id);
     case.actor_name = Some(actor_name.to_string());
-    store_case(runtime, &case).await.ok();
-    let log_message_id = log_action(bot, runtime, &case).await.unwrap_or_default();
-    case.log_message_id = Some(log_message_id);
-    store_case(runtime, &case).await.ok();
-    notify_group(bot, runtime, &case, log_message_id, "<b>已撤銷封禁</b>").await.ok();
+    runtime.persist_case(&case).await.map_err(|e| e.to_string())?;
+    if let Ok(id) = log_action(bot, runtime, &case).await {
+        case.log_message_id = Some(id);
+        runtime.persist_case(&case).await.map_err(|e| e.to_string())?;
+        let _ = notify_group(bot, runtime, &case, id, "<b>封禁案例已撤銷</b>").await;
+    }
     broadcast_unban_if_fully_clear(bot, runtime, case.target_user_id).await;
-
-    let network_note = if network_targets.is_empty() {
-        String::new()
-    } else {
-        format!("，並在 {} 個跨群組黑名單同步的群組中解封", network_targets.len())
-    };
-    Ok(format!("已解封用戶{noop_note}，並撤銷 case <code>{}</code>、移除 {removed} 筆對應訓練樣本{network_note}。", case.id))
+    Ok(format!("已撤銷 case <code>{}</code>、移除 {removed} 筆訓練樣本；{retained} 個群組因其他有效案件而保留限制。", case.id))
 }
 
 /// Reverses a mute case: restores full permissions in the case's chat and
@@ -5368,7 +5326,7 @@ fn netban_eligible(action: &ActionKind, model_score: Option<f64>, global_thresho
     }
     match action {
         ActionKind::ReportApproved | ActionKind::GuestBotBan | ActionKind::GuestInvokerBan => true,
-        ActionKind::AutoBan => model_score.is_some_and(|score| score >= global_threshold),
+        ActionKind::AutoBan => model_score.is_some_and(|score| passes_threshold(score, global_threshold)),
         _ => false,
     }
 }
@@ -5579,55 +5537,11 @@ async fn handle_permission_denied(bot: &Bot, runtime: &Runtime, message: &Messag
 }
 
 async fn train_spam(runtime: &Runtime, text: &str, case_id: Option<&str>) -> Result<()> {
-    let tokens = tokenize(text);
-    {
-        let mut model = runtime.model.lock().await;
-        model.spam_docs += 1;
-        for token in &tokens {
-            *model.spam_tokens.entry(token.clone()).or_default() += 1;
-        }
-    }
-    runtime
-        .with_conn(move |conn| {
-            let tx = conn.transaction()?;
-            for token in &tokens {
-                tx.execute(
-                    "INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES (?1, 1, 0) ON CONFLICT(word) DO UPDATE SET spam_count = spam_count + 1",
-                    params![token],
-                )?;
-            }
-            tx.commit()?;
-            Ok(())
-        })
-        .await?;
-    runtime.insert_training_sample("spam", text, case_id).await?;
-    runtime.persist_doc_counts().await
+    runtime.train_atomic("spam", text, case_id).await
 }
 
 async fn train_ham(runtime: &Runtime, text: &str, case_id: Option<&str>) -> Result<()> {
-    let tokens = tokenize(text);
-    {
-        let mut model = runtime.model.lock().await;
-        model.ham_docs += 1;
-        for token in &tokens {
-            *model.ham_tokens.entry(token.clone()).or_default() += 1;
-        }
-    }
-    runtime
-        .with_conn(move |conn| {
-            let tx = conn.transaction()?;
-            for token in &tokens {
-                tx.execute(
-                    "INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES (?1, 0, 1) ON CONFLICT(word) DO UPDATE SET ham_count = ham_count + 1",
-                    params![token],
-                )?;
-            }
-            tx.commit()?;
-            Ok(())
-        })
-        .await?;
-    runtime.insert_training_sample("ham", text, case_id).await?;
-    runtime.persist_doc_counts().await
+    runtime.train_atomic("ham", text, case_id).await
 }
 
 /// A `reply_to_message()` that's an actual reply the user made - not the
@@ -5742,8 +5656,7 @@ fn score_spam_from_text(model: &ModelState, text: &str) -> f64 {
         log_ham += ham_prob.ln();
     }
 
-    let odds = (log_spam - log_ham).exp();
-    odds / (1.0 + odds)
+    stable_probability(log_spam - log_ham)
 }
 
 fn score_debug_from_text(model: &ModelState, text: &str) -> ScoreDebugReport {
@@ -5773,8 +5686,7 @@ fn score_debug_from_text(model: &ModelState, text: &str) -> ScoreDebugReport {
         contributions.push(ScoreContribution { token, spam_count, ham_count, spam_prob, ham_prob, delta });
     }
 
-    let odds = (log_spam - log_ham).exp();
-    let score = odds / (1.0 + odds);
+    let score = stable_probability(log_spam - log_ham);
     ScoreDebugReport { score, tokens: contributions }
 }
 
@@ -8689,10 +8601,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     Err(err) => errors.push(err),
                 }
             }
-            let mut reply = format!("已解封用戶 <code>{target_user_id}</code>，撤銷 {reversed}/{total} 筆封禁案例並清除對應訓練樣本，同時移出跨群組黑名單。");
-            if !errors.is_empty() {
-                reply.push_str(&format!("\n部分失敗：{}", errors.join("；")));
-            }
+            let reply = if errors.is_empty() {
+                format!("已解封用戶 <code>{target_user_id}</code>，撤銷 {reversed}/{total} 筆封禁案例並清除對應訓練樣本，同時移出跨群組黑名單。")
+            } else {
+                format!("用戶 <code>{target_user_id}</code> 的撤銷尚未完成，已完成 {reversed}/{total} 筆案例。失敗項目已保留，請重試。\n{}", escape_html(&errors.join("；")))
+            };
             bot.send_message(message.chat.id, reply).parse_mode(ParseMode::Html).await?;
         }
         ModerationCommand::Unmute(arg) => {
@@ -8960,6 +8873,7 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
         return Ok(());
     }
 
+    let _review_guard = runtime.review_lock.lock().await;
     let case = match runtime.load_case(case_id).await {
         Ok(case) => case,
         Err(_) => {
@@ -8982,13 +8896,20 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
     // the ban changes here either way - the ban already happened in the
     // group. This decides only whether the text is allowed into the model.
     if kind == "train" {
+        match runtime.decide_training_review(&case.id, decision, from_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                bot.answer_callback_query(q.id).text("此訓練樣本已處理，未重複執行").await?;
+                return Ok(());
+            }
+            Err(err) => {
+                log_callback_error(&bot, &runtime, &case, "training_review", &err.to_string()).await;
+                bot.answer_callback_query(q.id).text("審核未完成，請檢查案例狀態或重試").await?;
+                return Ok(());
+            }
+        }
         let (note, toast) = match decision {
             "approve" => {
-                if let Err(err) = train_spam(&runtime, &case.evidence_text, Some(&case.id)).await {
-                    log_callback_error(&bot, &runtime, &case, "train_spam", &err.to_string()).await;
-                    bot.answer_callback_query(q.id).text("訓練失敗").await?;
-                    return Ok(());
-                }
                 // A reviewer approving a /sb is the second gate that promotes
                 // it from a local ban to the shared blacklist.
                 commit_network_ban(&bot, &runtime, &case).await;
@@ -9013,6 +8934,10 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
         return Ok(());
     }
 
+    if case.action != ActionKind::PendingReport || case.status != "pending_review" {
+        bot.answer_callback_query(q.id).text("此舉報已處理，未重複執行").await?;
+        return Ok(());
+    }
     match decision {
         "approve" => {
             if let Err(err) = ban_user(&bot, ChatId(case.chat_id), case.target_user_id).await {
@@ -9136,8 +9061,6 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
     }
     if let Ok(check) = runtime.check_group_modules(&bot, message.chat.id.0, user, None, message.text().or(message.caption())).await {
         if !check.reasons.is_empty() {
-            let _ = bot.delete_message(message.chat.id, message.id).await;
-            let _ = ban_user(&bot, message.chat.id, user.id.0 as i64).await;
             let case_id = Uuid::new_v4().to_string();
             let case = CaseRecord {
                 id: case_id,
@@ -9156,13 +9079,9 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
                 log_message_id: None,
                 created_at: Utc::now(),
             };
-            let log_message_id = log_action(&bot, &runtime, &case).await.unwrap_or_default();
-            let mut updated = case.clone();
-            updated.log_message_id = Some(log_message_id);
-            let _ = store_case(&runtime, &updated).await;
-            let _ = notify_group(&bot, &runtime, &updated, log_message_id, "<b>自動模組封禁</b>").await;
-            propagate_network_ban(&bot, &runtime, &updated).await;
-            broadcast_ban_status(&bot, &runtime, updated.target_user_id, true).await;
+            if let Err(err) = execute_auto_ban(&bot, &runtime, case, "<b>自動模組封禁</b>").await {
+                log::error!("auto-ban execution failed: {err}");
+            }
             return Ok(());
         }
     }
@@ -9174,7 +9093,8 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
     };
 
     let threshold = runtime.effective_threshold(Some(message.chat.id.0)).await.unwrap_or(runtime.config.spam_threshold);
-    if score < threshold {
+    if !passes_threshold(score, threshold) {
+        if !score.is_finite() { log::error!("invalid model score; auto-ban skipped"); }
         return Ok(());
     }
 
@@ -9184,7 +9104,7 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
     let is_bot_spam = bot_mentions_only(&text).is_some();
 
     let case_id = Uuid::new_v4().to_string();
-    let mut case = CaseRecord {
+    let case = CaseRecord {
         id: case_id,
         action: ActionKind::AutoBan,
         chat_id: message.chat.id.0,
@@ -9202,16 +9122,10 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
         created_at: Utc::now(),
     };
 
-    let _ = bot.delete_message(message.chat.id, message.id).await;
-    let _ = ban_user(&bot, message.chat.id, user.id.0 as i64).await;
-    let log_message_id = log_action(&bot, &runtime, &case).await.unwrap_or_default();
-    case.log_message_id = Some(log_message_id);
-    store_case(&runtime, &case).await.ok();
-    notify_group(&bot, &runtime, &case, log_message_id, "<b>自動機器學習封禁</b>").await.ok();
-    propagate_network_ban(&bot, &runtime, &case).await;
-    broadcast_ban_status(&bot, &runtime, case.target_user_id, true).await;
-    if is_bot_spam {
-        capture_bot_spam_rules(&bot, &runtime, message.chat.id.0, &text).await;
+    match execute_auto_ban(&bot, &runtime, case, "<b>自動機器學習封禁</b>").await {
+        Ok(true) if is_bot_spam => { capture_bot_spam_rules(&bot, &runtime, message.chat.id.0, &text).await; }
+        Ok(_) => {}
+        Err(err) => log::error!("auto-ban execution failed: {err}"),
     }
     Ok(())
 }
@@ -9722,6 +9636,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod reliability;
 
     /// Exercise the real command handler without contacting Telegram.
     struct TelegramStub {
@@ -9734,6 +9649,10 @@ mod tests {
 
     impl TelegramStub {
         fn new(admin_ids: Vec<i64>) -> Self {
+            Self::with_failures(admin_ids, Vec::new())
+        }
+
+        fn with_failures(admin_ids: Vec<i64>, failures: Vec<(String, i64)>) -> Self {
             use std::io::{BufRead, Read, Write};
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
@@ -9778,7 +9697,11 @@ mod tests {
                         }),
                         _ => serde_json::json!(true),
                     };
-                    let response = serde_json::json!({"ok": true, "result": result}).to_string();
+                    let response = if failures.iter().any(|(m, chat)| m == &method && args["chat_id"].as_i64() == Some(*chat)) {
+                        serde_json::json!({"ok": false, "error_code": 400, "description": "Bad Request: injected failure"})
+                    } else {
+                        serde_json::json!({"ok": true, "result": result})
+                    }.to_string();
                     write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
                 }
             });
@@ -11741,8 +11664,14 @@ mod tests {
         train_spam(&runtime, "重複垃圾訊息", None).await.unwrap();
         train_spam(&runtime, "重複垃圾訊息", None).await.unwrap();
         train_spam(&runtime, "獨特垃圾訊息", None).await.unwrap();
-        train_spam(&runtime, "", None).await.unwrap();
         train_ham(&runtime, "正常聊天內容", None).await.unwrap();
+        // New training refuses empty text; seed a historical row directly so
+        // this still exercises cleaning databases produced by older versions.
+        runtime.with_conn(|conn| {
+            conn.execute("INSERT INTO training_samples (label, text, created_at) VALUES ('spam', '', ?1)", params![Utc::now().to_rfc3339()])?;
+            conn.execute("UPDATE model_meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'spam_docs'", [])?;
+            Ok(())
+        }).await.unwrap();
 
         let (dup_removed, empty_removed) = runtime.dedupe_training_samples().await.unwrap();
         assert_eq!(dup_removed, 2, "3 copies of the same text should collapse to 1, removing 2");
