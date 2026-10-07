@@ -10,6 +10,7 @@
 mod reliability;
 mod origin_retry;
 mod moderation_queue;
+mod restriction_retry;
 use origin_retry::execute_auto_ban;
 use reliability::{passes_threshold, stable_probability};
 mod reversal_retry;
@@ -715,6 +716,9 @@ impl Runtime {
         if user_version < 24 {
             Self::migrate_v23_to_v24(conn)?;
         }
+        if user_version < 25 {
+            Self::migrate_v24_to_v25(conn)?;
+        }
         Ok(())
     }
 
@@ -1324,6 +1328,7 @@ impl Runtime {
     /// reversed its `action` is mutated to Unbanned/Unmuted (see the /unban
     /// and /unmute handlers), so it naturally drops out of this search and
     /// an older still-active case (if any) surfaces instead.
+    #[cfg(test)]
     async fn load_latest_case_by_actions(&self, chat_id: i64, target_user_id: i64, actions: &[&str]) -> Result<Option<CaseRecord>> {
         let actions: Vec<String> = actions.iter().map(|s| s.to_string()).collect();
         self.with_conn(move |conn| {
@@ -4197,6 +4202,12 @@ fn utc8_display(dt: DateTime<Utc>) -> String {
 
 fn chinese_case_action(case: &CaseRecord) -> String {
     match case.status.as_str() {
+        "action_pending" => return "操作待處理".to_string(),
+        "action_failed" => return "操作失敗，待重試".to_string(),
+        "action_cancelled" => return "操作已取消".to_string(),
+        "action_unconfirmed" => return "操作結果未確認".to_string(),
+        "kick_release_pending" => return "已移出，解封待處理".to_string(),
+        "locally_unmuted" => return "已在本群解除禁言".to_string(),
         "ban_pending" => return "封禁待確認".to_string(),
         "ban_failed" => return "封禁失敗".to_string(),
         "banned_delete_failed" => return "已封禁；刪除失敗".to_string(),
@@ -4955,22 +4966,8 @@ fn unban_noop_reason(err: &teloxide::RequestError) -> Option<&'static str> {
 /// Reverses a mute case: restores full permissions in the case's chat and
 /// marks the case `Unmuted`. Shared by `/unmute`'s maintainer path and the
 /// `/revert` dispatcher.
-async fn reverse_mute_case(bot: &Bot, runtime: &Runtime, mut case: CaseRecord, actor_id: i64, actor_name: &str) -> Result<String, String> {
-    if let Err(err) = bot.restrict_chat_member(ChatId(case.chat_id), UserId(case.target_user_id as u64), teloxide::types::ChatPermissions::all()).await {
-        return Err(format!("解除禁言失敗：{err}"));
-    }
-
-    case.action = ActionKind::Unmuted;
-    case.status = "reversed".to_string();
-    case.actor_user_id = Some(actor_id);
-    case.actor_name = Some(actor_name.to_string());
-    store_case(runtime, &case).await.ok();
-    let log_message_id = log_action(bot, runtime, &case).await.unwrap_or_default();
-    case.log_message_id = Some(log_message_id);
-    store_case(runtime, &case).await.ok();
-    notify_group(bot, runtime, &case, log_message_id, "<b>已解除禁言</b>").await.ok();
-
-    Ok(format!("已解除禁言，並撤銷 case <code>{}</code>。", case.id))
+async fn reverse_mute_case(bot: &Bot, runtime: &Runtime, case: CaseRecord, actor_id: i64, actor_name: &str) -> Result<String, String> {
+    restriction_retry::reverse(bot,runtime,case,actor_id,actor_name).await
 }
 
 /// Keeps PM's local ban-status cache (`bad_ids["users"]`) in sync so a
@@ -5136,19 +5133,6 @@ async fn reply_ephemeral(bot: &Bot, message: &Message, text: impl Into<String>) 
     Ok(())
 }
 
-/// Restores full permissions after `after` - a temporary mute that lifts
-/// itself, same shape as the CAPTCHA timeout task and `notify_group`'s
-/// auto-delete. Best-effort: doesn't check whether the user was already
-/// unmuted for some other reason in between, consistent with every other
-/// delayed task in this file.
-fn schedule_temp_unmute(bot: &Bot, chat_id: ChatId, user_id: i64, after: Duration) {
-    let bot = bot.clone();
-    tokio::spawn(async move {
-        sleep(after).await;
-        let _ = bot.restrict_chat_member(chat_id, UserId(user_id as u64), teloxide::types::ChatPermissions::all()).await;
-    });
-}
-
 /// Shared handler for every "only a group admin / maintainer can do this"
 /// rejection on a group-facing command. With CmdClean off, this is just
 /// `reply_ephemeral` - the rejection self-deletes but nothing else happens
@@ -5170,8 +5154,6 @@ async fn handle_permission_denied(bot: &Bot, runtime: &Runtime, message: &Messag
     let repeat_within_24h = prior.map(|t| Utc::now() - t < chrono::TimeDelta::hours(24)).unwrap_or(false);
 
     if repeat_within_24h {
-        let _ = mute_user_until(bot, message.chat.id, user_id, Utc::now() + chrono::TimeDelta::minutes(5)).await;
-        schedule_temp_unmute(bot, message.chat.id, user_id, Duration::from_secs(5 * 60));
         let case = CaseRecord {
             id: Uuid::new_v4().to_string(),
             action: ActionKind::CmdCleanMute,
@@ -5189,11 +5171,10 @@ async fn handle_permission_denied(bot: &Bot, runtime: &Runtime, message: &Messag
             log_message_id: None,
             created_at: Utc::now(),
         };
-        let log_message_id = log_action(bot, runtime, &case).await.unwrap_or_default();
-        let mut updated = case.clone();
-        updated.log_message_id = Some(log_message_id);
-        let _ = store_case(runtime, &updated).await;
-        let _ = notify_group(bot, runtime, &updated, log_message_id, "<b>指令權限濫用禁言</b>").await;
+        match runtime.queue_restriction(case,message.id.0,Some(Utc::now().timestamp()+300),"<b>指令權限濫用禁言</b>").await {
+            Ok(id)=>{if let Ok(Some(saved))=runtime.load_case(&id).await {let _=restriction_retry::attempt(bot,runtime,saved).await;}}
+            Err(err)=>log::warn!("could not queue command restriction: {err}"),
+        }
     } else {
         let _ = reply_ephemeral(bot, message, "⚠️ 你沒有權限使用此指令，訊息已刪除。24 小時內再次嘗試將被禁言 5 分鐘。").await;
     }
@@ -5478,7 +5459,6 @@ async fn check_flood_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Messag
         return Ok(false);
     }
 
-    let _ = mute_user(bot, message.chat.id, user_id).await;
     let case = CaseRecord {
         id: Uuid::new_v4().to_string(),
         action: ActionKind::FloodMute,
@@ -5496,11 +5476,10 @@ async fn check_flood_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Messag
         log_message_id: None,
         created_at: Utc::now(),
     };
-    let log_message_id = log_action(bot, runtime, &case).await.unwrap_or_default();
-    let mut updated = case.clone();
-    updated.log_message_id = Some(log_message_id);
-    let _ = store_case(runtime, &updated).await;
-    let _ = notify_group(bot, runtime, &updated, log_message_id, "<b>自動洗版偵測禁言</b>").await;
+    match runtime.queue_restriction(case,message.id.0,None,"<b>自動洗版偵測禁言</b>").await {
+        Ok(id)=>{if let Ok(Some(saved))=runtime.load_case(&id).await {let _=restriction_retry::attempt(bot,runtime,saved).await;}}
+        Err(err)=>log::warn!("could not queue flood restriction: {err}"),
+    }
     Ok(true)
 }
 
@@ -5992,7 +5971,7 @@ async fn handle_ban_mute_kick(bot: Bot, runtime: Arc<Runtime>, message: Message,
             };
 
             let case_id = Uuid::new_v4().to_string();
-            let mut case = CaseRecord {
+            let case = CaseRecord {
                 id: case_id.clone(),
                 action: action.clone(),
                 chat_id: message.chat.id.0,
@@ -6022,7 +6001,7 @@ async fn handle_ban_mute_kick(bot: Bot, runtime: Arc<Runtime>, message: Message,
                 match runtime.load_case(&id).await {
                     Ok(Some(saved)) => {
                         match origin_retry::attempt_origin_ban(&bot, &runtime, saved).await {
-                            Ok(false) => { reply_ephemeral(&bot, &message, format!("封禁尚未完成。案件：<code>{id}</code>，可用 /case 查詢進度。")).await?; }
+                            Ok(false) => { reply_ephemeral(&bot, &message, format!("封禁尚未完成。案件：{id}，可用 /case 查詢進度。")).await?; }
                             Ok(true) => {}
                             Err(err) => { log::warn!("manual ban {id}: {}", notices::diagnostic(&runtime.config, &err.to_string())); }
                         }
@@ -6036,34 +6015,19 @@ async fn handle_ban_mute_kick(bot: Bot, runtime: Arc<Runtime>, message: Message,
                 return Ok(());
             }
 
-            match action {
-                ActionKind::Mute => {
-                    mute_user(&bot, message.chat.id, target_id).await.ok();
+            match runtime.queue_restriction(case,message.id.0,None,"<b>已執行管理操作</b>").await {
+                Ok(id)=>{
+                    if let Ok(Some(saved))=runtime.load_case(&id).await {let _=restriction_retry::attempt(&bot,&runtime,saved).await;}
+                    if let Ok(Some(saved))=runtime.load_case(&id).await {
+                        if saved.status!="done" {reply_ephemeral(&bot,&message,format!("{}。案件：{id}",chinese_case_action(&saved))).await?;}
+                    }
                 }
-                ActionKind::Kick => {
-                    kick_user(&bot, message.chat.id, target_id).await.ok();
+                Err(err)=>{
+                    log::warn!("could not queue restriction: {err}");
+                    reply_ephemeral(&bot,&message,"無法保存操作，請稍後重試。").await?;
+                    return Ok(());
                 }
-                _ => {}
             }
-
-            let log_message_id = log_action(&bot, &runtime, &case).await.unwrap_or_default();
-            case.log_message_id = Some(log_message_id);
-            if let Err(err) = store_case(&runtime, &case).await {
-                log::error!("Failed to save moderation case {}: {err}", case.id);
-                reply_ephemeral(&bot, &message, "案例儲存失敗，未執行訓練或 netban 同步。").await?;
-                return Ok(());
-            }
-            notify_group(&bot, &runtime, &case, log_message_id, "<b>已執行管理操作</b>").await.ok();
-            // Reuses the case's own case_id as the revert handle - no new ID
-            // needed, /revert for a Case just calls the same
-            // reverse_ban_case/reverse_mute_case the case_id form of
-            // /unban and /unmute already use. A kick has nothing persistent
-            // to undo (it's just a ban immediately followed by an unban).
-            let (command_name, undo) = match action {
-                ActionKind::Mute => ("/mute", UndoData::Case { case_id: case_id.clone(), kind: CaseKind::Mute }),
-                _ => ("/kick", UndoData::NotRevertible),
-            };
-            log_maintainer_action(&bot, &runtime, from_id, &short_user(from), Some(message.chat.id.0), command_name, &format!("{} 對象={target_id}", chinese_case_action(&case)), undo).await;
 
             // Delete the command message to minimize group disruption
             let _ = bot.delete_message(message.chat.id, message.id).await;
@@ -8265,22 +8229,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     reply_ephemeral(&bot, &message, "請回覆要解除禁言的用戶，或提供 user_id。").await?;
                     return Ok(());
                 };
-                if let Err(err) = bot.restrict_chat_member(message.chat.id, UserId(target_user_id as u64), teloxide::types::ChatPermissions::all()).await {
-                    bot.send_message(message.chat.id, format!("解除禁言失敗：{err}")).await?;
-                    return Ok(());
-                }
-                let _ = bot
-                    .send_message(
-                        ChatId(runtime.config.log_channel_id),
-                        format!(
-                            "<b>群組管理員手動解除禁言</b>\n<b>群組</b>: <code>{}</code>\n<b>對象</b>: <code>{target_user_id}</code>\n<b>操作者</b>: {}",
-                            message.chat.id.0,
-                            escape_html(&short_user(from)),
-                        ),
-                    )
-                    .parse_mode(ParseMode::Html)
-                    .await;
-                bot.send_message(message.chat.id, format!("已在本群解除用戶 <code>{target_user_id}</code> 的禁言。")).parse_mode(ParseMode::Html).await?;
+                let result=restriction_retry::release_all(&bot,&runtime,message.chat.id.0,target_user_id,from_id,&short_user(from),message.id.0).await;
+                let text=result.unwrap_or_else(|err|{log::warn!("could not queue unmute: {err}");"無法保存解除禁言請求，請稍後重試。".into()});
+                bot.send_message(message.chat.id,text).await?;
                 return Ok(());
             }
 
@@ -8305,21 +8256,10 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 return Ok(());
             };
 
-            let case = match case_from_id {
-                Some(case) => Some(case),
-                None => runtime
-                    .load_latest_case_by_actions(chat_id, target_user_id, &["mute", "flood_mute"])
-                    .await
-                    .ok()
-                    .flatten(),
-            };
-
-            let Some(case) = case else {
-                if let Err(err) = bot.restrict_chat_member(ChatId(chat_id), UserId(target_user_id as u64), teloxide::types::ChatPermissions::all()).await {
-                    bot.send_message(message.chat.id, format!("解除禁言失敗：{err}")).await?;
-                    return Ok(());
-                }
-                bot.send_message(message.chat.id, format!("已在本群解除用戶 <code>{target_user_id}</code> 的禁言。（找不到本專案的禁言記錄）")).parse_mode(ParseMode::Html).await?;
+            let Some(case) = case_from_id else {
+                let result=restriction_retry::release_all(&bot,&runtime,chat_id,target_user_id,from_id,&short_user(from),message.id.0).await;
+                let text=result.unwrap_or_else(|err|{log::warn!("could not queue unmute: {err}");"無法保存解除禁言請求，請稍後重試。".into()});
+                bot.send_message(message.chat.id,text).await?;
                 return Ok(());
             };
 
@@ -9244,6 +9184,7 @@ mod tests {
     mod guest_delivery;
     mod model_updates;
     mod moderation_queue;
+    mod restriction_retry;
     mod captcha;
     mod edited_messages;
     mod notices;

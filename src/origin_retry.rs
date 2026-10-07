@@ -763,6 +763,9 @@ pub(super) fn spawn_origin_worker(bot: Bot, runtime: Arc<Runtime>) -> tokio::tas
             if let Err(err) = moderation_queue::deliver_review_updates(&bot, &runtime, None).await {
                 log::warn!("review notification queue: {err}");
             }
+            if let Err(err) = restriction_retry::retry(&bot, &runtime).await {
+                log::warn!("restriction queue: {err}");
+            }
             sleep(Duration::from_secs(5)).await;
         }
     })
