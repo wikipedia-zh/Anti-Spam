@@ -8,6 +8,12 @@
   Object.assign(words['zh-Hant'],{review:'審核',reviewConfirm:'確認審核決定',approve:'批准',reject:'拒絕',approveReport:'受理並封禁',rejectReport:'拒絕並標記正常',approveTraining:'訓練並加入聯防',rejectTraining:'拒絕訓練',reviewSaved:'審核決定已保存。請重新讀取查看執行進度。',saving:'正在保存請求…',reportApprove:'受理後會排程封禁來源群組；成功後訓練為垃圾訊息，並依聯防設定送至訂閱群組。',reportReject:'內容會標記為正常。非維護員的舉報者會增加一次被拒記錄，達到上限後暫停使用 /spam。',trainingApprove:'內容會訓練為垃圾訊息，並加入跨群黑名單。其他群組依聯防設定接收封禁。',trainingReject:'不訓練、不因這次審核加入聯防；原有的本群封禁保留。',reporter:'舉報者',strikes:'被拒次數',exempt:'此舉報者不計被拒次數。',missingCard:'未保存原審核訊息位置，舊訊息可能不會更新。請以此處的審核結果為準。',decided:'已保存的決定',reviewer:'審核人',confirmReview:'確認決定'});
   Object.assign(words['zh-Hans'],{review:'审核',reviewConfirm:'确认审核决定',approve:'批准',reject:'拒绝',approveReport:'受理并封禁',rejectReport:'拒绝并标记正常',approveTraining:'训练并加入联防',rejectTraining:'拒绝训练',reviewSaved:'审核决定已保存。请重新读取查看执行进度。',saving:'正在保存请求…',reportApprove:'受理后会安排封禁来源群组；成功后训练为垃圾消息，并按联防设置发送至订阅群组。',reportReject:'内容会标记为正常。非维护员的举报者会增加一次被拒记录，达到上限后暂停使用 /spam。',trainingApprove:'内容会训练为垃圾消息，并加入跨群黑名单。其他群组按联防设置接收封禁。',trainingReject:'不训练、不因本次审核加入联防；原有的本群封禁保留。',reporter:'举报者',strikes:'被拒次数',exempt:'此举报者不计被拒次数。',missingCard:'未保存原审核消息位置，旧消息可能不会更新。请以此处的审核结果为准。',decided:'已保存的决定',reviewer:'审核人',confirmReview:'确认决定'});
   Object.assign(words.en,{review:'Review',reviewConfirm:'Confirm review decision',approve:'Approve',reject:'Reject',approveReport:'Accept and ban',rejectReport:'Reject and mark as normal',approveTraining:'Train and share ban',rejectTraining:'Reject training',reviewSaved:'Decision saved. Refresh to check execution progress.',saving:'Saving request…',reportApprove:'Queues a ban in the source group. After it succeeds, the content trains the spam model and the ban is shared with subscribed groups.',reportReject:'Labels the content as normal. Reporters who are not maintainers receive one rejection strike; reaching the limit suspends /spam access.',trainingApprove:'Trains the content as spam and adds the user to the shared blacklist. Other groups receive bans according to their sharing settings.',trainingReject:'Does not train or add a shared ban through this review. The existing local ban remains.',reporter:'Reporter',strikes:'Rejection strikes',exempt:'This reporter is exempt from rejection strikes.',missingCard:'The original review message location was not saved, so the old message may not update. Use the decision shown here.',decided:'Saved decision',reviewer:'Reviewer',confirmReview:'Confirm decision'});
+  Object.assign(words['zh-Hant'],{checks:'當時的門檻',detection:'首次偵測',enforcement:'封禁前檢查',network:'聯防收錄檢查',passed:'分數達到門檻',below:'分數未達門檻',invalidThreshold:'門檻無效',checkNote:'首次偵測會保留原值；後續檢查顯示最近一次不同的判斷。這是分數比較結果，不代表封禁已完成。',netban:'目前列入聯防',yes:'是',no:'否'});
+  Object.assign(words['zh-Hans'],{checks:'当时的阈值',detection:'首次检测',enforcement:'封禁前检查',network:'联防收录检查',passed:'分数达到阈值',below:'分数未达阈值',invalidThreshold:'阈值无效',checkNote:'首次检测会保留原值；后续检查显示最近一次不同的判断。这是分数比较结果，不代表封禁已完成。',netban:'当前列入联防',yes:'是',no:'否'});
+  Object.assign(words.en,{checks:'Thresholds used',detection:'Initial detection',enforcement:'Check before banning',network:'Shared blacklist check',passed:'Score meets threshold',below:'Score below threshold',invalidThreshold:'Invalid threshold',checkNote:'Initial detection keeps its original value. Later checks show the most recent changed decision. These comparisons do not confirm that a ban succeeded.',netban:'Currently on shared blacklist',yes:'Yes',no:'No'});
+  words['zh-Hant'].missingDetection='首次偵測門檻未保存。';
+  words['zh-Hans'].missingDetection='首次检测阈值未保存。';
+  words.en.missingDetection='The initial detection threshold was not saved.';
   let dialog,context,lang='zh-Hant',data=null,busy=false,error='',confirming='',pending=null,conflict=false,saved=false,savedMessage='queued';
   const t=key=>words[lang][key]||key;
   const el=(tag,text,className)=>{const node=document.createElement(tag);if(text!==undefined)node.textContent=text;if(className)node.className=className;return node;};
@@ -25,7 +31,23 @@
       if(!confirming){
         const evidence=el('details');evidence.append(el('summary',t('evidence')),el('pre',c.evidence||t('unknown')));dialog.append(evidence);
         dialog.append(el('p',`${t('reason')}: ${c.reason||t('unknown')}`));
-        if(c.model_score!==null){dialog.append(el('p',`${t('score')}: ${c.model_score}`),el('p',t('threshold'),'host-note'));}
+        dialog.append(el('p',`${t('netban')}: ${t(c.netban_eligible?'yes':'no')}`));
+        if(c.model_score!==null){
+          dialog.append(el('p',`${t('score')}: ${c.model_score}`));
+          const checks=data.threshold_checks||[];
+          if(checks.length){
+            dialog.append(el('h3',t('checks')));
+            const history=el('article',undefined,'host-record');const values=el('dl');
+            for(const check of checks){
+              const value=el('dd',check.threshold===null?t('invalidThreshold'):`${check.threshold} · ${t(check.passed?'passed':'below')}`);
+              value.append(el('br'),el('span',new Date(check.checked_at).toLocaleString(lang),'host-meta'));
+              values.append(el('dt',t(check.phase)),value);
+            }
+            history.append(values);dialog.append(history);
+            if(!checks.some(check=>check.phase==='detection'))dialog.append(el('p',t('missingDetection'),'host-note'));
+            dialog.append(el('p',t('checkNote'),'host-note'));
+          }else dialog.append(el('p',t('threshold'),'host-note'));
+        }
       }
       const review=data.review;
       if(review?.kind&&confirming!=='reverse'){

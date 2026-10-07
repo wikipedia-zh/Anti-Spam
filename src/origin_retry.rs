@@ -113,21 +113,51 @@ impl Runtime {
     }
 
     pub(super) async fn queue_origin_bans(&self, cases: Vec<(CaseRecord, String)>) -> Result<()> {
+        self.queue_origin_bans_with_thresholds(
+            cases
+                .into_iter()
+                .map(|(case, header)| (case, header, None))
+                .collect(),
+        )
+        .await
+    }
+
+    pub(super) async fn queue_scored_ban(
+        &self,
+        case: CaseRecord,
+        header: String,
+        threshold: f64,
+    ) -> Result<()> {
         anyhow::ensure!(
-            cases.iter().all(|(case, _)| matches!(
+            case.action == ActionKind::AutoBan
+                && case
+                    .model_score
+                    .is_some_and(|score| passes_threshold(score, threshold)),
+            "invalid scored ban"
+        );
+        self.queue_origin_bans_with_thresholds(vec![(case, header, Some(threshold))])
+            .await
+    }
+
+    async fn queue_origin_bans_with_thresholds(
+        &self,
+        cases: Vec<(CaseRecord, String, Option<f64>)>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            cases.iter().all(|(case, _, _)| matches!(
                 case.action,
                 ActionKind::AutoBan | ActionKind::GuestBotBan | ActionKind::GuestInvokerBan
             )),
             "unsupported original ban action"
         );
-        let mut ids: Vec<_> = cases.iter().map(|(c, _)| c.id.clone()).collect();
+        let mut ids: Vec<_> = cases.iter().map(|(c, _, _)| c.id.clone()).collect();
         ids.sort();
         ids.dedup();
         let mut review_guards = Vec::new();
         for id in ids {
             review_guards.push(self.review_guard(&id).await);
         }
-        let mut users: Vec<_> = cases.iter().map(|(c, _)| c.target_user_id).collect();
+        let mut users: Vec<_> = cases.iter().map(|(c, _, _)| c.target_user_id).collect();
         users.sort();
         users.dedup();
         let mut user_guards = Vec::new();
@@ -139,8 +169,18 @@ impl Runtime {
             // caller is cancelled while SQLite is busy.
             let _guards = (review_guards, user_guards);
             let tx = conn.transaction()?;
-            for (case, header) in cases {
-                insert_origin_case(&tx, &case, &header)?;
+            for (case, header, threshold) in cases {
+                if insert_origin_case(&tx, &case, &header)? {
+                    if let Some(value) = threshold {
+                        case_thresholds::record(
+                            &tx,
+                            &case.id,
+                            "detection",
+                            value,
+                            case.model_score.context("missing model score")?,
+                        )?;
+                    }
+                }
             }
             tx.commit()?;
             Ok(())
@@ -207,6 +247,15 @@ impl Runtime {
                 tx.execute("UPDATE cases SET status=?2,log_message_id=?3 WHERE id=?1 AND action IN ('auto_ban','guest_bot_ban','guest_invoker_ban','spam_ban','report_approved')
                     AND status NOT IN ('reversed','reversal_pending')",
                     params![job.case.id,job.case.status,job.case.log_message_id])?;
+                if job.banned && job.trained && job.case.action == ActionKind::AutoBan
+                    && job.case.matched_rule_pattern.as_deref() != Some("BOTSPAM") {
+                    if let Some(score) = job.case.model_score {
+                        let shared: bool = tx.query_row("SELECT netban_eligible FROM cases WHERE id=?1", [&job.case.id], |r| r.get(0))?;
+                        if !shared {
+                            case_thresholds::record(&tx, &job.case.id, "network", threshold, score)?;
+                        }
+                    }
+                }
                 if job.banned && job.trained && (matches!(job.training_mode.as_str(),"direct"|"report")
                     || netban_eligible(&job.case.action,job.case.model_score,threshold,job.case.matched_rule_pattern.as_deref())) {
                     network_delivery::enqueue_network_ban(&tx,&job.case.id,test_group)?;
@@ -296,7 +345,11 @@ async fn record_error(
     Ok(false)
 }
 
-async fn policy_still_enabled(runtime: &Runtime, case: &CaseRecord) -> Result<bool> {
+async fn policy_still_enabled(
+    runtime: &Runtime,
+    case: &CaseRecord,
+    guards: Arc<ActionGuards>,
+) -> Result<bool> {
     if case.matched_rule_pattern.as_deref() == Some("WARN") {
         return warning_queue::eligible(runtime, case).await;
     }
@@ -316,10 +369,15 @@ async fn policy_still_enabled(runtime: &Runtime, case: &CaseRecord) -> Result<bo
         return Ok(true);
     };
     if let Some(score) = case.model_score {
-        return Ok(passes_threshold(
-            score,
-            runtime.effective_threshold(Some(case.chat_id)).await?,
-        ));
+        let threshold = runtime.effective_threshold(Some(case.chat_id)).await?;
+        let id = case.id.clone();
+        runtime
+            .with_conn(move |conn| {
+                let _guards = guards;
+                case_thresholds::record(conn, &id, "enforcement", threshold, score)
+            })
+            .await?;
+        return Ok(passes_threshold(score, threshold));
     }
     let settings = runtime.get_group_modules(case.chat_id).await?;
     let rules = runtime.spam_rules.read().await;
@@ -453,7 +511,7 @@ pub(super) async fn attempt_origin_ban(
                 return Ok(false);
             }
         }
-        let exempt = !policy_still_enabled(runtime, &job.case).await?
+        let exempt = !policy_still_enabled(runtime, &job.case, guards.clone()).await?
             || runtime.is_maintainer(job.case.target_user_id).await
             || is_platform_pseudo_user(job.case.target_user_id)
             || runtime.is_group_banned(job.case.chat_id).await
@@ -662,7 +720,14 @@ pub(super) async fn attempt_origin_ban(
         if job.training_mode == "review"
             && job.case.matched_rule_pattern.as_deref() != Some("BOTSPAM")
         {
-            if let Err(err) = api(queue_training_review(bot, runtime, &job.case, guards.clone())).await {
+            if let Err(err) = api(queue_training_review(
+                bot,
+                runtime,
+                &job.case,
+                guards.clone(),
+            ))
+            .await
+            {
                 record_error(runtime, &mut job, "training_review", &err).await?;
                 runtime.save_origin_job(&job, "pending", guards).await?;
                 return Ok(true);
@@ -727,6 +792,21 @@ pub(super) async fn execute_auto_ban(
         .await?;
     let banned = attempt_origin_ban(bot, runtime, case.clone()).await?;
     // The per-user action lock must be released before draining network jobs.
+    deliver_network_bans(bot, runtime, Some(&case.id)).await?;
+    Ok(banned)
+}
+
+pub(super) async fn execute_scored_ban(
+    bot: &Bot,
+    runtime: &Runtime,
+    case: CaseRecord,
+    header: &str,
+    threshold: f64,
+) -> Result<bool> {
+    runtime
+        .queue_scored_ban(case.clone(), header.to_string(), threshold)
+        .await?;
+    let banned = attempt_origin_ban(bot, runtime, case.clone()).await?;
     deliver_network_bans(bot, runtime, Some(&case.id)).await?;
     Ok(banned)
 }

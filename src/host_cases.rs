@@ -173,9 +173,11 @@ fn details(conn: &Connection, case: &CaseRecord, offset: u32) -> Result<Value> {
     )?;
     let mut hash = Sha256::new();
     let review = review_state(conn, case, samples, eligible)?;
+    let thresholds = case_thresholds::load(conn, &case.id)?;
     hash.update(serde_json::to_vec(case)?);
     hash.update(serde_json::to_vec(&(samples, eligible))?);
     hash.update(serde_json::to_vec(&review)?);
+    hash.update(serde_json::to_vec(&thresholds)?);
     // Stream the complete impact through the hash while returning only one page.
     let mut stmt = conn.prepare("WITH chats AS (
         SELECT ?2 AS chat_id UNION SELECT chat_id FROM network_ban_targets WHERE case_id=?1
@@ -241,7 +243,7 @@ fn details(conn: &Connection, case: &CaseRecord, offset: u32) -> Result<Value> {
         "evidence":case.evidence_text,"reason":case.matched_rule_pattern,"model_score":case.model_score,
         "netban_eligible":eligible,"created_at":case.created_at},
         "revision":format!("{:x}",hash.finalize()),"can_reverse":can_reverse,
-        "review":review,
+        "review":review,"threshold_checks":thresholds,
         "training_samples":samples,"unban_count":unban,"retained_count":retain,"cancel_count":cancel,
         "targets":targets,"total":total,"offset":offset,"has_more":u64::from(offset)+25<u64::from(total)}),
     )

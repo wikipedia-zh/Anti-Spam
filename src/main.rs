@@ -20,6 +20,7 @@ mod rule_notices;
 mod host_panel;
 mod host_cases;
 mod review_decisions;
+mod case_thresholds;
 mod role_updates;
 use origin_retry::execute_auto_ban;
 use reliability::{passes_threshold, stable_probability};
@@ -749,6 +750,9 @@ impl Runtime {
         }
         if user_version < 32 {
             Self::migrate_v31_to_v32(conn)?;
+        }
+        if user_version < 33 {
+            Self::migrate_v32_to_v33(conn)?;
         }
         Ok(())
     }
@@ -8358,7 +8362,7 @@ async fn auto_moderate(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Res
         created_at: Utc::now(),
     };
 
-    match execute_auto_ban(&bot, &runtime, case, "<b>自動機器學習封禁</b>").await {
+    match origin_retry::execute_scored_ban(&bot, &runtime, case, "<b>自動機器學習封禁</b>", threshold).await {
         Ok(_) => {}
         Err(err) => log::error!("auto-ban execution failed: {err}"),
     }
@@ -8948,6 +8952,7 @@ mod tests {
     mod role_updates;
     mod host_cases;
     mod host_review;
+    mod case_thresholds;
     mod captcha;
     mod edited_messages;
     mod notices;
