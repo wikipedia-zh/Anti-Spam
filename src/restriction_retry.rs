@@ -21,6 +21,54 @@ struct Guards {
     _user: tokio::sync::OwnedMutexGuard<()>,
 }
 
+pub(super) fn insert_restriction(
+    tx: &rusqlite::Transaction<'_>,
+    case: &CaseRecord,
+    message_id: i32,
+    until: Option<i64>,
+    header: String,
+) -> Result<()> {
+    tx.execute("INSERT INTO cases(id,action,chat_id,target_user_id,target_name,actor_user_id,actor_name,source_message_id,evidence_text,model_score,matched_rule_id,matched_rule_pattern,status,log_message_id,created_at)
+                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'action_pending',NULL,?13)",
+                params![case.id,case.action.as_str(),case.chat_id,case.target_user_id,case.target_name,case.actor_user_id,case.actor_name,
+                    case.source_message_id,case.evidence_text,case.model_score,case.matched_rule_id,case.matched_rule_pattern,case.created_at.to_rfc3339()])?;
+    let mut job = Job {
+        step: "apply".into(),
+        until,
+        kick_until: None,
+        uncertain: false,
+        header,
+        audit_id: None,
+        audit_sent: false,
+        notice_sent: false,
+        release_mode: "known".into(),
+        release_fingerprint: None,
+    };
+    if let Some(actor) = case.actor_user_id {
+        let undo = if case.action == ActionKind::Kick {
+            UndoData::NotRevertible
+        } else {
+            UndoData::Case {
+                case_id: case.id.clone(),
+                kind: CaseKind::Mute,
+            }
+        };
+        tx.execute("INSERT INTO maintainer_actions(actor_id,actor_name,chat_id,command,summary,undo_data,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    params![actor,case.actor_name,case.chat_id,if case.matched_rule_pattern.as_deref()==Some("WARN") {"WARN"} else if case.action==ActionKind::Kick {"/kick"} else {"/mute"},
+                    format!("管理請求 對象={}",case.target_user_id),serde_json::to_string(&undo)?,Utc::now().to_rfc3339()])?;
+        job.audit_id = Some(tx.last_insert_rowid());
+    }
+    tx.execute(
+        "INSERT INTO restriction_jobs(case_id,payload) VALUES (?1,?2)",
+        params![case.id, serde_json::to_string(&job)?],
+    )?;
+    tx.execute(
+        "INSERT INTO moderation_requests(chat_id,message_id,case_id) VALUES (?1,?2,?3)",
+        params![case.chat_id, message_id, case.id],
+    )?;
+    Ok(())
+}
+
 impl Runtime {
     pub(super) fn migrate_v24_to_v25(conn: &mut Connection) -> Result<()> {
         conn.execute_batch(
@@ -64,27 +112,23 @@ impl Runtime {
         let guards = self.restriction_guards(&case).await;
         let header = header.to_string();
         self.with_conn(move |conn| {
-            let _guards=guards;
-            let tx=conn.transaction()?;
-            if let Some(id)=tx.query_row("SELECT case_id FROM moderation_requests WHERE chat_id=?1 AND message_id=?2",
-                params![case.chat_id,message_id],|r|r.get::<_,String>(0)).optional()? {return Ok(id);}
-            tx.execute("INSERT INTO cases(id,action,chat_id,target_user_id,target_name,actor_user_id,actor_name,source_message_id,evidence_text,model_score,matched_rule_id,matched_rule_pattern,status,log_message_id,created_at)
-                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'action_pending',NULL,?13)",
-                params![case.id,case.action.as_str(),case.chat_id,case.target_user_id,case.target_name,case.actor_user_id,case.actor_name,
-                    case.source_message_id,case.evidence_text,case.model_score,case.matched_rule_id,case.matched_rule_pattern,case.created_at.to_rfc3339()])?;
-            let mut job=Job {step:"apply".into(),until,kick_until:None,uncertain:false,header,audit_id:None,audit_sent:false,notice_sent:false,release_mode:"known".into(),release_fingerprint:None};
-            if let Some(actor)=case.actor_user_id {
-                let undo=if case.action==ActionKind::Kick {UndoData::NotRevertible} else {UndoData::Case{case_id:case.id.clone(),kind:CaseKind::Mute}};
-                tx.execute("INSERT INTO maintainer_actions(actor_id,actor_name,chat_id,command,summary,undo_data,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                    params![actor,case.actor_name,case.chat_id,if case.action==ActionKind::Kick {"/kick"} else {"/mute"},
-                    format!("管理請求 對象={}",case.target_user_id),serde_json::to_string(&undo)?,Utc::now().to_rfc3339()])?;
-                job.audit_id=Some(tx.last_insert_rowid());
+            let _guards = guards;
+            let tx = conn.transaction()?;
+            if let Some(id) = tx
+                .query_row(
+                    "SELECT case_id FROM moderation_requests WHERE chat_id=?1 AND message_id=?2",
+                    params![case.chat_id, message_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                return Ok(id);
             }
-            tx.execute("INSERT INTO restriction_jobs(case_id,payload) VALUES (?1,?2)",params![case.id,serde_json::to_string(&job)?])?;
-            tx.execute("INSERT INTO moderation_requests(chat_id,message_id,case_id) VALUES (?1,?2,?3)",params![case.chat_id,message_id,case.id])?;
+            insert_restriction(&tx, &case, message_id, until, header)?;
             tx.commit()?;
             Ok(case.id)
-        }).await
+        })
+        .await
     }
 
     async fn save_restriction(
@@ -178,6 +222,9 @@ async fn run(
                 .await?
                 .kind
                 .is_privileged();
+            }
+            if case.matched_rule_pattern.as_deref() == Some("WARN") {
+                allowed &= warning_queue::eligible(runtime, case).await?;
             }
             if case.action == ActionKind::FloodMute {
                 allowed &= runtime.get_group_modules(case.chat_id).await?.flood_control

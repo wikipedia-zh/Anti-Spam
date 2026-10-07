@@ -14,6 +14,7 @@ mod restriction_retry;
 mod queue_status;
 mod report_delivery;
 mod maintenance;
+mod warning_queue;
 use origin_retry::execute_auto_ban;
 use reliability::{passes_threshold, stable_probability};
 mod reversal_retry;
@@ -418,7 +419,7 @@ impl Default for GroupModuleSettings {
 /// because the warn system isn't a module: every group has it, with no
 /// on/off switch, only these knobs. `action` is "mute" | "kick" | "ban";
 /// `action_duration_secs` only applies to "mute" (`None` = permanent).
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct WarnSettings {
     threshold: i64,
     action: String,
@@ -727,6 +728,9 @@ impl Runtime {
         }
         if user_version < 27 {
             Self::migrate_v26_to_v27(conn)?;
+        }
+        if user_version < 28 {
+            Self::migrate_v27_to_v28(conn)?;
         }
         Ok(())
     }
@@ -3017,6 +3021,7 @@ impl Runtime {
     /// keeps one row per warning - `/warn`'s reason has to survive somewhere,
     /// and `/unwarn <n>` needs individual rows to drop the N most recent
     /// from. Warns never expire, so there's deliberately no cleanup here.
+    #[cfg(test)]
     async fn add_warn(&self, chat_id: i64, user_id: i64, reason: Option<&str>, warned_by: i64) -> Result<i64> {
         let reason = reason.map(|s| s.to_string());
         self.with_conn(move |conn| {
@@ -3042,6 +3047,7 @@ impl Runtime {
     /// rather than `DELETE ... ORDER BY ... LIMIT`, since the latter needs a
     /// SQLite build flag this project doesn't assume. Returns how many were
     /// actually removed (fewer than `n` if the user had fewer warns).
+    #[cfg(test)]
     async fn remove_warns(&self, chat_id: i64, user_id: i64, n: i64) -> Result<i64> {
         self.with_conn(move |conn| {
             let removed = conn.execute(
@@ -4833,58 +4839,6 @@ async fn alert_project_ban_bypass_attempt(bot: &Bot, runtime: &Runtime, actor_id
     let _ = bot.send_message(ChatId(dest), text).parse_mode(ParseMode::Html).await;
 }
 
-/// Applies a group's configured warn-threshold action (mute/kick/ban) once
-/// `/warn` (or `/ot`) pushes someone's count to `settings.threshold`, and
-/// records it as a real `CaseRecord` tagged "WARN" - unlike `/pol`'s
-/// deliberately uncased escalation, the generic warn system is a public,
-/// every-group feature and its consequences should show up in `/case` and
-/// the moderation log like anything else an admin does. Does nothing (no
-/// case, no log) if the underlying Telegram action itself fails.
-async fn apply_warn_threshold_action(bot: &Bot, runtime: &Runtime, chat_id: ChatId, target_id: i64, target_name: &str, settings: &WarnSettings, warn_count: i64) {
-    let action_kind = match settings.action.as_str() {
-        "kick" => ActionKind::Kick,
-        "ban" => ActionKind::SpamBan,
-        _ => ActionKind::Mute,
-    };
-    let result = match action_kind {
-        ActionKind::Kick => kick_user(bot, chat_id, target_id).await,
-        ActionKind::SpamBan => ban_user(bot, chat_id, target_id).await,
-        _ => match settings.action_duration_secs {
-            Some(secs) if secs > 0 => mute_user_until(bot, chat_id, target_id, Utc::now() + chrono::TimeDelta::seconds(secs)).await,
-            _ => mute_user(bot, chat_id, target_id).await,
-        },
-    };
-    if result.is_err() {
-        return;
-    }
-
-    let case = CaseRecord {
-        id: Uuid::new_v4().to_string(),
-        action: action_kind.clone(),
-        chat_id: chat_id.0,
-        target_user_id: target_id,
-        target_name: target_name.to_string(),
-        actor_user_id: None,
-        actor_name: None,
-        source_message_id: None,
-        evidence_text: format!("累計警告達 {warn_count} 次（門檻 {}）", settings.threshold),
-        model_score: None,
-        matched_rule_id: None,
-        matched_rule_pattern: Some("WARN".to_string()),
-        status: "done".to_string(),
-        log_message_id: None,
-        created_at: Utc::now(),
-    };
-    let log_message_id = log_action(bot, runtime, &case).await.unwrap_or_default();
-    let mut updated = case.clone();
-    updated.log_message_id = Some(log_message_id);
-    let _ = store_case(runtime, &updated).await;
-    let _ = notify_group(bot, runtime, &updated, log_message_id, "<b>警告達門檻，已自動處置</b>").await;
-    if action_kind == ActionKind::SpamBan {
-        broadcast_ban_status(bot, runtime, target_id, true).await;
-    }
-}
-
 /// Same shape as `notify_netban_sync`, but for check_reban_and_act's
 /// same-chat case - worth flagging to admins since a ban that let its
 /// target back in once might do so again, unlike a routine netban sync.
@@ -5090,33 +5044,6 @@ async fn commit_network_ban(bot: &Bot, runtime: &Runtime, case: &CaseRecord) {
 
 async fn ban_user(bot: &Bot, chat_id: ChatId, user_id: i64) -> Result<()> {
     bot.ban_chat_member(chat_id, UserId(user_id as u64)).await?;
-    Ok(())
-}
-
-async fn mute_user(bot: &Bot, chat_id: ChatId, user_id: i64) -> Result<()> {
-    let permissions = teloxide::types::ChatPermissions::empty();
-    bot.restrict_chat_member(chat_id, UserId(user_id as u64), permissions).await?;
-    Ok(())
-}
-
-/// Like `mute_user`, but sets Telegram's own `until_date` so the restriction
-/// expires on Telegram's side regardless of whether this process is still
-/// running - unlike relying purely on a `tokio::spawn` timer (see
-/// `schedule_temp_unmute`), which silently never fires if the bot restarts
-/// during the window, leaving the mute permanent. Telegram treats anything
-/// under 30 seconds from now as "forever", so this only makes sense for
-/// durations meaningfully longer than that.
-async fn mute_user_until(bot: &Bot, chat_id: ChatId, user_id: i64, until: DateTime<Utc>) -> Result<()> {
-    let permissions = teloxide::types::ChatPermissions::empty();
-    bot.restrict_chat_member(chat_id, UserId(user_id as u64), permissions)
-        .until_date(until)
-        .await?;
-    Ok(())
-}
-
-async fn kick_user(bot: &Bot, chat_id: ChatId, user_id: i64) -> Result<()> {
-    bot.ban_chat_member(chat_id, UserId(user_id as u64)).await?;
-    bot.unban_chat_member(chat_id, UserId(user_id as u64)).await?;
     Ok(())
 }
 
@@ -6993,20 +6920,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 reply_ephemeral(&bot, &message, "不能對群組管理員或項目維護人員執行此指令。").await?;
                 return Ok(());
             }
-            let chat_id = message.chat.id.0;
-            let reason = reason.as_str();
-            let reason_opt = if reason.is_empty() { None } else { Some(reason) };
-            let count = runtime.add_warn(chat_id, target_id, reason_opt, from_id).await.unwrap_or(1);
-            let settings = runtime.get_warn_settings(chat_id).await.unwrap_or_default();
-
-            let reason_line = reason_opt.map(|r| format!("\n原因：{}", escape_html(r))).unwrap_or_default();
-            let text = format!("{} 已被警告，目前累計 {count} 次（門檻 {}）。{reason_line}", mention_link(target_id, &target_name), settings.threshold);
-            bot.send_message(message.chat.id, text).parse_mode(ParseMode::Html).await?;
-
-            if count >= settings.threshold {
-                apply_warn_threshold_action(&bot, &runtime, message.chat.id, target_id, &target_name, &settings, count).await;
-            }
-            let _ = bot.delete_message(message.chat.id, message.id).await;
+            warning_queue::handle(&bot, &runtime, &message, target_id, target_name, reason, None).await?;
         }
         ModerationCommand::Unwarn(arg) => {
             // Reply targets the message's author and the whole arg is the
@@ -7029,8 +6943,14 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             }
             let n = count_arg.trim().parse::<i64>().unwrap_or(1).max(1);
             let chat_id = message.chat.id.0;
-            let removed = runtime.remove_warns(chat_id, target_id, n).await.unwrap_or(0);
-            let remaining = runtime.warn_count(chat_id, target_id).await.unwrap_or(0);
+            let (removed, remaining) = match runtime.remove_warning_request(chat_id, target_id, n, message.id.0).await {
+                Ok(result) => result,
+                Err(error) => {
+                    log::error!("remove warning: {}", notices::diagnostic(&runtime.config, &error.to_string()));
+                    reply_ephemeral(&bot, &message, "未能移除警告，請稍後重試。").await?;
+                    return Ok(());
+                }
+            };
             bot.send_message(message.chat.id, format!("已移除 {} 的 {removed} 次警告，剩餘 {remaining} 次。", mention_link(target_id, &target_name))).parse_mode(ParseMode::Html).await?;
             let _ = bot.delete_message(message.chat.id, message.id).await;
         }
@@ -7107,7 +7027,10 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 return Ok(());
             }
             let duration_secs = if action == "mute" { parts.get(2).and_then(|raw| parse_duration_zh(raw)) } else { None };
-            runtime.set_warn_config(chat_id, threshold, &action, duration_secs).await.ok();
+            if runtime.set_warn_config(chat_id, threshold, &action, duration_secs).await.is_err() {
+                reply_ephemeral(&bot, &message, "未能儲存警告設定，請稍後重試。").await?;
+                return Ok(());
+            }
             log_maintainer_action(
                 &bot,
                 &runtime,
@@ -7134,41 +7057,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 reply_ephemeral(&bot, &message, "不能對群組管理員或項目維護人員執行此指令。").await?;
                 return Ok(());
             }
-            let chat_id = message.chat.id.0;
-            let settings = runtime.get_warn_settings(chat_id).await.unwrap_or_default();
-            let _ = bot.delete_message(message.chat.id, MessageId(source_id)).await;
-
-            let mut count = runtime.warn_count(chat_id, target_id).await.unwrap_or(0);
-            for _ in 0..settings.ot_warn_count.max(1) {
-                count = runtime.add_warn(chat_id, target_id, Some("離題（/ot）"), from_id).await.unwrap_or(count + 1);
-            }
-
-            let template = settings.ot_template.clone().unwrap_or_else(default_ot_template);
-            let text = template.replace("{user}", &mention_link(target_id, &target_name)).replace("{count}", &count.to_string());
-            let (text, buttons) = extract_template_buttons(&text);
-            let mut req = bot.send_message(message.chat.id, text).parse_mode(ParseMode::Html);
-            if let Some(markup) = buttons {
-                req = req.reply_markup(markup);
-            }
-            if let Ok(sent) = req.await {
-                let bot2 = bot.clone();
-                let notice_chat = message.chat.id;
-                let sent_id = sent.id;
-                tokio::spawn(async move {
-                    // Kept much longer than the bot's other transient notices
-                    // (those are 180s) - this one names the offending user
-                    // and their warning count, so it's worth leaving visible
-                    // for the group to actually see rather than cleaning it
-                    // up almost immediately.
-                    sleep(Duration::from_secs(24 * 60 * 60)).await;
-                    let _ = bot2.delete_message(notice_chat, sent_id).await;
-                });
-            }
-
-            if count >= settings.threshold {
-                apply_warn_threshold_action(&bot, &runtime, message.chat.id, target_id, &target_name, &settings, count).await;
-            }
-            let _ = bot.delete_message(message.chat.id, message.id).await;
+            warning_queue::handle(&bot, &runtime, &message, target_id, target_name, "離題（/ot）".into(), Some(source_id)).await?;
         }
         ModerationCommand::OtWarns(arg) => {
             if !message.chat.is_group() && !message.chat.is_supergroup() {
@@ -7189,7 +7078,10 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 reply_ephemeral(&bot, &message, "數字至少為 1。").await?;
                 return Ok(());
             }
-            runtime.set_ot_warn_count(chat_id, n).await.ok();
+            if runtime.set_ot_warn_count(chat_id, n).await.is_err() {
+                reply_ephemeral(&bot, &message, "未能儲存警告設定，請稍後重試。").await?;
+                return Ok(());
+            }
             bot.send_message(message.chat.id, format!("已設定 /ot 每次加 {n} 次警告。")).await?;
         }
         ModerationCommand::OtTemplate(text_arg) => {
@@ -9141,6 +9033,7 @@ mod tests {
     mod queue_status;
     mod report_delivery;
     mod maintenance;
+    mod warning_queue;
     mod captcha;
     mod edited_messages;
     mod notices;

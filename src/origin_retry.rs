@@ -297,6 +297,9 @@ async fn record_error(
 }
 
 async fn policy_still_enabled(runtime: &Runtime, case: &CaseRecord) -> Result<bool> {
+    if case.matched_rule_pattern.as_deref() == Some("WARN") {
+        return warning_queue::eligible(runtime, case).await;
+    }
     if matches!(
         case.action,
         ActionKind::SpamBan | ActionKind::ReportApproved
@@ -422,7 +425,9 @@ pub(super) async fn attempt_origin_ban(
         );
         if manual {
             let actor = job.case.actor_user_id.context("missing approving actor")?;
-            let allowed = if job.training_mode == "review" {
+            let allowed = if job.training_mode == "review"
+                || job.case.matched_rule_pattern.as_deref() == Some("WARN")
+            {
                 match api(async {
                     bot.get_chat_member(ChatId(job.case.chat_id), UserId(actor as u64))
                         .await
@@ -759,6 +764,9 @@ pub(super) fn spawn_origin_worker(bot: Bot, runtime: Arc<Runtime>) -> tokio::tas
         loop {
             if let Err(err) = retry_origin_bans(&bot, &runtime).await {
                 log::warn!("original ban queue: {err}");
+            }
+            if let Err(err) = warning_queue::retry(&bot, &runtime).await {
+                log::warn!("warning queue: {err}");
             }
             if let Err(err) = report_delivery::retry(&bot, &runtime).await {
                 log::warn!("report delivery queue: {err}");
