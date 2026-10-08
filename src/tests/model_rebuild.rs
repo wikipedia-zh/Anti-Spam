@@ -329,7 +329,7 @@ async fn rebuild_limits_do_not_write_and_migration_keeps_existing_data() {
     .unwrap();
     let result = serde_json::to_value(result).unwrap();
     assert_eq!(result["schema_before"], 34);
-    assert_eq!(result["schema_after"], 39);
+    assert_eq!(result["schema_after"], 40);
     assert_eq!(result["restore"], "ok");
     assert!(serde_json::from_value::<Patch>(
         json!({"request_id":"x","expected_revision":"y","actor_id":HOST_ID})

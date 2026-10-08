@@ -1374,3 +1374,27 @@ async fn departure_api_requires_host_scope_and_saves_once_without_calling_telegr
     assert!(!api.runtime.is_group_banned(-100).await);
     assert_eq!(api.telegram.requests.lock().unwrap().iter().filter(|(m,_)|m=="leavechat").count(),0);
 }
+
+#[tokio::test]
+async fn retry_api_is_host_only_and_never_calls_telegram_directly() {
+    let api=TestApi::new().await;let group=api.login(HOST_ID,-100).await;
+    let route="/api/host/queue/item";
+    for method in [reqwest::Method::POST,reqwest::Method::PATCH] {
+        assert_eq!(api.request(method.clone(),route).json(&serde_json::json!({})).send().await.unwrap().status(),401);
+        assert_eq!(api.request(method,route).bearer_auth(&group).json(&serde_json::json!({})).send().await.unwrap().status(),403);
+    }
+    assert_eq!(api.request(reqwest::Method::POST,"/api/host/query").bearer_auth(group).json(&serde_json::json!({"view":"maintenance"})).send().await.unwrap().status(),403);
+    let link=api.service.host_link(HOST_ID).await.unwrap();let launch=link.query_pairs().find(|(k,_)|k=="startapp").unwrap().1.into_owned();
+    let session:serde_json::Value=api.login_raw(&signed(&api.runtime.config.bot_token,HOST_ID,&launch,Utc::now().timestamp())).await.json().await.unwrap();let token=session["token"].as_str().unwrap();
+    let case=dummy_case(ActionKind::AutoBan,-100,200,Utc::now());api.runtime.persist_case(&case).await.unwrap();api.runtime.set_group_module(-300,"netban",true).await.unwrap();api.runtime.enqueue_network_deliveries(&case.id).await.unwrap();
+    api.runtime.with_conn(|c|{c.execute("UPDATE network_deliveries SET last_error='failure',next_attempt_at=?1",[Utc::now().timestamp()+3600])?;Ok(())}).await.unwrap();
+    let target=serde_json::json!({"kind":"network","case_id":case.id,"chat_id":-300});
+    let snapshot:serde_json::Value=api.request(reqwest::Method::POST,route).bearer_auth(token).json(&serde_json::json!({"target":target})).send().await.unwrap().json().await.unwrap();
+    let body=serde_json::json!({"request_id":Uuid::new_v4().to_string(),"target":target,"expected_revision":snapshot["revision"]});let before=api.telegram.requests.lock().unwrap().len();
+    let mut forged=body.clone();forged["actor_id"]=serde_json::json!(HOST_ID);
+    assert_eq!(api.request(reqwest::Method::PATCH,route).bearer_auth(token).json(&forged).send().await.unwrap().status(),400);
+    for _ in 0..2 {assert_eq!(api.request(reqwest::Method::PATCH,route).bearer_auth(token).json(&body).send().await.unwrap().status(),200);}
+    assert_eq!(api.telegram.requests.lock().unwrap().len(),before);
+    let health=api.request(reqwest::Method::POST,"/api/host/query").bearer_auth(token).json(&serde_json::json!({"view":"maintenance"})).send().await.unwrap();assert_eq!(health.status(),200);
+    assert_eq!(health.json::<serde_json::Value>().await.unwrap()["items"][0]["backup"]["status"],"missing");
+}

@@ -174,7 +174,7 @@ async fn snapshot_write_failure_rolls_back_ban_intent_and_legacy_cases_stay_unkn
     .unwrap();
     let result = serde_json::to_value(result).unwrap();
     assert_eq!(result["schema_before"], 32);
-    assert_eq!(result["schema_after"], 39);
+    assert_eq!(result["schema_after"], 40);
     assert_eq!(result["restore"], "ok");
     let restarted = Runtime::load(runtime.config.clone()).await.unwrap();
     assert!(preview(&restarted, &legacy.id).await["threshold_checks"]

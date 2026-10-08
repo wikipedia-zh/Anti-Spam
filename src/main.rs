@@ -12,6 +12,8 @@ mod origin_retry;
 mod moderation_queue;
 mod restriction_retry;
 mod queue_status;
+mod queue_admin;
+mod host_maintenance;
 mod report_delivery;
 mod maintenance;
 mod warning_queue;
@@ -294,6 +296,7 @@ struct ModelState {
 }
 
 struct Runtime {
+    started_at: i64,
     config: Config,
     db: Arc<StdMutex<Connection>>,
     project_chat: Mutex<Option<i64>>,
@@ -521,6 +524,7 @@ impl Runtime {
         let maintainers = Self::load_id_set(&conn, "SELECT user_id FROM maintainers")?;
         Ok(Self {
             config,
+            started_at: Utc::now().timestamp(),
             db: Arc::new(StdMutex::new(conn)),
             project_chat: Mutex::new(project_chat),
             audit_log_chat: Mutex::new(audit_log_chat),
@@ -780,6 +784,9 @@ impl Runtime {
         }
         if user_version < 39 {
             Self::migrate_v38_to_v39(conn)?;
+        }
+        if user_version < 40 {
+            Self::migrate_v39_to_v40(conn)?;
         }
         Ok(())
     }
@@ -8943,6 +8950,8 @@ mod tests {
     mod moderation_queue;
     mod restriction_retry;
     mod queue_status;
+    mod queue_admin;
+    mod host_maintenance;
     mod report_delivery;
     mod maintenance;
     mod warning_queue;

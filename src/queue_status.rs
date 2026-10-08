@@ -38,26 +38,27 @@ pub(super) async fn handle(
 // The same completion predicates used by the workers, including notices
 // whose case has changed since the previous successful delivery.
 pub(super) const WORK: &str = "
-    SELECT '封禁' AS kind,j.case_id,c.chat_id,j.attempts,j.next_attempt_at,j.last_error
+    SELECT '封禁' AS kind,j.case_id,c.chat_id,j.attempts,j.next_attempt_at,j.last_error,
+        json_object('kind','origin','case_id',j.case_id) AS job_key
         FROM origin_ban_jobs j JOIN cases c ON c.id=j.case_id WHERE j.state='pending'
-    UNION ALL SELECT '跨群封禁',case_id,chat_id,attempts,next_attempt_at,last_error
+    UNION ALL SELECT '跨群封禁',case_id,chat_id,attempts,next_attempt_at,last_error,json_object('kind','network','case_id',case_id,'chat_id',chat_id)
         FROM network_deliveries WHERE state='pending'
-    UNION ALL SELECT '聯防訊息處理',case_id,chat_id,attempts,next_attempt_at,last_error
+    UNION ALL SELECT '聯防訊息處理',case_id,chat_id,attempts,next_attempt_at,last_error,json_object('kind','catchup','chat_id',chat_id,'message_id',message_id,'user_id',user_id)
         FROM network_catchups WHERE state='pending'
-    UNION ALL SELECT '退群',NULL,chat_id,attempts,next_attempt_at,last_error
+    UNION ALL SELECT '退群',NULL,chat_id,attempts,next_attempt_at,last_error,json_object('kind','departure','request_id',request_id)
         FROM group_departures WHERE state IN ('queued','leaving','unconfirmed')
-    UNION ALL SELECT '禁言／踢人',j.case_id,c.chat_id,j.attempts,j.next_attempt_at,j.last_error
+    UNION ALL SELECT '禁言／踢人',j.case_id,c.chat_id,j.attempts,j.next_attempt_at,j.last_error,json_object('kind','restriction','case_id',j.case_id)
         FROM restriction_jobs j JOIN cases c ON c.id=j.case_id WHERE j.state='pending'
-    UNION ALL SELECT '解封',j.case_id,c.chat_id,j.attempts,j.next_attempt_at,j.last_error
+    UNION ALL SELECT '解封',j.case_id,c.chat_id,j.attempts,j.next_attempt_at,j.last_error,json_object('kind','reversal','case_id',j.case_id)
         FROM reversal_retries j JOIN cases c ON c.id=j.case_id WHERE c.status='reversal_pending'
-    UNION ALL SELECT '入群驗證',NULL,chat_id,attempts,next_attempt_at,last_error FROM captcha_jobs
-    UNION ALL SELECT '舉報送出',j.case_id,c.chat_id,j.attempts,j.next_attempt_at,j.last_error
+    UNION ALL SELECT '入群驗證',NULL,chat_id,attempts,next_attempt_at,last_error,json_object('kind','captcha','chat_id',chat_id,'user_id',user_id) FROM captcha_jobs
+    UNION ALL SELECT '舉報送出',j.case_id,c.chat_id,j.attempts,j.next_attempt_at,j.last_error,json_object('kind','report','case_id',j.case_id)
         FROM report_deliveries j JOIN cases c ON c.id=j.case_id WHERE j.state='pending'
-    UNION ALL SELECT '警告通知',case_id,chat_id,attempts,next_attempt_at,last_error
+    UNION ALL SELECT '警告通知',case_id,chat_id,attempts,next_attempt_at,last_error,json_object('kind','warning','chat_id',chat_id,'message_id',message_id)
         FROM warning_requests WHERE state='pending'
-    UNION ALL SELECT '規則通知',case_id,source_chat_id,attempts,next_attempt_at,last_error
+    UNION ALL SELECT '規則通知',case_id,source_chat_id,attempts,next_attempt_at,last_error,json_object('kind','rule_notice','id',id)
         FROM rule_notice_jobs WHERE state='pending'
-    UNION ALL SELECT '審核通知',u.case_id,COALESCE(u.chat_id,u.confirmation_chat_id,c.chat_id),u.attempts,u.next_attempt_at,u.last_error
+    UNION ALL SELECT '審核通知',u.case_id,COALESCE(u.chat_id,u.confirmation_chat_id,c.chat_id),u.attempts,u.next_attempt_at,u.last_error,json_object('kind','review','case_id',u.case_id)
         FROM review_updates u JOIN cases c ON c.id=u.case_id LEFT JOIN origin_ban_jobs j ON j.case_id=c.id
         WHERE u.review_status!=c.status||':'||COALESCE(j.state,'') OR u.confirmation_status!=c.status||':'||COALESCE(j.state,'')";
 

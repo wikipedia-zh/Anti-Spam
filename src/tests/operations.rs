@@ -350,7 +350,7 @@ async fn upgrade_restores_36_and_rejects_forged_fields() {
     .unwrap();
     let result = serde_json::to_value(result).unwrap();
     assert_eq!(result["schema_before"], 36);
-    assert_eq!(result["schema_after"], 39);
+    assert_eq!(result["schema_after"], 40);
     assert_eq!(result["restore"], "ok");
     assert!(serde_json::from_value::<Patch>(serde_json::json!({"request_id":Uuid::new_v4().to_string(),"expected_revision":0,"actor_id":HOST_ID,"controls":{"automatic_new_paused":true,"automatic_pending_paused":false,"network_paused":false}})).is_err());
 }

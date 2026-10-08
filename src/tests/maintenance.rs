@@ -30,7 +30,7 @@ async fn upgrade_check_preserves_uncheckpointed_data_and_restores_the_old_schema
     let report = crate::maintenance::check_upgrade(&runtime.config.sqlite_path, &output).unwrap();
     let json = serde_json::to_value(report).unwrap();
     assert_eq!(json["schema_before"], 24);
-    assert_eq!(json["schema_after"], 39);
+    assert_eq!(json["schema_after"], 40);
     assert_eq!(json["restore"], "ok");
     assert_eq!(
         writer

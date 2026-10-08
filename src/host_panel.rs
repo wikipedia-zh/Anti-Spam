@@ -32,7 +32,7 @@ impl Query {
     pub(super) fn valid(&self) -> bool {
         matches!(
             self.view.as_str(),
-            "overview" | "cases" | "groups" | "people" | "audit" | "queue" | "rules"
+            "overview" | "cases" | "groups" | "people" | "audit" | "queue" | "rules" | "maintenance"
         ) && (self.filter.is_empty()
             || (self.view == "cases"
                 && matches!(
@@ -91,6 +91,11 @@ impl Runtime {
         anyhow::ensure!(query.valid(), "invalid host query");
         let mut config = self.config.clone();
         config.hostctl_secret = self.hostctl_secret().await;
+        let started_at=self.started_at;
+        let backup=if query.view=="maintenance" {
+            let database=config.sqlite_path.clone();
+            tokio::task::spawn_blocking(move||host_maintenance::read_report(&database)).await?
+        }else{Value::Null};
         self.with_conn(move |conn| {
             let tx = conn.transaction()?;
             let now = Utc::now().timestamp();
@@ -98,6 +103,7 @@ impl Runtime {
             let id = search.parse::<i64>().ok();
             let params = params![search, id, query.offset];
             let mut items = match query.view.as_str() {
+                "maintenance" => vec![host_maintenance::snapshot(&tx,backup,started_at)?],
                 "overview" => {
                     let work = queue_status::WORK;
                     let mut summary = rows(&tx, &format!("SELECT
@@ -161,7 +167,7 @@ impl Runtime {
                     AND (?4 IS NULL OR {CREATED_SECONDS}>=?4)
                     AND (?5 IS NULL OR {CREATED_SECONDS}<?5)
                     ORDER BY created_at DESC,source,id DESC LIMIT 26 OFFSET ?3"), params![search,id,query.offset,query.created_from,query.created_before])?,
-                "queue" => rows(&tx, &format!("SELECT kind,case_id,chat_id,attempts,next_attempt_at,
+                "queue" => rows(&tx, &format!("SELECT kind,case_id,chat_id,attempts,next_attempt_at,job_key,
                     last_error,COALESCE((SELECT state FROM group_access a WHERE a.chat_id=w.chat_id),'unknown') AS membership_state,
                     (kind IN ('跨群封禁','聯防訊息處理') AND EXISTS(SELECT 1 FROM group_access a WHERE a.chat_id=w.chat_id AND a.state IN ('left','unavailable'))) AS waiting_for_group
                     FROM ({}) w
@@ -175,6 +181,10 @@ impl Runtime {
             // Old command logs may contain sensitive diagnostic text too.
             for item in &mut items {
                 if let Some(object) = item.as_object_mut() {
+                    if let Some(Value::String(key))=object.remove("job_key") {
+                        let target:queue_admin::Target=serde_json::from_str(&key)?;
+                        object.insert("target".into(),serde_json::to_value(target)?);
+                    }
                     for value in object.values_mut() {
                         if let Some(text) = value.as_str() {
                             *value = json!(notices::diagnostic(&config,text));

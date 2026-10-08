@@ -850,6 +850,30 @@ async fn save_departure(State(api):State<Api>,headers:HeaderMap,payload:std::res
     departure_response(api.runtime.queue_departure(grant.user_id,patch).await.map_err(storage_error)?)
 }
 
+fn queue_response(outcome:queue_admin::Outcome)->std::result::Result<Json<serde_json::Value>,ApiError> {
+    match outcome {
+        queue_admin::Outcome::Ready(v)=>Ok(Json(v)),
+        queue_admin::Outcome::Forbidden=>Err(forbidden()),
+        queue_admin::Outcome::Invalid=>Err(ApiError(StatusCode::BAD_REQUEST,"invalid_request")),
+        queue_admin::Outcome::Missing=>Err(ApiError(StatusCode::NOT_FOUND,"queue_item_missing")),
+        queue_admin::Outcome::Conflict=>Err(ApiError(StatusCode::CONFLICT,"settings_changed")),
+        queue_admin::Outcome::Busy=>Err(ApiError(StatusCode::TOO_MANY_REQUESTS,"queue_busy")),
+        queue_admin::Outcome::Held=>Err(ApiError(StatusCode::CONFLICT,"queue_paused")),
+    }
+}
+async fn read_queue_item(State(api):State<Api>,headers:HeaderMap,payload:std::result::Result<Json<queue_admin::Read>,axum::extract::rejection::JsonRejection>)->std::result::Result<Json<serde_json::Value>,ApiError> {
+    let grant=session(&api,&headers).await?;
+    if grant.scope!=Scope::Host || !is_host(grant.user_id) {return Err(forbidden());}
+    let Json(query)=payload.map_err(|_|ApiError(StatusCode::BAD_REQUEST,"invalid_request"))?;
+    queue_response(api.runtime.host_queue_item(grant.user_id,query.target).await.map_err(storage_error)?)
+}
+async fn retry_queue_item(State(api):State<Api>,headers:HeaderMap,payload:std::result::Result<Json<queue_admin::Retry>,axum::extract::rejection::JsonRejection>)->std::result::Result<Json<serde_json::Value>,ApiError> {
+    let grant=session(&api,&headers).await?;
+    if grant.scope!=Scope::Host || !is_host(grant.user_id) {return Err(forbidden());}
+    let Json(patch)=payload.map_err(|_|ApiError(StatusCode::BAD_REQUEST,"invalid_request"))?;
+    queue_response(api.runtime.retry_host_queue(grant.user_id,patch).await.map_err(storage_error)?)
+}
+
 async fn read_settings(
     State(api): State<Api>,
     headers: HeaderMap,
@@ -923,6 +947,7 @@ pub(super) fn router(api: Api) -> Router {
         .route("/api/host/model", post(host_model))
         .route("/api/host/operations",post(read_operations).patch(save_operations))
         .route("/api/host/group/leave",post(read_departure).patch(save_departure))
+        .route("/api/host/queue/item",post(read_queue_item).patch(retry_queue_item))
         .route(
             "/api/host/model/rebuild",
             post(preview_model_rebuild).patch(save_model_rebuild),
