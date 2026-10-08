@@ -331,6 +331,6 @@ async fn upgrade_from_35_preserves_data_and_restores_old_schema() {
     .unwrap();
     let result = serde_json::to_value(result).unwrap();
     assert_eq!(result["schema_before"], 35);
-    assert_eq!(result["schema_after"], 36);
+    assert_eq!(result["schema_after"], 37);
     assert_eq!(result["restore"], "ok");
 }

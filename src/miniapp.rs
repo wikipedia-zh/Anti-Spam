@@ -808,6 +808,27 @@ async fn host_model(
     }
 }
 
+fn operations_response(outcome:operations::Outcome)->std::result::Result<Json<serde_json::Value>,ApiError> {
+    match outcome {
+        operations::Outcome::Ready(v)=>Ok(Json(v)),
+        operations::Outcome::Forbidden=>Err(forbidden()),
+        operations::Outcome::Invalid=>Err(ApiError(StatusCode::BAD_REQUEST,"invalid_request")),
+        operations::Outcome::Conflict=>Err(ApiError(StatusCode::CONFLICT,"settings_changed")),
+    }
+}
+async fn read_operations(State(api):State<Api>,headers:HeaderMap,payload:std::result::Result<Json<operations::Read>,axum::extract::rejection::JsonRejection>)->std::result::Result<Json<serde_json::Value>,ApiError> {
+    let grant=session(&api,&headers).await?;
+    if grant.scope!=Scope::Host || !is_host(grant.user_id) {return Err(forbidden());}
+    let _ = payload.map_err(|_|ApiError(StatusCode::BAD_REQUEST,"invalid_request"))?;
+    operations_response(api.runtime.host_operations(grant.user_id).await.map_err(storage_error)?)
+}
+async fn save_operations(State(api):State<Api>,headers:HeaderMap,payload:std::result::Result<Json<operations::Patch>,axum::extract::rejection::JsonRejection>)->std::result::Result<Json<serde_json::Value>,ApiError> {
+    let grant=session(&api,&headers).await?;
+    if grant.scope!=Scope::Host || !is_host(grant.user_id) {return Err(forbidden());}
+    let Json(patch)=payload.map_err(|_|ApiError(StatusCode::BAD_REQUEST,"invalid_request"))?;
+    operations_response(api.runtime.save_operations(grant.user_id,patch).await.map_err(storage_error)?)
+}
+
 async fn read_settings(
     State(api): State<Api>,
     headers: HeaderMap,
@@ -879,6 +900,7 @@ pub(super) fn router(api: Api) -> Router {
         .route("/api/host/rule", post(read_host_rule).patch(save_host_rule))
         .route("/api/host/rule/test", post(test_host_rule))
         .route("/api/host/model", post(host_model))
+        .route("/api/host/operations",post(read_operations).patch(save_operations))
         .route(
             "/api/host/model/rebuild",
             post(preview_model_rebuild).patch(save_model_rebuild),

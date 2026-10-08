@@ -124,6 +124,7 @@ impl Runtime {
         self.with_conn(move |conn| {
             let tx = conn.transaction()?;
             let now = Utc::now().timestamp();
+            if operations::controls(&tx)?.network_paused {return Ok(None);}
             let due: Option<(u32,bool)> = tx.query_row(
                 "SELECT attempts,outcome_unknown FROM network_deliveries WHERE case_id=?1 AND chat_id=?2
                  AND state='pending' AND next_attempt_at<=?3
@@ -207,6 +208,7 @@ pub(super) async fn deliver_network_bans(
         let mut stmt = conn.prepare(
             "SELECT d.case_id,d.chat_id,c.target_user_id FROM network_deliveries d JOIN cases c ON c.id=d.case_id
              WHERE d.state='pending' AND d.next_attempt_at<=?1
+             AND (SELECT network_paused FROM operations_controls WHERE id=1)=0
              AND (?2 IS NULL OR d.case_id=?2)
              AND (SELECT not_before FROM telegram_retry_state WHERE id=1)<=?1
              ORDER BY d.next_attempt_at,d.case_id,d.chat_id LIMIT 20",

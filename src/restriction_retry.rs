@@ -114,6 +114,11 @@ impl Runtime {
         self.with_conn(move |conn| {
             let _guards = guards;
             let tx = conn.transaction()?;
+            if operations::automatic(&case.action)
+                && operations::controls(&tx)?.automatic_new_paused
+            {
+                return Ok(case.id);
+            }
             if let Some(id) = tx
                 .query_row(
                     "SELECT case_id FROM moderation_requests WHERE chat_id=?1 AND message_id=?2",
@@ -471,11 +476,15 @@ pub(super) async fn attempt(bot: &Bot, runtime: &Runtime, case: CaseRecord) -> R
     };
     let id = case.id.clone();
     let claim_guard = guards.clone();
+    let automatic = operations::automatic(&case.action);
     let payload=runtime.with_conn(move |conn| {
         let _guard=claim_guard;
         let tx=conn.transaction()?;
         let row=tx.query_row("SELECT payload,attempts FROM restriction_jobs WHERE case_id=?1 AND state='pending' AND next_attempt_at<=?2
             AND (SELECT not_before FROM telegram_retry_state WHERE id=1)<=?2",params![id,Utc::now().timestamp()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u32>(1)?))).optional()?;
+        if automatic && operations::controls(&tx)?.automatic_pending_paused {
+            if let Some((payload,_))=&row {let job:Job=serde_json::from_str(payload)?;if job.step=="apply" && !job.uncertain {return Ok(None);}}
+        }
         if let Some((_,attempts))=row.as_ref() {
             let n=attempts.saturating_add(1).min(31);
             tx.execute("UPDATE restriction_jobs SET attempts=?2,next_attempt_at=?3 WHERE case_id=?1",params![id,n,Utc::now().timestamp()+(60_i64<<n.saturating_sub(1).min(6)).min(3600)])?;
@@ -521,6 +530,7 @@ pub(super) async fn attempt(bot: &Bot, runtime: &Runtime, case: CaseRecord) -> R
 pub(super) async fn retry(bot: &Bot, runtime: &Runtime) -> Result<()> {
     let ids=runtime.with_conn(|conn| {
         let mut stmt=conn.prepare("SELECT case_id FROM restriction_jobs WHERE state='pending' AND next_attempt_at<=?1
+            AND ((SELECT automatic_pending_paused FROM operations_controls WHERE id=1)=0 OR json_extract(payload,'$.step')!='apply' OR json_extract(payload,'$.uncertain')=1 OR case_id IN (SELECT id FROM cases WHERE action NOT IN ('flood_mute','cmd_clean_mute')))
             AND (SELECT not_before FROM telegram_retry_state WHERE id=1)<=?1 ORDER BY next_attempt_at,case_id LIMIT 20")?;
         let rows=stmt.query_map([Utc::now().timestamp()],|r|r.get::<_,String>(0))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)

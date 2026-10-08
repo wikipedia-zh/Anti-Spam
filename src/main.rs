@@ -31,6 +31,7 @@ mod reversal_retry;
 use reversal_retry::{reverse_ban_case, spawn_reversal_worker};
 mod network_delivery;
 mod network_catchup;
+mod operations;
 use network_delivery::{deliver_network_bans, spawn_network_worker};
 mod captcha;
 use captcha::{check_captcha_and_act, start_captcha_challenge, spawn_captcha_worker};
@@ -768,6 +769,9 @@ impl Runtime {
         }
         if user_version < 36 {
             Self::migrate_v35_to_v36(conn)?;
+        }
+        if user_version < 37 {
+            Self::migrate_v36_to_v37(conn)?;
         }
         Ok(())
     }
@@ -4336,7 +4340,7 @@ async fn process_new_group_member(bot: &Bot, runtime: &Arc<Runtime>, message: &M
     let enabled = runtime.get_group_modules(message.chat.id.0).await.unwrap_or_default();
     let mut banned = false;
 
-    if enabled.no_halal {
+    if enabled.no_halal && runtime.operations_controls().await.map(|c| !c.automatic_new_paused).unwrap_or(false) {
         let all_reasons = {
             let profile = runtime.load_user_profile(bot, user.id.0 as i64).await.ok();
             let bio = profile.as_ref().and_then(|p| p.bio.as_deref());
@@ -4344,7 +4348,6 @@ async fn process_new_group_member(bot: &Bot, runtime: &Arc<Runtime>, message: &M
         };
 
         if !all_reasons.is_empty() {
-            banned = true;
             let case = CaseRecord {
                 id: Uuid::new_v4().to_string(),
                 action: ActionKind::AutoBan,
@@ -4362,9 +4365,11 @@ async fn process_new_group_member(bot: &Bot, runtime: &Arc<Runtime>, message: &M
                 log_message_id: None,
                 created_at: Utc::now(),
             };
+            let case_id = case.id.clone();
             if let Err(err) = execute_auto_ban(bot, runtime, case, "<b>自動模組封禁</b>").await {
                 log::error!("join moderation failed: {err}");
             }
+            banned = runtime.load_case(&case_id).await.ok().flatten().is_some();
         }
     }
 
@@ -4939,6 +4944,9 @@ async fn handle_permission_denied(bot: &Bot, runtime: &Runtime, message: &Messag
     }
 
     let _ = bot.delete_message(message.chat.id, message.id).await;
+    if runtime.operations_controls().await.map(|c| c.automatic_new_paused || c.automatic_pending_paused).unwrap_or(true) {
+        return reply_ephemeral(bot, message, denial_text).await;
+    }
     let user_id = from.id.0 as i64;
     let prior = runtime.last_permission_offense(chat_id, user_id).await.ok().flatten();
     let _ = runtime.record_permission_offense(chat_id, user_id).await;
@@ -8930,6 +8938,7 @@ mod tests {
     mod host_model;
     mod model_rebuild;
     mod network_catchup;
+    mod operations;
     mod captcha;
     mod edited_messages;
     mod notices;

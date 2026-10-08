@@ -6,6 +6,8 @@ const ANSWER_SECONDS: i64 = 120;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Challenge {
+    #[serde(default)]
+    control_epoch: i64,
     chat_id: i64,
     user_id: i64,
     join_message_id: i32,
@@ -22,6 +24,29 @@ struct Challenge {
 }
 
 impl Runtime {
+    async fn captcha_control_epoch(&self) -> Result<i64> {
+        self.with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT captcha_epoch FROM operations_controls WHERE id=1",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+    }
+    async fn queue_captcha(
+        &self,
+        mut job: Challenge,
+        guard: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Result<Option<Challenge>> {
+        self.with_conn(move|conn| {
+            let _guard=guard;let tx=conn.transaction()?;let controls=operations::controls(&tx)?;
+            if controls.automatic_new_paused || controls.automatic_pending_paused {return Ok(None);}
+            job.control_epoch=tx.query_row("SELECT captcha_epoch FROM operations_controls WHERE id=1",[],|r|r.get(0))?;
+            tx.execute("INSERT INTO captcha_jobs(chat_id,user_id,payload,next_attempt_at) VALUES (?1,?2,?3,0) ON CONFLICT(chat_id,user_id) DO UPDATE SET payload=excluded.payload,next_attempt_at=0",params![job.chat_id,job.user_id,serde_json::to_string(&job)?])?;
+            tx.commit()?;Ok(Some(job))
+        }).await
+    }
     pub(super) fn migrate_v20_to_v21(conn: &mut Connection) -> Result<()> {
         let tx = conn.transaction()?;
         tx.execute_batch(
@@ -143,6 +168,12 @@ async fn run_captcha(bot: &Bot, runtime: &Runtime, mut job: Challenge) -> Result
     let user = UserId(job.user_id as u64);
     for _ in 0..6 {
         let previous_state = job.state.clone();
+        if job.control_epoch != runtime.captcha_control_epoch().await?
+            && !job.kick_started
+            && matches!(job.state.as_str(), "prepare" | "waiting" | "kick")
+        {
+            job.state = "release".into();
+        }
         if job.state == "waiting" && Utc::now().timestamp() < job.deadline {
             return Ok(());
         }
@@ -349,8 +380,12 @@ pub(super) async fn start_captcha_challenge(
         return;
     }
     let user_id = user.id.0 as i64;
-    let _guard = runtime.user_action_guard(user_id).await;
+    let guard = Arc::new(runtime.user_action_guard(user_id).await);
     let result: Result<()> = async {
+        let controls = runtime.operations_controls().await?;
+        if controls.automatic_new_paused || controls.automatic_pending_paused {
+            return Ok(());
+        }
         let mut prior_restrict_until = None;
         if let Some(old) = runtime.captcha_job(message.chat.id.0, user_id).await? {
             if old.join_message_id == message.id.0 {
@@ -368,6 +403,7 @@ pub(super) async fn start_captcha_challenge(
         let entropy = Uuid::new_v4();
         let now = Utc::now().timestamp();
         let job = Challenge {
+            control_epoch: 0,
             chat_id: message.chat.id.0,
             user_id,
             join_message_id: message.id.0,
@@ -382,7 +418,9 @@ pub(super) async fn start_captcha_challenge(
             kick_until: None,
             kick_started: false,
         };
-        runtime.save_captcha(&job, 0).await?;
+        let Some(job) = runtime.queue_captcha(job, guard.clone()).await? else {
+            return Ok(());
+        };
         if runtime.claim_captcha(job.chat_id, job.user_id).await? {
             attempt_captcha(bot, runtime, job).await;
         }
@@ -417,6 +455,23 @@ pub(super) async fn check_captcha_and_act(
     if matches!(job.state.as_str(), "cleanup" | "unkick") {
         return false;
     }
+    let cancelled = match runtime.captcha_control_epoch().await {
+        Ok(epoch) => epoch != job.control_epoch,
+        Err(err) => {
+            log::warn!("could not read CAPTCHA control: {err}");
+            return true;
+        }
+    };
+    if cancelled
+        && !job.kick_started
+        && matches!(job.state.as_str(), "prepare" | "waiting" | "kick")
+    {
+        job.state = "release".into();
+        if let Err(err) = runtime.save_captcha(&job, 0).await {
+            log::warn!("could not release paused CAPTCHA: {err}");
+            return true;
+        }
+    }
     if matches!(job.state.as_str(), "prepare" | "waiting")
         && Utc::now().timestamp() < job.deadline
         && message.text().unwrap_or("").trim() == (job.a + job.b).to_string()
@@ -427,10 +482,12 @@ pub(super) async fn check_captcha_and_act(
             return true;
         }
     }
-    let _ = telegram(runtime, async {
-        bot.delete_message(message.chat.id, message.id).await
-    })
-    .await;
+    if !cancelled {
+        let _ = telegram(runtime, async {
+            bot.delete_message(message.chat.id, message.id).await
+        })
+        .await;
+    }
     if runtime
         .claim_captcha(job.chat_id, job.user_id)
         .await

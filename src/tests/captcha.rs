@@ -356,3 +356,23 @@ async fn a_new_join_replaces_the_old_deadline_without_lifting_other_restrictions
     assert_eq!(calls(&telegram, "sendmessage").len(), 2);
     assert!(calls(&telegram, "banchatmember").is_empty());
 }
+
+#[tokio::test]
+async fn operations_pause_releases_old_challenges_even_after_resume() {
+    let runtime=runtime().await;let telegram=api(vec![]);start(&telegram.bot,&runtime).await;
+    super::operations::set(&runtime,false,true,false).await;
+    super::operations::set(&runtime,false,false,false).await;
+    let restarted=Runtime::load(runtime.config.clone()).await.unwrap();alter_job(&restarted,"deadline",serde_json::json!(0)).await;
+    retry_captchas(&telegram.bot,&restarted).await.unwrap();
+    assert!(job(&restarted).await.is_none());assert!(calls(&telegram,"banchatmember").is_empty());assert_eq!(calls(&telegram,"restrictchatmember").len(),2);
+}
+#[tokio::test]
+async fn operations_admission_pause_does_not_interrupt_existing_challenges() {
+    let runtime=runtime().await;let telegram=api(vec![]);start(&telegram.bot,&runtime).await;
+    super::operations::set(&runtime,true,false,false).await;
+    let mut another=serde_json::to_value(join_message()).unwrap();another["message_id"]=serde_json::json!(3);another["from"]["id"]=serde_json::json!(201);let another:Message=serde_json::from_value(another).unwrap();
+    start_captcha_challenge(&telegram.bot,&runtime,&another,another.from.as_ref().unwrap()).await;
+    assert_eq!(calls(&telegram,"restrictchatmember").len(),1);
+    let expected=answer(&runtime).await;check_captcha_and_act(&telegram.bot,&runtime,&reply(&expected)).await;
+    assert!(job(&runtime).await.is_none());assert!(calls(&telegram,"banchatmember").is_empty());
+}

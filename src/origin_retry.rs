@@ -169,6 +169,7 @@ impl Runtime {
             // caller is cancelled while SQLite is busy.
             let _guards = (review_guards, user_guards);
             let tx = conn.transaction()?;
+            if operations::controls(&tx)?.automatic_new_paused {return Ok(());}
             for (case, header, threshold) in cases {
                 if insert_origin_case(&tx, &case, &header)? {
                     if let Some(value) = threshold {
@@ -210,6 +211,7 @@ impl Runtime {
                 },r.get::<_,u32>(6)?)),
             ).optional()?;
             let Some((job,attempts)) = job else { return Ok(None); };
+            if !job.banned && operations::automatic(&case.action) && operations::controls(&tx)?.automatic_pending_paused {return Ok(None);}
             if !supported_action(&case.action) || matches!(case.status.as_str(), "reversed" | "reversal_pending") {
                 tx.execute("UPDATE origin_ban_jobs SET state='cancelled' WHERE case_id=?1",params![case.id])?;
                 tx.commit()?;
@@ -817,6 +819,7 @@ pub(super) async fn execute_scored_ban(
 pub(super) async fn retry_origin_bans(bot: &Bot, runtime: &Runtime) -> Result<usize> {
     let pending = runtime.with_conn(|conn| {
         let mut stmt = conn.prepare("SELECT case_id FROM origin_ban_jobs WHERE state='pending' AND next_attempt_at<=?1
+            AND (ban_done=1 OR (SELECT automatic_pending_paused FROM operations_controls WHERE id=1)=0 OR case_id IN (SELECT id FROM cases WHERE action NOT IN ('auto_ban','guest_bot_ban','guest_invoker_ban')))
             AND (SELECT not_before FROM telegram_retry_state WHERE id=1)<=?1 ORDER BY next_attempt_at,case_id LIMIT 20")?;
         let rows = stmt.query_map(params![Utc::now().timestamp()],|r| r.get::<_,String>(0))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)

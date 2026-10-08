@@ -1345,3 +1345,16 @@ async fn settings_command_uses_a_group_link_bound_to_the_requesting_admin() {
         .unwrap();
     assert!(link.starts_with("https://t.me/testbot?startapp="));
 }
+
+#[tokio::test]
+async fn operations_api_requires_host_scope_and_rejects_forged_actors() {
+    let api=TestApi::new().await;let group=api.login(HOST_ID,-100).await;
+    for method in [reqwest::Method::POST,reqwest::Method::PATCH] {assert_eq!(api.request(method,"/api/host/operations").bearer_auth(&group).json(&serde_json::json!({})).send().await.unwrap().status(),403);}
+    let link=api.service.host_link(HOST_ID).await.unwrap();let launch=link.query_pairs().find(|(k,_)|k=="startapp").unwrap().1.into_owned();
+    let session:serde_json::Value=api.login_raw(&signed(&api.runtime.config.bot_token,HOST_ID,&launch,Utc::now().timestamp())).await.json().await.unwrap();let token=session["token"].as_str().unwrap();
+    let body=serde_json::json!({"request_id":Uuid::new_v4().to_string(),"expected_revision":0,"controls":{"automatic_new_paused":true,"automatic_pending_paused":true,"network_paused":true}});
+    assert_eq!(api.request(reqwest::Method::POST,"/api/host/operations").bearer_auth(token).json(&serde_json::json!({})).send().await.unwrap().status(),200);
+    for method in [reqwest::Method::POST,reqwest::Method::PATCH] {let mut forged=body.clone();forged["actor_id"]=serde_json::json!(HOST_ID);assert_eq!(api.request(method,"/api/host/operations").bearer_auth(token).json(&forged).send().await.unwrap().status(),400);}
+    for _ in 0..2 {assert_eq!(api.request(reqwest::Method::PATCH,"/api/host/operations").bearer_auth(token).json(&body).send().await.unwrap().status(),200);}
+    assert!(api.runtime.operations_controls().await.unwrap().network_paused);
+}
