@@ -47,8 +47,5 @@ jobs:
         run: |
           php -l web/settings/api.php
           php -l web/settings/index.php
-          node --check web/settings/settings.js
-          node --check web/settings/host.js
-          node --check web/settings/host-roles.js
-          node --check web/settings/host-cases.js
+          for file in web/settings/*.js; do node --check "$file"; done
           node --test tests/miniapp-proxy.cjs

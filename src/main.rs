@@ -30,6 +30,7 @@ use reliability::{passes_threshold, stable_probability};
 mod reversal_retry;
 use reversal_retry::{reverse_ban_case, spawn_reversal_worker};
 mod network_delivery;
+mod network_catchup;
 use network_delivery::{deliver_network_bans, spawn_network_worker};
 mod captcha;
 use captcha::{check_captcha_and_act, start_captcha_challenge, spawn_captcha_worker};
@@ -764,6 +765,9 @@ impl Runtime {
         }
         if user_version < 35 {
             Self::migrate_v34_to_v35(conn)?;
+        }
+        if user_version < 36 {
+            Self::migrate_v35_to_v36(conn)?;
         }
         Ok(())
     }
@@ -4371,11 +4375,13 @@ async fn process_new_group_member(bot: &Bot, runtime: &Arc<Runtime>, message: &M
     // that check.
     if !banned && enabled.netban {
         if let Ok(Some(prior_case)) = runtime.find_active_network_ban(user.id.0 as i64).await {
-            banned = true;
-            let _ = bot.delete_message(message.chat.id, message.id).await;
-            let _ = bot.ban_chat_member(message.chat.id, user.id).await;
-            let _ = runtime.record_network_ban_target(&prior_case.id, message.chat.id.0).await;
-            notify_netban_sync(bot, message.chat.id, user.id.0 as i64, &prior_case.id).await;
+            match network_catchup::observe(bot, runtime, &prior_case, message, user.id.0 as i64).await {
+                Ok(saved) => banned = saved,
+                Err(err) => {
+                    log::warn!("could not save join netban: {}", notices::diagnostic(&runtime.config, &err.to_string()));
+                    return;
+                }
+            }
         }
     }
 
@@ -4597,30 +4603,7 @@ async fn notify_group(bot: &Bot, runtime: &Runtime, case: &CaseRecord, log_messa
     Ok(())
 }
 
-/// Announces a netban catching someone *in this group* - they posted here,
-/// or just joined. Deliberately not sent when the ban is first propagated
-/// (see `propagate_network_ban`): a group only hears about a network ban
-/// once the person it concerns actually turns up, rather than every time
-/// someone is banned somewhere else.
-///
-/// Same self-delete window as `notify_group` - this is routine ambient
-/// noise for group admins, not something that needs to stick around in the
-/// chat permanently.
-async fn notify_netban_sync(bot: &Bot, chat_id: ChatId, target_user_id: i64, case_id: &str) {
-    let text = format!("<b>已同步跨群封禁</b>\n<b>對象</b>: <code>{target_user_id}</code>\n<b>案例</b>: <code>{case_id}</code>");
-    let Ok(sent) = bot.send_message(chat_id, text).parse_mode(ParseMode::Html).await else { return };
-    let bot = bot.clone();
-    let message_id = sent.id;
-    tokio::spawn(async move {
-        sleep(Duration::from_secs(180)).await;
-        let _ = bot.delete_message(chat_id, message_id).await;
-    });
-}
-
-/// Same shape as `notify_netban_sync`, but worded for Project Ban (see
-/// `check_project_ban_and_act`) - explicitly says this can't be bypassed
-/// locally, since that's the whole point of the distinction from a routine
-/// netban sync.
+/// Announces a project ban and its exemption policy.
 async fn notify_project_ban_sync(bot: &Bot, chat_id: ChatId, target_user_id: i64, case_id: &str) {
     let text = format!(
         "<b>已執行項目封禁（PB）</b>\n<b>對象</b>: <code>{target_user_id}</code>\n<b>案例</b>: <code>{case_id}</code>\n所有群組均適用，白名單及本群解封無效，僅維護組可解除。<a href=\"{TERMS_URL}#project-ban\">使用規範第 7 條</a>"
@@ -4702,9 +4685,7 @@ async fn alert_project_ban_bypass_attempt(bot: &Bot, runtime: &Runtime, actor_id
     let _ = bot.send_message(ChatId(dest), text).parse_mode(ParseMode::Html).await;
 }
 
-/// Same shape as `notify_netban_sync`, but for check_reban_and_act's
-/// same-chat case - worth flagging to admins since a ban that let its
-/// target back in once might do so again, unlike a routine netban sync.
+/// Alerts admins when a locally banned user is observed posting again.
 async fn notify_reban_sync(bot: &Bot, chat_id: ChatId, target_user_id: i64, case_id: &str) {
     let text = format!("<b>已重新封禁</b>\n<b>對象</b>: <code>{target_user_id}</code>\n本群封禁仍生效；因再次發言，已刪除訊息並重新封禁。\n<b>案例</b>: <code>{case_id}</code>");
     let Ok(sent) = bot.send_message(chat_id, text).parse_mode(ParseMode::Html).await else { return };
@@ -5420,11 +5401,13 @@ async fn check_netban_and_act(bot: &Bot, runtime: &Arc<Runtime>, message: &Messa
         return false;
     };
 
-    let _ = bot.delete_message(message.chat.id, message.id).await;
-    let _ = bot.ban_chat_member(message.chat.id, user.id).await;
-    let _ = runtime.record_network_ban_target(&prior_case.id, chat_id).await;
-    notify_netban_sync(bot, message.chat.id, user_id, &prior_case.id).await;
-    true
+    match network_catchup::observe(bot, runtime, &prior_case, message, user_id).await {
+        Ok(saved) => saved,
+        Err(err) => {
+            log::warn!("could not save message netban: {}", notices::diagnostic(&runtime.config, &err.to_string()));
+            true
+        }
+    }
 }
 
 /// Same-chat ban-evasion safety net: a Telegram ban is supposed to make
@@ -8946,6 +8929,7 @@ mod tests {
     mod host_rules;
     mod host_model;
     mod model_rebuild;
+    mod network_catchup;
     mod captcha;
     mod edited_messages;
     mod notices;

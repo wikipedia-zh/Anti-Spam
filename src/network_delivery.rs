@@ -1,6 +1,23 @@
 use super::*;
 use rusqlite::OptionalExtension;
 
+pub(super) fn eligible_target(
+    conn: &Connection,
+    case_id: &str,
+    chat_id: i64,
+    test_group: Option<i64>,
+) -> Result<Option<i64>> {
+    Ok(conn.query_row("SELECT c.target_user_id FROM cases c JOIN group_module_settings g ON g.chat_id=?2
+        WHERE c.id=?1 AND c.netban_eligible=1 AND g.netban=1
+        AND (?3 IS NULL OR g.chat_id!=?3)
+        AND c.action IN ('auto_ban','spam_ban','report_approved','guest_bot_ban','guest_invoker_ban')
+        AND c.status NOT IN ('ban_pending','ban_failed','reversal_pending','reversed')
+        AND NOT EXISTS(SELECT 1 FROM global_whitelist WHERE user_id=c.target_user_id)
+        AND NOT EXISTS(SELECT 1 FROM group_whitelist WHERE chat_id=g.chat_id AND user_id=c.target_user_id)
+        AND NOT EXISTS(SELECT 1 FROM banned_groups WHERE chat_id=g.chat_id)",
+        params![case_id,chat_id,test_group], |r| r.get(0)).optional()?)
+}
+
 // The blacklist entry and its deliveries belong to the same transaction.
 pub(super) fn enqueue_network_ban(
     tx: &rusqlite::Transaction<'_>,
@@ -114,17 +131,7 @@ impl Runtime {
                 params![case_id,chat_id,now], |r| Ok((r.get(0)?,r.get(1)?)),
             ).optional()?;
             let Some((attempts,previously_uncertain)) = due else { return Ok(None); };
-            let user_id: Option<i64> = tx.query_row(
-                "SELECT c.target_user_id FROM cases c JOIN group_module_settings g ON g.chat_id=?2
-                 WHERE c.id=?1 AND c.netban_eligible=1 AND g.netban=1
-                 AND (?3 IS NULL OR g.chat_id!=?3)
-                 AND c.action IN ('auto_ban','spam_ban','report_approved','guest_bot_ban','guest_invoker_ban')
-                 AND c.status NOT IN ('ban_pending','ban_failed','reversal_pending','reversed')
-                 AND NOT EXISTS (SELECT 1 FROM global_whitelist WHERE user_id=c.target_user_id)
-                 AND NOT EXISTS (SELECT 1 FROM group_whitelist WHERE chat_id=g.chat_id AND user_id=c.target_user_id)
-                 AND NOT EXISTS (SELECT 1 FROM banned_groups WHERE chat_id=g.chat_id)",
-                params![case_id,chat_id,test_group_id], |r| r.get(0),
-            ).optional()?;
+            let user_id = eligible_target(&tx, &case_id, chat_id, test_group_id)?;
             if user_id.is_some() {
                 let attempt = attempts.saturating_add(1).min(31);
                 let delay = (60_i64 << attempt.saturating_sub(1).min(6)).min(3600);
@@ -155,6 +162,19 @@ impl Runtime {
         }).await
     }
 
+    async fn cancel_network_delivery(
+        &self,
+        case_id: &str,
+        chat_id: i64,
+        uncertain: bool,
+    ) -> Result<()> {
+        let id = case_id.to_string();
+        self.with_conn(move|conn| {
+            conn.execute("UPDATE network_deliveries SET state='cancelled',outcome_unknown=?3,last_error='Target is exempt' WHERE case_id=?1 AND chat_id=?2",params![id,chat_id,uncertain])?;
+            Ok(())
+        }).await
+    }
+
     async fn fail_network_delivery(
         &self,
         case_id: &str,
@@ -163,7 +183,10 @@ impl Runtime {
         uncertain: bool,
     ) -> Result<()> {
         let case_id = case_id.to_string();
-        let error = error.chars().take(2000).collect::<String>();
+        let error = notices::diagnostic(&self.config, error)
+            .chars()
+            .take(2000)
+            .collect::<String>();
         self.with_conn(move |conn| {
             conn.execute(
                 "UPDATE network_deliveries SET last_error=?3,outcome_unknown=?4 WHERE case_id=?1 AND chat_id=?2",
@@ -200,6 +223,41 @@ pub(super) async fn deliver_network_bans(
             continue;
         };
         attempted += 1;
+        if runtime.is_maintainer(user_id).await || is_platform_pseudo_user(user_id) {
+            runtime
+                .cancel_network_delivery(&case_id, chat_id, previously_uncertain)
+                .await?;
+            continue;
+        }
+        match tokio::time::timeout(Duration::from_secs(30), async {
+            bot.get_chat_member(ChatId(chat_id), UserId(user_id as u64))
+                .await
+        })
+        .await
+        {
+            Ok(Ok(member)) if member.kind.is_privileged() => {
+                runtime
+                    .cancel_network_delivery(&case_id, chat_id, previously_uncertain)
+                    .await?;
+                continue;
+            }
+            Ok(Ok(_)) => {}
+            result => {
+                let error = match result {
+                    Ok(Err(err)) => {
+                        if let teloxide::RequestError::RetryAfter(delay) = &err {
+                            runtime.delay_telegram_queue(delay.seconds()).await?;
+                        }
+                        notices::diagnostic(&runtime.config, &err.to_string())
+                    }
+                    _ => "Telegram member lookup timed out".into(),
+                };
+                runtime
+                    .fail_network_delivery(&case_id, chat_id, &error, previously_uncertain)
+                    .await?;
+                continue;
+            }
+        }
         let request = bot.ban_chat_member(ChatId(chat_id), UserId(user_id as u64));
         match tokio::time::timeout(Duration::from_secs(30), async { request.await }).await {
             Ok(Ok(_)) => runtime.finish_network_delivery(&case_id, chat_id).await?,
@@ -224,7 +282,10 @@ pub(super) async fn deliver_network_bans(
                 runtime
                     .fail_network_delivery(&case_id, chat_id, &err.to_string(), uncertain)
                     .await?;
-                log::warn!("network ban {case_id} to {chat_id} failed: {err}");
+                log::warn!(
+                    "network ban {case_id} to {chat_id} failed: {}",
+                    notices::diagnostic(&runtime.config, &err.to_string())
+                );
             }
             Err(_) => {
                 runtime
@@ -240,7 +301,16 @@ pub(super) fn spawn_network_worker(bot: Bot, runtime: Arc<Runtime>) -> tokio::ta
     tokio::spawn(async move {
         loop {
             if let Err(err) = deliver_network_bans(&bot, &runtime, None).await {
-                log::warn!("network delivery queue: {err}");
+                log::warn!(
+                    "network delivery queue: {}",
+                    notices::diagnostic(&runtime.config, &err.to_string())
+                );
+            }
+            if let Err(err) = network_catchup::retry(&bot, &runtime).await {
+                log::warn!(
+                    "network catch-up queue: {}",
+                    notices::diagnostic(&runtime.config, &err.to_string())
+                );
             }
             sleep(Duration::from_secs(5)).await;
         }
