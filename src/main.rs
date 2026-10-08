@@ -32,6 +32,7 @@ use reversal_retry::{reverse_ban_case, spawn_reversal_worker};
 mod network_delivery;
 mod network_catchup;
 mod operations;
+mod group_departure;
 use network_delivery::{deliver_network_bans, spawn_network_worker};
 mod captcha;
 use captcha::{check_captcha_and_act, start_captcha_challenge, spawn_captcha_worker};
@@ -337,7 +338,7 @@ struct Runtime {
     /// waste for something that changes a handful of times a year. The DB
     /// stays the source of truth; these are refilled from it at startup and
     /// written through on every change.
-    banned_groups: RwLock<std::collections::HashSet<i64>>,
+    banned_groups: Arc<RwLock<std::collections::HashSet<i64>>>,
     banned_users: RwLock<std::collections::HashSet<i64>>,
     /// Command-granted maintainers (see migrate_v12_to_v13). Cached in
     /// memory like the other permission sets because it is read on every
@@ -534,7 +535,7 @@ impl Runtime {
             flood_tracker: Mutex::new(HashMap::new()),
             recent_messages: Mutex::new(HashMap::new()),
             group_seen_flush: Mutex::new(HashMap::new()),
-            banned_groups: RwLock::new(banned_groups),
+            banned_groups: Arc::new(RwLock::new(banned_groups)),
             banned_users: RwLock::new(banned_users),
             maintainers: Arc::new(RwLock::new(maintainers)),
             me_id: OnceLock::new(),
@@ -772,6 +773,9 @@ impl Runtime {
         }
         if user_version < 37 {
             Self::migrate_v36_to_v37(conn)?;
+        }
+        if user_version < 38 {
+            Self::migrate_v37_to_v38(conn)?;
         }
         Ok(())
     }
@@ -2652,6 +2656,7 @@ impl Runtime {
 
     async fn set_group_banned(&self, chat_id: i64, banned: bool, reason: &str, added_by: Option<i64>) -> Result<()> {
         let reason = reason.to_string();
+        let mut cache = self.banned_groups.clone().write_owned().await;
         self.with_conn(move |conn| {
             if banned {
                 conn.execute(
@@ -2662,16 +2667,9 @@ impl Runtime {
             } else {
                 conn.execute("DELETE FROM banned_groups WHERE chat_id = ?1", params![chat_id])?;
             }
+            if banned { cache.insert(chat_id); } else { cache.remove(&chat_id); }
             Ok(())
-        })
-        .await?;
-        let mut cache = self.banned_groups.write().await;
-        if banned {
-            cache.insert(chat_id);
-        } else {
-            cache.remove(&chat_id);
-        }
-        Ok(())
+        }).await
     }
 
     async fn set_user_banned(&self, user_id: i64, banned: bool, reason: &str, added_by: Option<i64>) -> Result<()> {
@@ -8627,6 +8625,7 @@ async fn main() -> Result<()> {
     let miniapp_server = miniapp::start(bot.clone(), runtime.clone()).await?;
     let reversal_worker = spawn_reversal_worker(bot.clone(), runtime.clone());
     let network_worker = spawn_network_worker(bot.clone(), runtime.clone());
+    let departure_worker = group_departure::spawn_worker(bot.clone(), runtime.clone());
     let origin_worker = origin_retry::spawn_origin_worker(bot.clone(), runtime.clone());
     let captcha_worker = spawn_captcha_worker(bot.clone(), runtime.clone());
 
@@ -8905,6 +8904,8 @@ async fn main() -> Result<()> {
     let _ = reversal_worker.await;
     network_worker.abort();
     let _ = network_worker.await;
+    departure_worker.abort();
+    let _ = departure_worker.await;
     origin_worker.abort();
     let _ = origin_worker.await;
     captcha_worker.abort();
@@ -8939,6 +8940,7 @@ mod tests {
     mod model_rebuild;
     mod network_catchup;
     mod operations;
+    mod group_departure;
     mod captcha;
     mod edited_messages;
     mod notices;

@@ -140,7 +140,8 @@ impl Runtime {
                     ORDER BY r.id DESC LIMIT 26 OFFSET ?3",params)?,
                 "groups" => rows(&tx, "SELECT g.chat_id,title,last_seen,netban,
                     spam_threshold_override,settings_revision,
-                    EXISTS(SELECT 1 FROM banned_groups b WHERE b.chat_id=g.chat_id) AS service_denied
+                    EXISTS(SELECT 1 FROM banned_groups b WHERE b.chat_id=g.chat_id) AS service_denied,
+                    (SELECT state FROM group_departures d WHERE d.chat_id=g.chat_id ORDER BY d.rowid DESC LIMIT 1) AS departure_state
                     FROM group_module_settings g WHERE (?1='' OR g.chat_id=?2 OR INSTR(LOWER(COALESCE(title,'')),LOWER(?1))>0)
                     AND (?4='' OR (spam_threshold_override IS NOT NULL AND chat_id NOT IN (SELECT chat_id FROM banned_groups)))
                     ORDER BY g.chat_id LIMIT 26 OFFSET ?3", params![search,id,query.offset,query.filter])?,

@@ -829,6 +829,27 @@ async fn save_operations(State(api):State<Api>,headers:HeaderMap,payload:std::re
     operations_response(api.runtime.save_operations(grant.user_id,patch).await.map_err(storage_error)?)
 }
 
+fn departure_response(outcome:group_departure::Outcome)->std::result::Result<Json<serde_json::Value>,ApiError> {
+    match outcome {
+        group_departure::Outcome::Ready(v)=>Ok(Json(v)),
+        group_departure::Outcome::Forbidden=>Err(forbidden()),
+        group_departure::Outcome::Invalid=>Err(ApiError(StatusCode::BAD_REQUEST,"invalid_request")),
+        group_departure::Outcome::Conflict=>Err(ApiError(StatusCode::CONFLICT,"settings_changed")),
+    }
+}
+async fn read_departure(State(api):State<Api>,headers:HeaderMap,payload:std::result::Result<Json<group_departure::Read>,axum::extract::rejection::JsonRejection>)->std::result::Result<Json<serde_json::Value>,ApiError> {
+    let grant=session(&api,&headers).await?;
+    if grant.scope!=Scope::Host || !is_host(grant.user_id) {return Err(forbidden());}
+    let Json(query)=payload.map_err(|_|ApiError(StatusCode::BAD_REQUEST,"invalid_request"))?;
+    departure_response(api.runtime.host_departure(grant.user_id,query.chat_id).await.map_err(storage_error)?)
+}
+async fn save_departure(State(api):State<Api>,headers:HeaderMap,payload:std::result::Result<Json<group_departure::Patch>,axum::extract::rejection::JsonRejection>)->std::result::Result<Json<serde_json::Value>,ApiError> {
+    let grant=session(&api,&headers).await?;
+    if grant.scope!=Scope::Host || !is_host(grant.user_id) {return Err(forbidden());}
+    let Json(patch)=payload.map_err(|_|ApiError(StatusCode::BAD_REQUEST,"invalid_request"))?;
+    departure_response(api.runtime.queue_departure(grant.user_id,patch).await.map_err(storage_error)?)
+}
+
 async fn read_settings(
     State(api): State<Api>,
     headers: HeaderMap,
@@ -901,6 +922,7 @@ pub(super) fn router(api: Api) -> Router {
         .route("/api/host/rule/test", post(test_host_rule))
         .route("/api/host/model", post(host_model))
         .route("/api/host/operations",post(read_operations).patch(save_operations))
+        .route("/api/host/group/leave",post(read_departure).patch(save_departure))
         .route(
             "/api/host/model/rebuild",
             post(preview_model_rebuild).patch(save_model_rebuild),

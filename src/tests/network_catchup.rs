@@ -40,6 +40,22 @@ async fn setup() -> (Runtime, CaseRecord) {
         .unwrap();
     (runtime, case)
 }
+
+#[tokio::test]
+async fn stopping_new_automatic_actions_keeps_join_netban_working() {
+    let (runtime, _) = setup().await;
+    let runtime=Arc::new(runtime);
+    runtime
+        .set_group_module(-300, "nohalal", true)
+        .await
+        .unwrap();
+    super::operations::set(&runtime, true, false, false).await;
+    let message:Message=serde_json::from_value(serde_json::json!({"message_id":50,"date":0,"text":"hello","chat":{"id":-300,"type":"supergroup","title":"Test"},"from":{"id":200,"is_bot":false,"first_name":"Test"}})).unwrap();
+    let bot = TelegramStub::new(vec![]);
+    process_new_group_member(&bot.bot, &runtime, &message, message.from.as_ref().unwrap()).await;
+    assert_eq!(calls(&bot, "banchatmember"), 1);
+    assert_eq!(calls(&bot, "getchat"), 0);
+}
 async fn due(runtime: &Runtime) {
     runtime.with_conn(|c|{c.execute_batch("UPDATE network_deliveries SET next_attempt_at=0; UPDATE network_catchups SET next_attempt_at=0;")?;Ok(())}).await.unwrap();
 }
@@ -331,6 +347,6 @@ async fn upgrade_from_35_preserves_data_and_restores_old_schema() {
     .unwrap();
     let result = serde_json::to_value(result).unwrap();
     assert_eq!(result["schema_before"], 35);
-    assert_eq!(result["schema_after"], 37);
+    assert_eq!(result["schema_after"], 38);
     assert_eq!(result["restore"], "ok");
 }

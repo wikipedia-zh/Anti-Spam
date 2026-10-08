@@ -39,13 +39,14 @@
     }
   };
   words['zh-Hans'] = {...words['zh-Hant'],title:'项目管理',overview:'总览',cases:'案件',groups:'群组',people:'人员',audit:'操作记录',queue:'待处理',search:'用户 ID、群组 ID 或案件 ID',groupSearch:'群组名称或 ID',find:'搜索',refresh:'重新读取',logout:'退出登录',loading:'正在读取…',empty:'没有符合条件的记录。',previous:'上一页',next:'下一页',page:'页',updated:'更新于',pending_reports:'待审核举报',pending_work:'待处理工作',failed_work:'曾失败、等待重试',pending_network:'待发送联防',known_groups:'记录中的群组',rules:'封禁规则',global_threshold:'全局模型阈值',schema:'数据库版本',version:'程序版本',note:'显示目前保存的记录。群组最近出现时间不代表机器人现在仍有管理权限。',modelNote:'模型在本群封禁与加入联防，使用不同的判断条件。',unknown:'未知',yes:'是',no:'否',global:'跟随全局',chat_id:'群组 ID',target_user_id:'用户 ID',status:'处理状态',model_score:'模型分数',reason:'触发原因',netban_eligible:'曾符合联防条件',network_done:'已完成联防工作',network_pending:'待发送联防工作',created_at:'记录时间',evidence:'证据摘要',last_seen:'最近出现',netban:'接收联防',spam_threshold_override:'本群阈值',service_denied:'已终止服务',user_id:'用户 ID',role:'角色',added_by:'授权人',host:'项目主持人',maintainer:'维护员',reviewer:'审核员',actor_user_id:'操作人',source:'来源',detail:'变更摘要',reverted:'已撤销',settings:'群组设置',command:'指令',kind:'工作种类',case_id:'案件 ID',attempts:'尝试次数',next_attempt_at:'下次尝试',last_error:'上次错误',session_expired:'登录已过期。请私聊机器人重新输入 /manage。',forbidden:'只有项目主持人可以使用此面板。',temporarily_unavailable:'暂时无法读取，请稍后重试。',rate_limited:'操作太频繁，请稍候一分钟再试。',signedOut:'已退出登录。请私聊机器人输入 /manage 重新打开。',cooldown:'Telegram 暂停接收操作，重试时间：'};
+  Object.assign(words['zh-Hant'],{leaveGroup:'退群／查看結果',departure_state:'最近退群狀態'});Object.assign(words['zh-Hans'],{leaveGroup:'退群／查看结果',departure_state:'最近退群状态'});Object.assign(words.en,{leaveGroup:'Leave group / status',departure_state:'Latest departure status'});
   const views = ['overview','cases','groups','people','rules','model','operations','audit','queue'];
   Object.assign(words['zh-Hant'],{model:'模型',overrides:'另設門檻的群組'});
   Object.assign(words['zh-Hans'],{model:'模型',overrides:'另设阈值的群组'});
   Object.assign(words.en,{model:'Model',overrides:'Groups with custom thresholds'});
   const fields = {
     cases:['id','chat_id','target_user_id','action','status','model_score','reason','netban_eligible','network_done','network_pending','created_at'],
-    groups:['chat_id','last_seen','netban','spam_threshold_override','service_denied'],
+    groups:['chat_id','last_seen','netban','spam_threshold_override','service_denied','departure_state'],
     people:['user_id','role','added_by','created_at'],audit:['id','source','actor_user_id','chat_id','action','reverted','created_at'],
     queue:['kind','case_id','chat_id','attempts','next_attempt_at'],rules:['id','pattern','recorded_hits']
   };
@@ -87,6 +88,7 @@
     if(v===null||v===undefined)return key==='spam_threshold_override'?t('global'):t('unknown');
     if(['netban_eligible','netban','service_denied','reverted'].includes(key))return t(v?'yes':'no');
     if(['created_at','last_seen','next_attempt_at'].includes(key))return date(v);
+    if(key==='departure_state')return ({'zh-Hant':{queued:'已排隊',leaving:'等待確認',unconfirmed:'正在核對',done:'已確認離開',failed:'未完成',cancelled:'已取消'},'zh-Hans':{queued:'已排队',leaving:'等待确认',unconfirmed:'正在核对',done:'已确认离开',failed:'未完成',cancelled:'已取消'},en:{queued:'Queued',leaving:'Awaiting confirmation',unconfirmed:'Checking membership',done:'Confirmed absent',failed:'Not completed',cancelled:'Cancelled'}}[lang][v]||v);
     if(['role','source'].includes(key))return t(v);
     if(['action','status'].includes(key))return states[lang][v]||t(v);
     return String(v);
@@ -142,7 +144,7 @@
         if(view==='cases')card.append(button(t('caseDetails'),()=>window.SPBCasePanel.open({request,language:lang,caseId:item.id,status:s=>value('status',s),onAuthError:fail,onSaved:load})));
         if(view==='rules')card.append(button(t('editRule'),()=>editRule(item.id)));
         if(view==='groups'){
-          card.append(button(t('groupSettings'),()=>prepareGroup(item.chat_id)));
+          card.append(button(t('groupSettings'),()=>prepareGroup(item.chat_id)),button(t('leaveGroup'),()=>window.SPBGroupDeparture.open({request,language:lang,chatId:item.chat_id,onAuthError:fail,onSaved:load})));
           if(groupLink?.chat_id===item.chat_id){
             const link=element('a',t('openSettings'),'host-group-link');link.href=groupLink.url;
             link.addEventListener('click',event=>{if(window.Telegram?.WebApp?.openTelegramLink){event.preventDefault();window.Telegram.WebApp.openTelegramLink(link.href);}});
@@ -158,10 +160,10 @@
   function editRule(ruleId){window.SPBRuleEditor.open({request,language:lang,ruleId,onAuthError:fail,onSaved:load});}
   async function prepareGroup(chatId){if(busy||closed)return;busy=true;error='';groupLink=null;render();try{const result=await request('host-group-link','POST',{chat_id:chatId});const url=new URL(result.url);if(url.protocol!=='https:'||url.hostname!=='t.me'||url.username||url.password)throw new Error('temporarily_unavailable');groupLink={chat_id:chatId,url:url.href};}catch(e){fail(e);}finally{busy=false;render();}}
   async function load(){if(busy||closed)return;busy=true;error='';data=null;groupLink=null;window.SPBModelPage.reset();render();try{data=await (view==='operations'?request('host-operations','POST',{}):view==='model'?request('host-model','POST',{action:'summary'}):request('host-query','POST',{view,search,filter,offset,created_from:createdFrom,created_before:createdBefore}));}catch(e){fail(e);}finally{busy=false;render();}}
-  function fail(e){error=Object.hasOwn(words.en,e.message)?e.message:'temporarily_unavailable';if(['session_expired','forbidden'].includes(error)){closed=true;data=null;clearToken?.();window.SPBRoleEditor.expire();window.SPBCasePanel.expire();window.SPBRuleEditor.expire();window.SPBModelRebuild.expire();window.SPBOperations.expire();window.SPBModelPage.reset();}render();}
-  async function logout(){if(busy||closed)return;busy=true;render();try{await request('logout','POST',{});closed=true;data=null;clearToken();window.SPBModelRebuild.expire();window.SPBOperations.expire();window.SPBModelPage.reset();error='signedOut';}catch(e){fail(e);}finally{busy=false;render();}}
+  function fail(e){error=Object.hasOwn(words.en,e.message)?e.message:'temporarily_unavailable';if(['session_expired','forbidden'].includes(error)){closed=true;data=null;clearToken?.();window.SPBRoleEditor.expire();window.SPBCasePanel.expire();window.SPBRuleEditor.expire();window.SPBModelRebuild.expire();window.SPBOperations.expire();window.SPBGroupDeparture.expire();window.SPBModelPage.reset();}render();}
+  async function logout(){if(busy||closed)return;busy=true;render();try{await request('logout','POST',{});closed=true;data=null;clearToken();window.SPBModelRebuild.expire();window.SPBOperations.expire();window.SPBGroupDeparture.expire();window.SPBModelPage.reset();error='signedOut';}catch(e){fail(e);}finally{busy=false;render();}}
   window.SPBHost={
     async start(api,language,clear){request=api;lang=language;clearToken=clear;document.body.classList.add('host-mode');root=document.querySelector('main');document.getElementById('save-bar').hidden=true;await load();},
-    setLanguage(language){lang=language;render();window.SPBRoleEditor.setLanguage(language);window.SPBCasePanel.setLanguage(language);window.SPBRuleEditor.setLanguage(language);window.SPBModelRebuild.setLanguage(language);window.SPBOperations.setLanguage(language);},fail
+    setLanguage(language){lang=language;render();window.SPBRoleEditor.setLanguage(language);window.SPBCasePanel.setLanguage(language);window.SPBRuleEditor.setLanguage(language);window.SPBModelRebuild.setLanguage(language);window.SPBOperations.setLanguage(language);window.SPBGroupDeparture.setLanguage(language);},fail
   };
 })();

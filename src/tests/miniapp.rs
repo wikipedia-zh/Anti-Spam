@@ -1358,3 +1358,19 @@ async fn operations_api_requires_host_scope_and_rejects_forged_actors() {
     for _ in 0..2 {assert_eq!(api.request(reqwest::Method::PATCH,"/api/host/operations").bearer_auth(token).json(&body).send().await.unwrap().status(),200);}
     assert!(api.runtime.operations_controls().await.unwrap().network_paused);
 }
+
+#[tokio::test]
+async fn departure_api_requires_host_scope_and_saves_once_without_calling_telegram() {
+    let api=TestApi::new().await;let group=api.login(HOST_ID,-100).await;
+    api.runtime.record_group_seen(-100,Some("Test")).await;
+    for method in [reqwest::Method::POST,reqwest::Method::PATCH] {assert_eq!(api.request(method,"/api/host/group/leave").bearer_auth(&group).json(&serde_json::json!({})).send().await.unwrap().status(),403);}
+    let link=api.service.host_link(HOST_ID).await.unwrap();let launch=link.query_pairs().find(|(k,_)|k=="startapp").unwrap().1.into_owned();
+    let session:serde_json::Value=api.login_raw(&signed(&api.runtime.config.bot_token,HOST_ID,&launch,Utc::now().timestamp())).await.json().await.unwrap();let token=session["token"].as_str().unwrap();
+    let snapshot:serde_json::Value=api.request(reqwest::Method::POST,"/api/host/group/leave").bearer_auth(token).json(&serde_json::json!({"chat_id":-100})).send().await.unwrap().json().await.unwrap();
+    let body=serde_json::json!({"request_id":Uuid::new_v4().to_string(),"chat_id":-100,"expected_revision":snapshot["revision"],"reason":"Missing permissions","block_rejoin":false});
+    let mut forged=body.clone();forged["actor_id"]=serde_json::json!(HOST_ID);
+    assert_eq!(api.request(reqwest::Method::PATCH,"/api/host/group/leave").bearer_auth(token).json(&forged).send().await.unwrap().status(),400);
+    for _ in 0..2 {let result=api.request(reqwest::Method::PATCH,"/api/host/group/leave").bearer_auth(token).json(&body).send().await.unwrap();assert_eq!(result.status(),200);let result:serde_json::Value=result.json().await.unwrap();assert_eq!(result["state"],"queued");}
+    assert!(!api.runtime.is_group_banned(-100).await);
+    assert_eq!(api.telegram.requests.lock().unwrap().iter().filter(|(m,_)|m=="leavechat").count(),0);
+}

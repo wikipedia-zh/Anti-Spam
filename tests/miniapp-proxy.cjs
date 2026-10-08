@@ -77,7 +77,7 @@ test('management queries use fixed authenticated POST routes', async () => {
   }
 });
 test('role reads and changes require authentication and fixed methods', async () => {
-  for(const [route,path] of [['host-role','/api/host/role'],['host-rule','/api/host/rule'],['host-model-rebuild','/api/host/model/rebuild'],['host-operations','/api/host/operations']]) {
+  for(const [route,path] of [['host-role','/api/host/role'],['host-rule','/api/host/rule'],['host-model-rebuild','/api/host/model/rebuild'],['host-operations','/api/host/operations'],['host-group-leave','/api/host/group/leave']]) {
   const before=seen.length;
   assert.equal((await request(route,'GET')).status,405);
   assert.equal((await request(route,'PATCH',{Authorization:''},'{}')).status,401);

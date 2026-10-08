@@ -44,6 +44,8 @@ pub(super) const WORK: &str = "
         FROM network_deliveries WHERE state='pending'
     UNION ALL SELECT '聯防訊息處理',case_id,chat_id,attempts,next_attempt_at,last_error
         FROM network_catchups WHERE state='pending'
+    UNION ALL SELECT '退群',NULL,chat_id,attempts,next_attempt_at,last_error
+        FROM group_departures WHERE state IN ('queued','leaving','unconfirmed')
     UNION ALL SELECT '禁言／踢人',j.case_id,c.chat_id,j.attempts,j.next_attempt_at,j.last_error
         FROM restriction_jobs j JOIN cases c ON c.id=j.case_id WHERE j.state='pending'
     UNION ALL SELECT '解封',j.case_id,c.chat_id,j.attempts,j.next_attempt_at,j.last_error
