@@ -33,6 +33,7 @@ mod network_delivery;
 mod network_catchup;
 mod operations;
 mod group_departure;
+mod group_access;
 use network_delivery::{deliver_network_bans, spawn_network_worker};
 mod captcha;
 use captcha::{check_captcha_and_act, start_captcha_challenge, spawn_captcha_worker};
@@ -776,6 +777,9 @@ impl Runtime {
         }
         if user_version < 38 {
             Self::migrate_v37_to_v38(conn)?;
+        }
+        if user_version < 39 {
+            Self::migrate_v38_to_v39(conn)?;
         }
         Ok(())
     }
@@ -8886,12 +8890,25 @@ async fn main() -> Result<()> {
         }
     });
 
+    let my_chat_member_handler = Update::filter_my_chat_member().endpoint({
+        let runtime = runtime.clone();
+        move |update: Update, member: ChatMemberUpdated| {
+            let runtime = runtime.clone();
+            async move {
+                if let Err(error) = runtime.record_bot_membership(update.id.0, member).await {
+                    log::warn!("bot membership update: {}", notices::diagnostic(&runtime.config, &error.to_string()));
+                }
+                Ok(())
+            }
+        }
+    });
     let handler = dptree::entry()
         .branch(message_handler)
         .branch(edited_message_handler)
         .branch(callback_handler)
         .branch(exchange_handler)
-        .branch(chat_member_handler);
+        .branch(chat_member_handler)
+        .branch(my_chat_member_handler);
 
     let mut dispatcher = Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![runtime.clone(), runtime.config.clone()])
@@ -8941,6 +8958,7 @@ mod tests {
     mod network_catchup;
     mod operations;
     mod group_departure;
+    mod group_access;
     mod captcha;
     mod edited_messages;
     mod notices;

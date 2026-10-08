@@ -140,6 +140,7 @@ impl Runtime {
                     ORDER BY r.id DESC LIMIT 26 OFFSET ?3",params)?,
                 "groups" => rows(&tx, "SELECT g.chat_id,title,last_seen,netban,
                     spam_threshold_override,settings_revision,
+                    COALESCE((SELECT state FROM group_access a WHERE a.chat_id=g.chat_id),'unknown') AS membership_state,
                     EXISTS(SELECT 1 FROM banned_groups b WHERE b.chat_id=g.chat_id) AS service_denied,
                     (SELECT state FROM group_departures d WHERE d.chat_id=g.chat_id ORDER BY d.rowid DESC LIMIT 1) AS departure_state
                     FROM group_module_settings g WHERE (?1='' OR g.chat_id=?2 OR INSTR(LOWER(COALESCE(title,'')),LOWER(?1))>0)
@@ -161,7 +162,9 @@ impl Runtime {
                     AND (?5 IS NULL OR {CREATED_SECONDS}<?5)
                     ORDER BY created_at DESC,source,id DESC LIMIT 26 OFFSET ?3"), params![search,id,query.offset,query.created_from,query.created_before])?,
                 "queue" => rows(&tx, &format!("SELECT kind,case_id,chat_id,attempts,next_attempt_at,
-                    last_error FROM ({})
+                    last_error,COALESCE((SELECT state FROM group_access a WHERE a.chat_id=w.chat_id),'unknown') AS membership_state,
+                    (kind IN ('跨群封禁','聯防訊息處理') AND EXISTS(SELECT 1 FROM group_access a WHERE a.chat_id=w.chat_id AND a.state IN ('left','unavailable'))) AS waiting_for_group
+                    FROM ({}) w
                     WHERE (?1='' OR case_id=?1 OR chat_id=?2)
                     AND (?4='' OR (?4='failed' AND last_error IS NOT NULL) OR (?4='network' AND kind='跨群封禁'))
                     ORDER BY (last_error IS NOT NULL) DESC,attempts DESC,next_attempt_at,kind,case_id,chat_id LIMIT 26 OFFSET ?3", queue_status::WORK), params![search,id,query.offset,query.filter])?,

@@ -56,6 +56,7 @@ struct Job {
     deleted: bool,
     notice: Option<i32>,
     cleanup: i64,
+    access_revision: group_access::Observation,
 }
 
 async fn update(
@@ -98,6 +99,7 @@ async fn failed(
     if let teloxide::RequestError::RetryAfter(delay) = &error {
         runtime.delay_telegram_queue(delay.seconds()).await?;
     }
+    runtime.record_group_access_error(job.chat,job.access_revision,&error).await?;
     update(
         runtime,
         job,
@@ -119,11 +121,13 @@ async fn attempt(bot: &Bot, runtime: &Runtime, chat: i64, message: i32, user: i6
     let test = runtime.config.test_group_id;
     let claimed=runtime.with_conn(move|conn| {
         let _guard=db_guard;let tx=conn.transaction()?;let now=Utc::now().timestamp();
+        if group_access::blocked(&tx,chat)? {return Ok(None);}
+        let access_revision=group_access::observation(&tx,chat)?;
         let row=tx.query_row("SELECT x.case_id,x.delete_done,x.notice_id,x.cleanup_at,x.attempts,d.state
             FROM network_catchups x JOIN network_deliveries d ON d.case_id=x.case_id AND d.chat_id=x.chat_id
             WHERE x.chat_id=?1 AND x.message_id=?2 AND x.user_id=?3 AND x.state='pending' AND x.next_attempt_at<=?4
             AND (SELECT not_before FROM telegram_retry_state WHERE id=1)<=?4",
-            params![chat,message,user,now],|r|Ok((Job{chat,message,user,case_id:r.get(0)?,deleted:r.get(1)?,notice:r.get(2)?,cleanup:r.get(3)?},r.get::<_,u32>(4)?,r.get::<_,String>(5)?))).optional()?;
+            params![chat,message,user,now],|r|Ok((Job{chat,message,user,access_revision,case_id:r.get(0)?,deleted:r.get(1)?,notice:r.get(2)?,cleanup:r.get(3)?},r.get::<_,u32>(4)?,r.get::<_,String>(5)?))).optional()?;
         let Some((job,attempts,delivery))=row else{return Ok(None);};
         let eligible=network_delivery::eligible_target(&tx,&job.case_id,chat,test)?==Some(user);
         if delivery=="pending" && eligible && job.notice.is_none(){return Ok(None);}
@@ -214,6 +218,7 @@ pub(super) async fn retry(bot: &Bot, runtime: &Runtime) -> Result<()> {
             JOIN network_deliveries d ON d.case_id=x.case_id AND d.chat_id=x.chat_id
             JOIN cases c ON c.id=x.case_id
             WHERE x.state='pending' AND x.next_attempt_at<=?1
+            AND NOT EXISTS(SELECT 1 FROM group_access a WHERE a.chat_id=x.chat_id AND a.state IN ('left','unavailable'))
             AND (d.state!='pending' OR x.notice_id IS NOT NULL OR c.status IN ('reversed','reversal_pending'))
             AND (SELECT not_before FROM telegram_retry_state WHERE id=1)<=?1
             ORDER BY x.next_attempt_at,x.chat_id,x.message_id,x.user_id LIMIT 20")?;

@@ -41,6 +41,7 @@ pub(super) fn enqueue_network_ban(
          AND NOT EXISTS (SELECT 1 FROM global_whitelist WHERE user_id=c.target_user_id)
          AND NOT EXISTS (SELECT 1 FROM group_whitelist WHERE chat_id=g.chat_id AND user_id=c.target_user_id)
          AND NOT EXISTS (SELECT 1 FROM banned_groups WHERE chat_id=g.chat_id)
+         AND NOT EXISTS (SELECT 1 FROM group_access WHERE chat_id=g.chat_id AND state IN ('left','unavailable'))
          AND NOT EXISTS (SELECT 1 FROM network_ban_targets WHERE case_id=c.id AND chat_id=g.chat_id)",
         params![case_id, test_group_id],
     )?;
@@ -118,13 +119,15 @@ impl Runtime {
         &self,
         case_id: &str,
         chat_id: i64,
-    ) -> Result<Option<(i64, bool)>> {
+    ) -> Result<Option<(i64, bool, group_access::Observation)>> {
         let case_id = case_id.to_string();
         let test_group_id = self.config.test_group_id;
         self.with_conn(move |conn| {
             let tx = conn.transaction()?;
             let now = Utc::now().timestamp();
             if operations::controls(&tx)?.network_paused {return Ok(None);}
+            if group_access::blocked(&tx,chat_id)? {return Ok(None);}
+            let revision=group_access::observation(&tx,chat_id)?;
             let due: Option<(u32,bool)> = tx.query_row(
                 "SELECT attempts,outcome_unknown FROM network_deliveries WHERE case_id=?1 AND chat_id=?2
                  AND state='pending' AND next_attempt_at<=?3
@@ -145,7 +148,7 @@ impl Runtime {
                 tx.execute("UPDATE network_deliveries SET state='cancelled' WHERE case_id=?1 AND chat_id=?2", params![case_id,chat_id])?;
             }
             tx.commit()?;
-            Ok(user_id.map(|id| (id,previously_uncertain)))
+            Ok(user_id.map(|id| (id,previously_uncertain,revision)))
         }).await
     }
 
@@ -208,6 +211,7 @@ pub(super) async fn deliver_network_bans(
         let mut stmt = conn.prepare(
             "SELECT d.case_id,d.chat_id,c.target_user_id FROM network_deliveries d JOIN cases c ON c.id=d.case_id
              WHERE d.state='pending' AND d.next_attempt_at<=?1
+             AND NOT EXISTS(SELECT 1 FROM group_access a WHERE a.chat_id=d.chat_id AND a.state IN ('left','unavailable'))
              AND (SELECT network_paused FROM operations_controls WHERE id=1)=0
              AND (?2 IS NULL OR d.case_id=?2)
              AND (SELECT not_before FROM telegram_retry_state WHERE id=1)<=?1
@@ -219,7 +223,7 @@ pub(super) async fn deliver_network_bans(
     let mut attempted = 0;
     for (case_id, chat_id, target_user_id) in pending {
         let _guard = runtime.user_action_guard(target_user_id).await;
-        let Some((user_id, previously_uncertain)) =
+        let Some((user_id, previously_uncertain, access_revision)) =
             runtime.claim_network_delivery(&case_id, chat_id).await?
         else {
             continue;
@@ -247,6 +251,7 @@ pub(super) async fn deliver_network_bans(
             result => {
                 let error = match result {
                     Ok(Err(err)) => {
+                        runtime.record_group_access_error(chat_id,access_revision,&err).await?;
                         if let teloxide::RequestError::RetryAfter(delay) = &err {
                             runtime.delay_telegram_queue(delay.seconds()).await?;
                         }
@@ -276,6 +281,7 @@ pub(super) async fn deliver_network_bans(
                 break;
             }
             Ok(Err(err)) => {
+                runtime.record_group_access_error(chat_id,access_revision,&err).await?;
                 let uncertain = previously_uncertain
                     || !matches!(
                         err,
@@ -302,6 +308,9 @@ pub(super) async fn deliver_network_bans(
 pub(super) fn spawn_network_worker(bot: Bot, runtime: Arc<Runtime>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
+            if let Err(err) = group_access::reconcile(&bot, &runtime).await {
+                log::warn!("group access check: {}", notices::diagnostic(&runtime.config, &err.to_string()));
+            }
             if let Err(err) = deliver_network_bans(&bot, &runtime, None).await {
                 log::warn!(
                     "network delivery queue: {}",

@@ -375,6 +375,6 @@ async fn rule_search_counts_saved_exact_ids_and_migration_preserves_rules() {
     )
     .unwrap();
     let result = serde_json::to_value(result).unwrap();
-    assert_eq!(result["schema_after"], 38);
+    assert_eq!(result["schema_after"], 39);
     assert_eq!(result["restore"], "ok");
 }

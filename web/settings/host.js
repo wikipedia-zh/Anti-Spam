@@ -46,9 +46,9 @@
   Object.assign(words.en,{model:'Model',overrides:'Groups with custom thresholds'});
   const fields = {
     cases:['id','chat_id','target_user_id','action','status','model_score','reason','netban_eligible','network_done','network_pending','created_at'],
-    groups:['chat_id','last_seen','netban','spam_threshold_override','service_denied','departure_state'],
+    groups:['chat_id','membership_state','last_seen','netban','spam_threshold_override','service_denied','departure_state'],
     people:['user_id','role','added_by','created_at'],audit:['id','source','actor_user_id','chat_id','action','reverted','created_at'],
-    queue:['kind','case_id','chat_id','attempts','next_attempt_at'],rules:['id','pattern','recorded_hits']
+    queue:['kind','case_id','chat_id','membership_state','attempts','next_attempt_at'],rules:['id','pattern','recorded_hits']
   };
   const states={
     'zh-Hant':{auto_ban:'自動封禁',spam_ban:'人工封禁',pending_report:'待審舉報',report_approved:'舉報已批准',report_rejected:'舉報已拒絕',guest_bot_ban:'訪客機器人封禁',guest_invoker_ban:'訪客召喚者封禁',mute:'禁言',kick:'踢出群組',flood_mute:'洗版禁言',project_ban:'項目封禁',pending_review:'待審核',ban_done:'已封禁',done:'已完成',ban_pending:'待封禁',ban_failed:'封禁失敗',reversed:'已撤銷',reversal_pending:'正在撤銷',action_failed:'操作失敗',action_unconfirmed:'結果未確認',action_cancelled:'已取消',action_pending:'待執行'},
@@ -77,6 +77,9 @@
   Object.assign(words.en,{ruleSearch:'Rule name, pattern or ID',newRule:'Add rule',editRule:'Edit and test',pattern:'Pattern',recorded_hits:'Recorded case hits',ruleNote:'Counts use saved rule IDs or codes. Older cases may be incomplete.'});
   Object.assign(words['zh-Hant'],{operations:'緊急控制'});Object.assign(words['zh-Hans'],{operations:'紧急控制'});Object.assign(words.en,{operations:'Emergency controls'});
   const caseFilters=['','pending_review','pending_training','banned','pending','failed','unconfirmed','reversal_pending','reversed','rejected','cancelled'];
+  Object.assign(words['zh-Hant'],{membership_state:'機器人狀態',present:'仍在群內',left:'已移除／已離開',unavailable:'無法存取',paused:'已暫停',waitingForGroup:'已暫停，等待重新加入或恢復存取'});
+  Object.assign(words['zh-Hans'],{membership_state:'机器人状态',present:'仍在群内',left:'已移除／已离开',unavailable:'无法访问',paused:'已暂停',waitingForGroup:'已暂停，等待重新加入或恢复访问'});
+  Object.assign(words.en,{membership_state:'Bot membership',present:'In group',left:'Removed or left',unavailable:'Inaccessible',paused:'Paused',waitingForGroup:'Paused until the bot rejoins or access is restored'});
   let lang='zh-Hant',request,clearToken,root,view='overview',search='',filter='',fromDate='',throughDate='',createdFrom=null,createdBefore=null,offset=0,data=null,busy=false,closed=false,error='',groupLink=null;
   const t = key => words[lang][key] ?? key;
   const element = (tag,text,className) => {const el=document.createElement(tag); if(text!==undefined)el.textContent=text; if(className)el.className=className; return el;};
@@ -86,6 +89,7 @@
   function dateBoundary(value,nextDay=false){if(!value)return null;const parts=value.split('-').map(Number);const date=new Date(parts[0],parts[1]-1,parts[2]);if(nextDay)date.setDate(date.getDate()+1);return date.getTime()/1000;}
   function value(key,v) {
     if(v===null||v===undefined)return key==='spam_threshold_override'?t('global'):t('unknown');
+    if(key==='membership_state')return t(v);
     if(['netban_eligible','netban','service_denied','reverted'].includes(key))return t(v?'yes':'no');
     if(['created_at','last_seen','next_attempt_at'].includes(key))return date(v);
     if(key==='departure_state')return ({'zh-Hant':{queued:'已排隊',leaving:'等待確認',unconfirmed:'正在核對',done:'已確認離開',failed:'未完成',cancelled:'已取消'},'zh-Hans':{queued:'已排队',leaving:'等待确认',unconfirmed:'正在核对',done:'已确认离开',failed:'未完成',cancelled:'已取消'},en:{queued:'Queued',leaving:'Awaiting confirmation',unconfirmed:'Checking membership',done:'Confirmed absent',failed:'Not completed',cancelled:'Cancelled'}}[lang][v]||v);
@@ -138,8 +142,9 @@
     }else{
       if(!data.items.length)root.append(element('p',t('empty')));
       for(const item of data.items){const card=element('article',undefined,'host-record');card.append(element('h3',item.target_name||item.title||(view==='rules'?`@${item.id} · ${item.description}`:'')||t(item.role)||item.case_id||item.id||t(view)));
-        const brief=[item.target_user_id??item.user_id??item.chat_id,item.status?value('status',item.status):item.kind||'',item.created_at?date(item.created_at):''].filter(v=>v!==''&&v!==undefined).join(' · ');card.append(element('p',brief,'host-meta'));
-        const detail=element('details');detail.append(element('summary',t('details')));const dl=element('dl');for(const key of fields[view])dl.append(element('dt',t(key)),element('dd',value(key,item[key])));detail.append(dl);
+        const brief=[item.target_user_id??item.user_id??item.chat_id,view==='groups'?value('membership_state',item.membership_state):item.status?value('status',item.status):item.kind||'',item.created_at?date(item.created_at):''].filter(v=>v!==''&&v!==undefined).join(' · ');card.append(element('p',brief,'host-meta'));
+        if(item.waiting_for_group)card.append(element('p',t('waitingForGroup'),'host-note'));
+        const detail=element('details');detail.append(element('summary',t('details')));const dl=element('dl');for(const key of fields[view])dl.append(element('dt',t(key)),element('dd',key==='next_attempt_at'&&item.waiting_for_group?t('paused'):value(key,item[key])));detail.append(dl);
         for(const key of ['evidence','detail','last_error'])if(item[key]){detail.append(element('h4',t(key)),element('pre',item[key]));}card.append(detail);if(view==='people'&&item.role!=='host')card.append(button(t('editRoles'),()=>editRole(item.user_id)));
         if(view==='cases')card.append(button(t('caseDetails'),()=>window.SPBCasePanel.open({request,language:lang,caseId:item.id,status:s=>value('status',s),onAuthError:fail,onSaved:load})));
         if(view==='rules')card.append(button(t('editRule'),()=>editRule(item.id)));

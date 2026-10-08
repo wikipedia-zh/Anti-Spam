@@ -68,6 +68,7 @@ struct Item {
     attempts: i64,
     next: i64,
     error: Option<String>,
+    waiting: bool,
 }
 
 impl Runtime {
@@ -78,13 +79,13 @@ impl Runtime {
             let tx=conn.transaction()?;
             let cooldown:i64=tx.query_row("SELECT not_before FROM telegram_retry_state WHERE id=1",[],|r|r.get(0))?;
             let groups={
-                let mut stmt=tx.prepare(&format!("SELECT kind,COUNT(*),SUM(last_error IS NOT NULL),SUM(next_attempt_at<=?2 AND ?3<=?2) FROM ({WORK}) WHERE (?1 IS NULL OR case_id=?1) GROUP BY kind ORDER BY kind"))?;
+                let mut stmt=tx.prepare(&format!("SELECT kind,COUNT(*),SUM(last_error IS NOT NULL),SUM(next_attempt_at<=?2 AND ?3<=?2 AND NOT (kind IN ('跨群封禁','聯防訊息處理') AND EXISTS(SELECT 1 FROM group_access a WHERE a.chat_id=w.chat_id AND a.state IN ('left','unavailable')))) FROM ({WORK}) w WHERE (?1 IS NULL OR case_id=?1) GROUP BY kind ORDER BY kind"))?;
                 let rows=stmt.query_map(params![case_id,now,cooldown],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?)))?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
             let items={
-                let mut stmt=tx.prepare(&format!("SELECT kind,case_id,chat_id,attempts,next_attempt_at,last_error FROM ({WORK}) WHERE (?1 IS NULL OR case_id=?1) ORDER BY (last_error IS NOT NULL) DESC,attempts DESC,next_attempt_at,case_id LIMIT 5"))?;
-                let rows=stmt.query_map(params![case_id],|r|Ok(Item{kind:r.get(0)?,case_id:r.get(1)?,chat:r.get(2)?,attempts:r.get(3)?,next:r.get(4)?,error:r.get(5)?}))?;
+                let mut stmt=tx.prepare(&format!("SELECT kind,case_id,chat_id,attempts,next_attempt_at,last_error,(kind IN ('跨群封禁','聯防訊息處理') AND EXISTS(SELECT 1 FROM group_access a WHERE a.chat_id=w.chat_id AND a.state IN ('left','unavailable'))) FROM ({WORK}) w WHERE (?1 IS NULL OR case_id=?1) ORDER BY (last_error IS NOT NULL) DESC,attempts DESC,next_attempt_at,case_id LIMIT 5"))?;
+                let rows=stmt.query_map(params![case_id],|r|Ok(Item{kind:r.get(0)?,case_id:r.get(1)?,chat:r.get(2)?,attempts:r.get(3)?,next:r.get(4)?,error:r.get(5)?,waiting:r.get(6)?}))?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
             let reports:i64=tx.query_row("SELECT COUNT(*) FROM cases WHERE action='pending_report' AND status='pending_review' AND (?1 IS NULL OR id=?1)",params![case_id],|r|r.get(0))?;
@@ -118,7 +119,9 @@ impl Runtime {
                 ));
             }
             let wait = item.next.max(cooldown).saturating_sub(now).max(0);
-            text.push_str(&if wait == 0 {
+            text.push_str(&if item.waiting {
+                "\n已暫停：等待機器人重新加入或恢復存取。".to_string()
+            } else if wait == 0 {
                 "\n下一次：待執行".to_string()
             } else {
                 format!("\n下一次：約 {wait} 秒後")

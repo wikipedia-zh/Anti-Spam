@@ -229,14 +229,19 @@ pub(super) async fn attempt(bot: &Bot, runtime: &Runtime, id: &str) -> Result<()
         )
         .await;
     };
+    let access_revision=runtime.group_access_revision(chat).await?;
     let member = match api(bot.get_chat_member(ChatId(chat), me).into_future()).await {
         Ok(m) => m,
-        Err(e) => return failure(runtime, &id, state, e, guard).await,
+        Err(e) => {
+            runtime.record_group_access_error(chat,access_revision,&e).await?;
+            return failure(runtime, &id, state, e, guard).await;
+        },
     };
     if matches!(
         member.kind,
         teloxide::types::ChatMemberKind::Left | teloxide::types::ChatMemberKind::Banned(_)
     ) {
+        runtime.record_group_access_check(chat,access_revision,"left").await?;
         let query=id.clone();let held=guard.clone();
         runtime.with_conn(move|conn|{let _guard=held;conn.execute("UPDATE group_departures SET notice_state='skipped' WHERE request_id=?1 AND notice_state='pending'",[query])?;Ok(())}).await?;
         return update(runtime, &id, "done", None, guard).await;
@@ -304,7 +309,10 @@ pub(super) async fn attempt(bot: &Bot, runtime: &Runtime, id: &str) -> Result<()
     // membership first; a fresh host confirmation is required to send again.
     update(runtime, &id, "leaving", None, guard.clone()).await?;
     match api(bot.leave_chat(ChatId(chat)).into_future()).await {
-        Ok(_) => update(runtime, &id, "done", None, guard).await,
+        Ok(_) => {
+            runtime.record_group_access_check(chat,access_revision,"left").await?;
+            update(runtime, &id, "done", None, guard).await
+        },
         Err(e) => failure(runtime, &id, "unconfirmed", e, guard).await,
     }
 }
