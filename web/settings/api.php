@@ -30,9 +30,9 @@ $paths = ['session' => '/api/miniapp/session', 'settings' => '/api/groups/curren
     'host-query' => '/api/host/query', 'logout' => '/api/miniapp/logout', 'host-role' => '/api/host/role',
     'host-group-link' => '/api/host/group-link', 'host-case' => '/api/host/case',
     'host-case-reverse' => '/api/host/case/reverse', 'host-case-review' => '/api/host/case/review',
-    'host-rule' => '/api/host/rule', 'host-rule-test' => '/api/host/rule/test'];
+    'host-rule' => '/api/host/rule', 'host-rule-test' => '/api/host/rule/test', 'host-model' => '/api/host/model'];
 if (!is_string($route) || !isset($paths[$route])) fail(404, 'invalid_request');
-if ((in_array($route, ['session', 'host-query', 'logout', 'host-group-link', 'host-case', 'host-rule-test'], true) && $method !== 'POST')
+if ((in_array($route, ['session', 'host-query', 'logout', 'host-group-link', 'host-case', 'host-rule-test', 'host-model'], true) && $method !== 'POST')
     || (in_array($route, ['host-case-reverse', 'host-case-review'], true) && $method !== 'PATCH')
     || ($route === 'settings' && !in_array($method, ['GET', 'PATCH'], true))
     || (in_array($route, ['host-role', 'host-rule'], true) && !in_array($method, ['POST', 'PATCH'], true))) {

@@ -48,7 +48,8 @@ impl Query {
                         | "rejected"
                         | "cancelled"
                 ))
-            || (self.view == "queue" && matches!(self.filter.as_str(), "failed" | "network")))
+            || (self.view == "queue" && matches!(self.filter.as_str(), "failed" | "network"))
+            || (self.view == "groups" && self.filter == "overrides"))
             && self.search.chars().count() <= 100
             && self.offset <= 100_000
             && ([self.created_from, self.created_before]
@@ -141,7 +142,8 @@ impl Runtime {
                     spam_threshold_override,settings_revision,
                     EXISTS(SELECT 1 FROM banned_groups b WHERE b.chat_id=g.chat_id) AS service_denied
                     FROM group_module_settings g WHERE (?1='' OR g.chat_id=?2 OR INSTR(LOWER(COALESCE(title,'')),LOWER(?1))>0)
-                    ORDER BY g.chat_id LIMIT 26 OFFSET ?3", params)?,
+                    AND (?4='' OR (spam_threshold_override IS NOT NULL AND chat_id NOT IN (SELECT chat_id FROM banned_groups)))
+                    ORDER BY g.chat_id LIMIT 26 OFFSET ?3", params![search,id,query.offset,query.filter])?,
                 "people" => rows(&tx, "SELECT * FROM (
                     SELECT 'host' AS role,?4 AS user_id,NULL AS added_by,NULL AS created_at
                     UNION ALL SELECT 'maintainer',user_id,added_by,created_at FROM maintainers WHERE user_id!=?4

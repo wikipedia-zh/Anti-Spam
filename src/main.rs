@@ -22,6 +22,7 @@ mod host_cases;
 mod review_decisions;
 mod case_thresholds;
 mod host_rules;
+mod host_model;
 mod role_updates;
 use origin_retry::execute_auto_ban;
 use reliability::{passes_threshold, stable_probability};
@@ -8964,6 +8965,7 @@ mod tests {
     mod host_review;
     mod case_thresholds;
     mod host_rules;
+    mod host_model;
     mod captcha;
     mod edited_messages;
     mod notices;

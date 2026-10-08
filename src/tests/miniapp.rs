@@ -186,6 +186,86 @@ async fn group_admin_can_edit_ot_text_but_cannot_save_after_revocation() {
 }
 
 #[tokio::test]
+async fn model_checks_require_host_scope_and_do_not_call_telegram() {
+    let api = TestApi::new().await;
+    let group = api.login(HOST_ID, -100).await;
+    assert_eq!(
+        api.request(reqwest::Method::POST, "/api/host/model")
+            .bearer_auth(group)
+            .body("{\"action\":\"summary\"}")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    let link = api.service.host_link(HOST_ID).await.unwrap();
+    let launch = link
+        .query_pairs()
+        .find(|(k, _)| k == "startapp")
+        .unwrap()
+        .1
+        .into_owned();
+    let session: serde_json::Value = api
+        .login_raw(&signed(
+            &api.runtime.config.bot_token,
+            HOST_ID,
+            &launch,
+            Utc::now().timestamp(),
+        ))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let token = session["token"].as_str().unwrap();
+    for body in [
+        serde_json::json!({"action":"summary","actor_id":200}),
+        serde_json::json!({"action":"train","text":"hi"}),
+        serde_json::json!({"action":"score","text":"字".repeat(4001)}),
+    ] {
+        assert_eq!(
+            api.request(reqwest::Method::POST, "/api/host/model")
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+    }
+    for body in [
+        serde_json::json!({"action":"summary"}),
+        serde_json::json!({"action":"score","text":"hello"}),
+        serde_json::json!({"action":"evaluate"}),
+    ] {
+        loop {
+            let response = api
+                .request(reqwest::Method::POST, "/api/host/model")
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            if response.status() == 429 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                continue;
+            }
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            break;
+        }
+    }
+    assert!(api
+        .telegram
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(m, _)| m != "banchatmember" && m != "sendmessage"));
+}
+
+#[tokio::test]
 async fn rule_management_requires_host_scope_and_trials_never_touch_telegram() {
     let api = TestApi::new().await;
     let group = api.login(HOST_ID, -100).await;

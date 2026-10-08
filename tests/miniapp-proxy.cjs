@@ -64,7 +64,7 @@ test('the proxy forwards fixed paths, exact JSON, and its own key', async () => 
   assert.equal(seen.at(-1).headers.authorization,undefined);
 });
 test('management queries use fixed authenticated POST routes', async () => {
-  for (const [route,path] of [['host-query','/api/host/query'],['logout','/api/miniapp/logout'],['host-group-link','/api/host/group-link'],['host-case','/api/host/case'],['host-rule-test','/api/host/rule/test']]) {
+  for (const [route,path] of [['host-query','/api/host/query'],['logout','/api/miniapp/logout'],['host-group-link','/api/host/group-link'],['host-case','/api/host/case'],['host-rule-test','/api/host/rule/test'],['host-model','/api/host/model']]) {
     const count=seen.length;
     assert.equal((await request(route,'GET')).status,405);
     assert.equal((await request(route,'POST',{Authorization:''},'{}')).status,401);
