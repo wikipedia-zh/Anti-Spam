@@ -23,6 +23,7 @@ mod review_decisions;
 mod case_thresholds;
 mod host_rules;
 mod host_model;
+mod model_rebuild;
 mod role_updates;
 use origin_retry::execute_auto_ban;
 use reliability::{passes_threshold, stable_probability};
@@ -252,6 +253,7 @@ enum UndoData {
     RuleAdded { rule_id: i64 },
     RuleEdited { rule_id: i64, old_pattern: String },
     RuleUpdated { rule_id: i64, before: host_rules::Rule, after: host_rules::Rule },
+    ModelRebuilt { request_id: String },
     RuleDeleted { pattern: String, description: String },
     ProjectChat { old: Option<i64> },
     /// `/leave` and `/forbid` - reverting either just lifts the denial,
@@ -759,6 +761,9 @@ impl Runtime {
         }
         if user_version < 34 {
             Self::migrate_v33_to_v34(conn)?;
+        }
+        if user_version < 35 {
+            Self::migrate_v34_to_v35(conn)?;
         }
         Ok(())
     }
@@ -1859,46 +1864,10 @@ impl Runtime {
     /// `word_frequencies` and have no backing sample to replay.
     async fn retrain_from_samples(&self) -> Result<(usize, usize)> {
         self.with_model_transaction(|tx| {
-            let samples: Vec<(String, String)> = {
-                let mut stmt = tx.prepare("SELECT label, text FROM training_samples WHERE trim(text) != ''")?;
-                let mut rows = stmt.query([])?;
-                let mut out = Vec::new();
-                while let Some(row) = rows.next()? {
-                    out.push((row.get(0)?, row.get(1)?));
-                }
-                out
-            };
-
-            tx.execute("DELETE FROM word_frequencies", [])?;
-            let (mut spam_docs, mut ham_docs) = (0usize, 0usize);
-            for (label, text) in &samples {
-                let (spam_delta, ham_delta) = match label.as_str() {
-                    "spam" => (1, 0),
-                    "ham" => (0, 1),
-                    _ => continue,
-                };
-                for token in tokenize(text) {
-                    tx.execute(
-                        "INSERT INTO word_frequencies (word, spam_count, ham_count) VALUES (?1, ?2, ?3)
-                         ON CONFLICT(word) DO UPDATE SET spam_count = spam_count + ?2, ham_count = ham_count + ?3",
-                        params![token, spam_delta, ham_delta],
-                    )?;
-                }
-                if spam_delta == 1 { spam_docs += 1 } else { ham_docs += 1 }
-            }
-
-            tx.execute(
-                "INSERT INTO model_meta (key, value) VALUES ('spam_docs', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                params![spam_docs.to_string()],
-            )?;
-            tx.execute(
-                "INSERT INTO model_meta (key, value) VALUES ('ham_docs', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                params![ham_docs.to_string()],
-            )?;
-
-            Ok((spam_docs, ham_docs))
-        })
-        .await
+            let model = model_rebuild::candidate(model_rebuild::samples(tx)?);
+            model_rebuild::write(tx, &model)?;
+            Ok((model.spam_docs, model.ham_docs))
+        }).await
     }
 
     /// Refreshes the in-memory model from disk. This only reads — the DB is
@@ -7183,13 +7152,18 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         }
         ModerationCommand::MlRebuild => {
             require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
-            let rebuilt = runtime.rebuild_model().await.unwrap_or_default();
-            bot.send_message(message.chat.id, format!("已重建模型，spam_docs={} ham_docs={}", rebuilt.spam_docs, rebuilt.ham_docs)).await?;
+            match runtime.rebuild_model().await {
+                Ok(model) => {bot.send_message(message.chat.id, format!("已重新載入模型：垃圾樣本 {}，正常樣本 {}。", model.spam_docs, model.ham_docs)).await?;}
+                Err(err) => {log::warn!("model reload: {err}");bot.send_message(message.chat.id, "模型載入失敗，原有模型仍在使用。請稍後重試。").await?;}
+            }
         }
         ModerationCommand::MlRetrain => {
             require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
-            let (spam_docs, ham_docs) = runtime.retrain_from_samples().await.unwrap_or((0, 0));
-            let rebuilt = runtime.rebuild_model().await.unwrap_or_default();
+            let (spam_docs, ham_docs) = match runtime.retrain_from_samples().await {
+                Ok(counts) => counts,
+                Err(err) => {log::warn!("model retrain: {err}");bot.send_message(message.chat.id, "詞頻重算失敗，資料未變更。請稍後重試。").await?;return Ok(());}
+            };
+            let rebuilt = runtime.model.lock().await.clone();
             let summary = format!(
                 "已依目前的分詞規則重新計算全部詞頻：spam={spam_docs} ham={ham_docs}，詞彙量 {}",
                 rebuilt.spam_tokens.len() + rebuilt.ham_tokens.len()
@@ -8113,6 +8087,11 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     Ok(false) => Err("規則已再修改或刪除，請先確認目前內容。".to_string()),
                     Err(e) => Err(e.to_string()),
                 },
+                UndoData::ModelRebuilt { request_id } => match runtime.restore_model_rebuild(request_id).await {
+                    Ok(true) => Ok("已復原重算前的詞頻。".to_string()),
+                    Ok(false) => Err("模型或程式版本已變動，請先確認目前資料，不能直接覆蓋。".to_string()),
+                    Err(e) => Err(e.to_string()),
+                },
                 UndoData::RuleDeleted { pattern, description } => match runtime.add_spam_rule(&pattern, &description).await {
                     Ok(new_id) => Ok(format!("已重新建立規則（新 ID：@{new_id}，原規則 ID 無法保留）。")),
                     Err(e) => Err(e.to_string()),
@@ -8966,6 +8945,7 @@ mod tests {
     mod case_thresholds;
     mod host_rules;
     mod host_model;
+    mod model_rebuild;
     mod captcha;
     mod edited_messages;
     mod notices;

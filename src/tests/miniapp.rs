@@ -186,6 +186,115 @@ async fn group_admin_can_edit_ot_text_but_cannot_save_after_revocation() {
 }
 
 #[tokio::test]
+async fn model_rebuild_api_keeps_host_scope_and_replays_the_committed_result() {
+    let api = TestApi::new().await;
+    let group = api.login(HOST_ID, -100).await;
+    for method in [reqwest::Method::POST, reqwest::Method::PATCH] {
+        assert_eq!(
+            api.request(method, "/api/host/model/rebuild")
+                .bearer_auth(&group)
+                .body("{}")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+    }
+    let link = api.service.host_link(HOST_ID).await.unwrap();
+    let launch = link
+        .query_pairs()
+        .find(|(k, _)| k == "startapp")
+        .unwrap()
+        .1
+        .into_owned();
+    let session: serde_json::Value = api
+        .login_raw(&signed(
+            &api.runtime.config.bot_token,
+            HOST_ID,
+            &launch,
+            Utc::now().timestamp(),
+        ))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let token = session["token"].as_str().unwrap();
+    assert_eq!(
+        api.request(reqwest::Method::POST, "/api/host/model/rebuild")
+            .bearer_auth(token)
+            .body("{\"actor_id\":200}")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    let mut revision = String::new();
+    loop {
+        let response = api
+            .request(reqwest::Method::POST, "/api/host/model/rebuild")
+            .bearer_auth(token)
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        if response.status() == 429 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            continue;
+        }
+        assert_eq!(response.status(), 200);
+        let preview: serde_json::Value = response.json().await.unwrap();
+        revision.push_str(preview["revision"].as_str().unwrap());
+        break;
+    }
+    let payload =
+        serde_json::json!({"request_id":Uuid::new_v4().to_string(),"expected_revision":revision});
+    let mut saved = None;
+    for _ in 0..2 {
+        loop {
+            let response = api
+                .request(reqwest::Method::PATCH, "/api/host/model/rebuild")
+                .bearer_auth(token)
+                .json(&payload)
+                .send()
+                .await
+                .unwrap();
+            if response.status() == 429 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                continue;
+            }
+            assert_eq!(response.status(), 200);
+            let result: serde_json::Value = response.json().await.unwrap();
+            if let Some(previous) = &saved {
+                assert_eq!(previous, &result);
+            }
+            saved = Some(result);
+            break;
+        }
+    }
+    let mut forged = payload;
+    forged["actor_id"] = serde_json::json!(HOST_ID);
+    assert_eq!(
+        api.request(reqwest::Method::PATCH, "/api/host/model/rebuild")
+            .bearer_auth(token)
+            .json(&forged)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    assert!(api
+        .telegram
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(m, _)| m != "banchatmember" && m != "sendmessage"));
+}
+
+#[tokio::test]
 async fn model_checks_require_host_scope_and_do_not_call_telegram() {
     let api = TestApi::new().await;
     let group = api.login(HOST_ID, -100).await;

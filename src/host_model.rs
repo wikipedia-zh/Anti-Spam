@@ -2,7 +2,7 @@ use super::*;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-static MODEL_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+pub(super) static MODEL_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 const MAX_ROWS: i64 = 20_000;
 const MAX_BYTES: i64 = 16 * 1024 * 1024;
 const MAX_SAMPLE_BYTES: i64 = 64 * 1024;

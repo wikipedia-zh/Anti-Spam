@@ -104,7 +104,7 @@
     if(view==='groups'&&filter==='overrides')root.append(element('p',t('overrides'),'host-note'),button(t('clearFilters'),()=>{resetFilters();load();}));
     if(view==='model'){
       root.append(button(t('refresh'),load));
-      if(data){const page=element('div');root.append(page);window.SPBModelPage.mount(page,data,{request,language:lang,onAuthError:fail,onGroups:()=>{view='groups';resetFilters();filter='overrides';load();}});}
+      if(data){const page=element('div');root.append(page);window.SPBModelPage.mount(page,data,{request,language:lang,onAuthError:fail,onSaved:load,onGroups:()=>{view='groups';resetFilters();filter='overrides';load();}});}
       return;
     }
     const dates={};const form=element('form',undefined,'host-tools');form.addEventListener('submit',event=>{event.preventDefault();if(!busy){const from=dateBoundary(dates.fromDate?.value),before=dateBoundary(dates.throughDate?.value,true);if((from!==null&&!Number.isFinite(from))||(before!==null&&!Number.isFinite(before))||(from!==null&&before!==null&&from>=before)){dates.throughDate?.setCustomValidity(t('invalid_request'));dates.throughDate?.reportValidity();return;}search=input.value.trim();filter=resultSelect?.value??filter;fromDate=dates.fromDate?.value||'';throughDate=dates.throughDate?.value||'';createdFrom=from;createdBefore=before;offset=0;load();}});
@@ -156,10 +156,10 @@
   function editRule(ruleId){window.SPBRuleEditor.open({request,language:lang,ruleId,onAuthError:fail,onSaved:load});}
   async function prepareGroup(chatId){if(busy||closed)return;busy=true;error='';groupLink=null;render();try{const result=await request('host-group-link','POST',{chat_id:chatId});const url=new URL(result.url);if(url.protocol!=='https:'||url.hostname!=='t.me'||url.username||url.password)throw new Error('temporarily_unavailable');groupLink={chat_id:chatId,url:url.href};}catch(e){fail(e);}finally{busy=false;render();}}
   async function load(){if(busy||closed)return;busy=true;error='';data=null;groupLink=null;window.SPBModelPage.reset();render();try{data=await (view==='model'?request('host-model','POST',{action:'summary'}):request('host-query','POST',{view,search,filter,offset,created_from:createdFrom,created_before:createdBefore}));}catch(e){fail(e);}finally{busy=false;render();}}
-  function fail(e){error=Object.hasOwn(words.en,e.message)?e.message:'temporarily_unavailable';if(['session_expired','forbidden'].includes(error)){closed=true;data=null;clearToken?.();window.SPBRoleEditor.expire();window.SPBCasePanel.expire();window.SPBRuleEditor.expire();window.SPBModelPage.reset();}render();}
-  async function logout(){if(busy||closed)return;busy=true;render();try{await request('logout','POST',{});closed=true;data=null;clearToken();window.SPBModelPage.reset();error='signedOut';}catch(e){fail(e);}finally{busy=false;render();}}
+  function fail(e){error=Object.hasOwn(words.en,e.message)?e.message:'temporarily_unavailable';if(['session_expired','forbidden'].includes(error)){closed=true;data=null;clearToken?.();window.SPBRoleEditor.expire();window.SPBCasePanel.expire();window.SPBRuleEditor.expire();window.SPBModelRebuild.expire();window.SPBModelPage.reset();}render();}
+  async function logout(){if(busy||closed)return;busy=true;render();try{await request('logout','POST',{});closed=true;data=null;clearToken();window.SPBModelRebuild.expire();window.SPBModelPage.reset();error='signedOut';}catch(e){fail(e);}finally{busy=false;render();}}
   window.SPBHost={
     async start(api,language,clear){request=api;lang=language;clearToken=clear;document.body.classList.add('host-mode');root=document.querySelector('main');document.getElementById('save-bar').hidden=true;await load();},
-    setLanguage(language){lang=language;render();window.SPBRoleEditor.setLanguage(language);window.SPBCasePanel.setLanguage(language);window.SPBRuleEditor.setLanguage(language);},fail
+    setLanguage(language){lang=language;render();window.SPBRoleEditor.setLanguage(language);window.SPBCasePanel.setLanguage(language);window.SPBRuleEditor.setLanguage(language);window.SPBModelRebuild.setLanguage(language);},fail
   };
 })();

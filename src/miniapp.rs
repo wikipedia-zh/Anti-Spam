@@ -719,6 +719,68 @@ async fn test_host_rule(
     )
 }
 
+fn rebuild_response(
+    outcome: model_rebuild::Outcome,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    match outcome {
+        model_rebuild::Outcome::Saved(value) => Ok(Json(value)),
+        model_rebuild::Outcome::Invalid => {
+            Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"))
+        }
+        model_rebuild::Outcome::Forbidden => Err(forbidden()),
+        model_rebuild::Outcome::Busy => {
+            Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "rate_limited"))
+        }
+        model_rebuild::Outcome::Conflict => Err(ApiError(StatusCode::CONFLICT, "settings_changed")),
+        model_rebuild::Outcome::TooLarge => {
+            Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE, "model_too_large"))
+        }
+    }
+}
+
+async fn preview_model_rebuild(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    payload: std::result::Result<
+        Json<model_rebuild::Preview>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let grant = session(&api, &headers).await?;
+    if grant.scope != Scope::Host || !is_host(grant.user_id) {
+        return Err(forbidden());
+    }
+    let _ = payload.map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    rebuild_response(
+        api.runtime
+            .preview_model_rebuild(grant.user_id)
+            .await
+            .map_err(storage_error)?,
+    )
+}
+
+async fn save_model_rebuild(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    payload: std::result::Result<
+        Json<model_rebuild::Patch>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let grant = session(&api, &headers).await?;
+    if grant.scope != Scope::Host || !is_host(grant.user_id) {
+        return Err(forbidden());
+    }
+    let Json(request) =
+        payload.map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    rebuild_response(
+        api.runtime
+            .save_model_rebuild(grant.user_id, request)
+            .await
+            .map_err(storage_error)?,
+    )
+}
+
 async fn host_model(
     State(api): State<Api>,
     headers: HeaderMap,
@@ -817,6 +879,10 @@ pub(super) fn router(api: Api) -> Router {
         .route("/api/host/rule", post(read_host_rule).patch(save_host_rule))
         .route("/api/host/rule/test", post(test_host_rule))
         .route("/api/host/model", post(host_model))
+        .route(
+            "/api/host/model/rebuild",
+            post(preview_model_rebuild).patch(save_model_rebuild),
+        )
         .route(
             "/api/groups/current/settings",
             get(read_settings).patch(save_settings),
