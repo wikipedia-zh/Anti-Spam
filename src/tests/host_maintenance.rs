@@ -28,7 +28,7 @@ fn maintenance_report_requires_matching_backup_upgrade_and_restore_files() {
     std::fs::write(&manifest, record.to_string()).unwrap();
     let v = crate::host_maintenance::read_report(&db);
     assert_eq!(v["status"], "verified");
-    assert_eq!(v["schema_after"], 40);
+    assert_eq!(v["schema_after"], 41);
     assert!(v.get("backup").is_none());
     let correct = record.clone();
     for invalid in [
@@ -84,5 +84,5 @@ async fn maintenance_snapshot_does_not_infer_worker_health_from_a_database_read(
     assert_eq!(v["worker_health"], "unknown");
     assert_eq!(v["backup"]["status"], "missing");
     assert_eq!(v["groups"]["left"], 1);
-    assert_eq!(v["schema"], 40);
+    assert_eq!(v["schema"], 41);
 }

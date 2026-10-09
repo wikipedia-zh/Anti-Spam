@@ -354,7 +354,7 @@ fn retry_migration_preserves_existing_data_and_restores() {
         serde_json::to_value(crate::maintenance::check_upgrade(&db, &dir.join("check")).unwrap())
             .unwrap();
     assert_eq!(result["schema_before"], 39);
-    assert_eq!(result["schema_after"], 40);
+    assert_eq!(result["schema_after"], 41);
     assert_eq!(result["restore"], "ok");
 }
 

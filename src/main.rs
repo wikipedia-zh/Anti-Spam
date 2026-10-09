@@ -26,6 +26,7 @@ mod case_thresholds;
 mod host_rules;
 mod host_model;
 mod model_rebuild;
+mod tokenizer_upgrade;
 mod role_updates;
 use origin_retry::execute_auto_ban;
 use reliability::{passes_threshold, stable_probability};
@@ -787,6 +788,9 @@ impl Runtime {
         }
         if user_version < 40 {
             Self::migrate_v39_to_v40(conn)?;
+        }
+        if user_version < 41 {
+            Self::migrate_v40_to_v41(conn)?;
         }
         Ok(())
     }
@@ -3151,9 +3155,6 @@ impl Runtime {
 
     async fn inspect_message(&self, _display_name: &str, text: &str) -> Result<InspectionResult> {
         let rules = self.spam_rules.read().await;
-        if tokenize(text).is_empty() {
-            return Ok(InspectionResult::Ham { score: 0.0 });
-        }
         for rule in rules.iter() {
             if regex_is_match(&rule.regex, text) {
                 return Ok(InspectionResult::Spam {
@@ -3500,7 +3501,10 @@ fn normalize_tokens(text: &str, jieba: &Jieba) -> Vec<String> {
         .cut(&cleaned, false)
         .into_iter()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && s.chars().count() > 1)
+        // A single character can be a word, especially with Jieba's HMM
+        // disabled. Dropping these made whole Chinese messages disappear
+        // from both training and scoring. Discard symbols, not short words.
+        .filter(|s| s.chars().count() > 1 || s.chars().any(char::is_alphanumeric))
         .collect()
 }
 
@@ -8947,6 +8951,7 @@ mod tests {
     mod origin_retry;
     mod guest_delivery;
     mod model_updates;
+    mod tokenizer_upgrade;
     mod moderation_queue;
     mod restriction_retry;
     mod queue_status;
@@ -11112,5 +11117,3 @@ mod tests {
         assert_eq!(reply.from.as_ref().unwrap().id.0, 999);
     }
 }
-
-

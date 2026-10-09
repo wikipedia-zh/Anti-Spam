@@ -53,7 +53,7 @@ fn conflicting_labels_and_empty_features_are_not_silently_scored() {
         },
         Sample {
             label: "ham".into(),
-            text: "! ? 1 a".into(),
+            text: "! ? 🎉".into(),
         },
         Sample {
             label: "unknown".into(),

@@ -123,9 +123,39 @@ pub(super) fn check_upgrade(source: &Path, output: &Path) -> Result<UpgradeCheck
         after == target_version,
         "migration did not reach the current schema"
     );
+    // v41 intentionally adds lost tokens and skipped reviewed samples. Build
+    // the expected model-only delta on a separate in-memory copy; every other
+    // table must still match the original snapshot byte for byte. This also
+    // catches model changes made by any migration other than the repair.
+    let expected_model = if before < 41 {
+        let mut copy = Connection::open_in_memory()?;
+        copy.restore(
+            DatabaseName::Main,
+            output.join("snapshot.db"),
+            None::<fn(rusqlite::backup::Progress)>,
+        )?;
+        if before < 18 {
+            Runtime::migrate_v17_to_v18(&mut copy)?;
+        }
+        Runtime::migrate_v40_to_v41(&mut copy)?;
+        Some(copy)
+    } else {
+        None
+    };
     for (table, columns, hash) in &expected {
+        let repaired_hash = if matches!(
+            table.as_str(),
+            "word_frequencies" | "training_samples" | "model_meta" | "model_revision"
+        ) {
+            expected_model
+                .as_ref()
+                .map(|copy| fingerprint(copy, table, columns))
+                .transpose()?
+        } else {
+            None
+        };
         anyhow::ensure!(
-            fingerprint(&upgraded, table, columns)? == *hash,
+            fingerprint(&upgraded, table, columns)? == *repaired_hash.as_ref().unwrap_or(hash),
             "migration changed existing data in {table}"
         );
     }
