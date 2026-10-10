@@ -4115,7 +4115,7 @@ fn chinese_case_action(case: &CaseRecord) -> String {
     match case.action {
         ActionKind::AutoDelete => "自動刪除".to_string(),
         ActionKind::AutoBan => "自動封禁".to_string(),
-        ActionKind::SpamBan if case.status == "force_approved" => "封禁（/sb -f 直接核准）".to_string(),
+        ActionKind::SpamBan if case.status == "force_approved" => "逕行封禁".to_string(),
         ActionKind::SpamBan => "封禁".to_string(),
         ActionKind::Mute => "禁言".to_string(),
         ActionKind::Kick => "踢出".to_string(),
