@@ -167,12 +167,10 @@ async fn attempt(bot: &Bot, runtime: &Runtime, chat: i64, message: i32, user: i6
     }
     // Permissions may have changed since the ban was sent. A failed lookup
     // must not be treated as proof that the member is safe to moderate.
-    match api(bot
-        .get_chat_member(ChatId(chat), UserId(user as u64))
-        .into_future())
+    match api(sender_targets::protected(bot, ChatId(chat), user))
     .await
     {
-        Ok(member) if member.kind.is_privileged() => {
+        Ok(true) => {
             return update(runtime, &job, "cancelled", None, guard).await
         }
         Ok(_) => {}

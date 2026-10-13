@@ -432,13 +432,7 @@ async fn ban_pending(
         .save_origin_job(job, "pending", guards.clone())
         .await?;
     let mut limited = false;
-    match api(async {
-        bot.ban_chat_member(
-            ChatId(job.case.chat_id),
-            UserId(job.case.target_user_id as u64),
-        )
-        .await
-    })
+    match api(sender_targets::ban(bot, ChatId(job.case.chat_id), job.case.target_user_id))
     .await
     {
         Ok(_) => {
@@ -529,6 +523,15 @@ pub(super) async fn attempt_origin_ban(
                         .await?));
         let admin = if exempt {
             true
+        } else if job.case.target_user_id < 0 {
+            match api(sender_targets::protected(bot, ChatId(job.case.chat_id), job.case.target_user_id)).await {
+                Ok(protected) => protected,
+                Err(err) => {
+                    record_error(runtime, &mut job, "check_sender_chat", &err).await?;
+                    runtime.save_origin_job(&job, "pending", guards).await?;
+                    return Ok(false);
+                }
+            }
         } else {
             match api(async {
                 bot.get_chat_member(

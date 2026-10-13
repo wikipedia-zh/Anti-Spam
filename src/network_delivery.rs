@@ -235,13 +235,10 @@ pub(super) async fn deliver_network_bans(
                 .await?;
             continue;
         }
-        match tokio::time::timeout(Duration::from_secs(30), async {
-            bot.get_chat_member(ChatId(chat_id), UserId(user_id as u64))
-                .await
-        })
+        match tokio::time::timeout(Duration::from_secs(30), sender_targets::protected(bot, ChatId(chat_id), user_id))
         .await
         {
-            Ok(Ok(member)) if member.kind.is_privileged() => {
+            Ok(Ok(true)) => {
                 runtime
                     .cancel_network_delivery(&case_id, chat_id, previously_uncertain)
                     .await?;
@@ -265,8 +262,8 @@ pub(super) async fn deliver_network_bans(
                 continue;
             }
         }
-        let request = bot.ban_chat_member(ChatId(chat_id), UserId(user_id as u64));
-        match tokio::time::timeout(Duration::from_secs(30), async { request.await }).await {
+        let request = sender_targets::ban(bot, ChatId(chat_id), user_id);
+        match tokio::time::timeout(Duration::from_secs(30), request).await {
             Ok(Ok(_)) => runtime.finish_network_delivery(&case_id, chat_id).await?,
             Ok(Err(teloxide::RequestError::RetryAfter(delay))) => {
                 runtime.delay_telegram_queue(delay.seconds()).await?;

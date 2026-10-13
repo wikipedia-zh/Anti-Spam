@@ -226,10 +226,8 @@ async fn apply_reversal(
         {
             retained += 1;
         } else {
-            let request = bot
-                .unban_chat_member(ChatId(chat_id), UserId(case.target_user_id as u64))
-                .only_if_banned(true);
-            match tokio::time::timeout(Duration::from_secs(30), async { request.await }).await {
+            let request = sender_targets::unban(bot, ChatId(chat_id), case.target_user_id, true);
+            match tokio::time::timeout(Duration::from_secs(30), request).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(teloxide::RequestError::RetryAfter(delay))) => {
                     runtime

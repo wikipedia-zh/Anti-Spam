@@ -15,6 +15,7 @@ mod queue_status;
 mod queue_admin;
 mod host_maintenance;
 mod report_delivery;
+mod sender_targets;
 mod maintenance;
 mod warning_queue;
 mod rule_updates;
@@ -7831,13 +7832,13 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 // that judgment call (was this actually a false positive?)
                 // needs someone with visibility across the whole project,
                 // not just this one group.
-                let target_user_id = if let Some(target_msg) = real_reply(&message) {
-                    target_msg.from.as_ref().map(|u| u.id.0 as i64)
+                let target_user_id = if real_reply(&message).is_some() {
+                    sender_targets::reply_context(&message).ok().map(|(id, _, _, _)| id)
                 } else {
                     arg.trim().parse::<i64>().ok()
                 };
                 let Some(target_user_id) = target_user_id else {
-                    reply_ephemeral(&bot, &message, "請回覆要解封的用戶，或提供 user_id。").await?;
+                    reply_ephemeral(&bot, &message, "請回覆要解封的用戶或頻道訊息，或提供對象 ID。").await?;
                     return Ok(());
                 };
                 if runtime.find_active_project_ban(target_user_id).await.unwrap_or(None).is_some() {
@@ -7845,7 +7846,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     alert_project_ban_bypass_attempt(&bot, &runtime, from_id, &short_user(from), message.chat.id.0, target_user_id, "/unban（群組管理員）").await;
                     return Ok(());
                 }
-                if let Err(err) = bot.unban_chat_member(message.chat.id, UserId(target_user_id as u64)).await {
+                if let Err(err) = sender_targets::unban(&bot, message.chat.id, target_user_id, false).await {
                     let Some(reason) = unban_noop_reason(&err) else {
                         bot.send_message(message.chat.id, format!("解封失敗：{err}")).await?;
                         return Ok(());
@@ -7865,7 +7866,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                     )
                     .parse_mode(ParseMode::Html)
                     .await;
-                bot.send_message(message.chat.id, format!("已在本群解封用戶 <code>{target_user_id}</code>。")).parse_mode(ParseMode::Html).await?;
+                bot.send_message(message.chat.id, format!("已在本群解封對象 <code>{target_user_id}</code>。")).parse_mode(ParseMode::Html).await?;
                 return Ok(());
             }
 
@@ -7877,8 +7878,8 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             // manually by another admin, by a different bot, or from before
             // this project was even involved - so unbanning can't depend on a
             // case existing at all.
-            let resolved = if let Some(target_msg) = real_reply(&message) {
-                target_msg.from.as_ref().map(|u| (message.chat.id.0, u.id.0 as i64, None::<CaseRecord>))
+            let resolved = if real_reply(&message).is_some() {
+                sender_targets::reply_context(&message).ok().map(|(id, _, _, _)| (message.chat.id.0, id, None::<CaseRecord>))
             } else if let Ok(user_id) = arg.trim().parse::<i64>() {
                 Some((message.chat.id.0, user_id, None))
             } else if !arg.trim().is_empty() {
@@ -7891,7 +7892,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             };
 
             let Some((chat_id, target_user_id, case_from_id)) = resolved else {
-                bot.send_message(message.chat.id, "請回覆要解封的用戶、提供 user_id，或提供 case_id。例如 /unban 123456789。").await?;
+                bot.send_message(message.chat.id, "請回覆要解封的用戶或頻道訊息、提供對象 ID，或提供 case_id。例如 /unban 123456789。").await?;
                 return Ok(());
             };
 
@@ -7910,7 +7911,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             if active.is_empty() {
                 // No case this project tracks - just lift a raw Telegram ban
                 // in the resolved chat.
-                if let Err(err) = bot.unban_chat_member(ChatId(chat_id), UserId(target_user_id as u64)).await {
+                if let Err(err) = sender_targets::unban(&bot, ChatId(chat_id), target_user_id, false).await {
                     let Some(reason) = unban_noop_reason(&err) else {
                         bot.send_message(message.chat.id, format!("解封失敗：{err}")).await?;
                         return Ok(());
@@ -7920,7 +7921,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 }
                 bot.send_message(
                     message.chat.id,
-                    format!("已在本群解封用戶 <code>{target_user_id}</code>。（找不到本專案的封禁記錄，沒有訓練樣本需要清除）"),
+                    format!("已在本群解封對象 <code>{target_user_id}</code>。（找不到本專案的封禁記錄，沒有訓練樣本需要清除）"),
                 )
                 .parse_mode(ParseMode::Html)
                 .await?;
@@ -7937,9 +7938,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
                 }
             }
             let reply = if errors.is_empty() {
-                format!("已解封用戶 <code>{target_user_id}</code>，撤銷 {reversed}/{total} 筆封禁案例並清除對應訓練樣本，同時移出跨群組黑名單。")
+                format!("已解封對象 <code>{target_user_id}</code>，撤銷 {reversed}/{total} 筆封禁案例並清除對應訓練樣本，同時移出跨群組黑名單。")
             } else {
-                format!("用戶 <code>{target_user_id}</code> 的撤銷尚未完成，已完成 {reversed}/{total} 筆案例。\n{}", escape_html(&errors.join("；")))
+                format!("對象 <code>{target_user_id}</code> 的撤銷尚未完成，已完成 {reversed}/{total} 筆案例。\n{}", escape_html(&errors.join("；")))
             };
             bot.send_message(message.chat.id, reply).parse_mode(ParseMode::Html).await?;
         }
@@ -8959,6 +8960,7 @@ mod tests {
     mod queue_admin;
     mod host_maintenance;
     mod report_delivery;
+    mod sender_targets;
     mod maintenance;
     mod warning_queue;
     mod rule_updates;

@@ -82,11 +82,12 @@ pub(super) async fn handle(bot: &Bot, runtime: &Runtime, message: &Message) -> R
     let Some(from) = message.from.as_ref() else {
         return Ok(());
     };
-    let Some((target_id, target_name, source_id, evidence_text)) =
-        extract_reply_context(message).await
-    else {
-        reply_ephemeral(bot, message, "請回覆一條疑似 spam 的訊息。").await?;
-        return Ok(());
+    let (target_id, target_name, source_id, evidence_text) = match sender_targets::reply_context(message) {
+        Ok(context) => context,
+        Err(reason) => {
+            reply_ephemeral(bot, message, reason).await?;
+            return Ok(());
+        }
     };
     let case = CaseRecord {
         id: Uuid::new_v4().to_string(),
