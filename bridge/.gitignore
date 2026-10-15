@@ -1,0 +1,8 @@
+*.session*
+*.db*
+__pycache__/
+.venv/
+config.json
+credentials.json
+preview*.json
+preview*.csv

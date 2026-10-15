@@ -1,0 +1,12 @@
+{
+  "source_db": "/data/project/YOUR_TOOL/bot.db",
+  "state_dir": "/data/project/YOUR_TOOL/hexdrill-private",
+  "destination_chat_id": -1000000000000,
+  "account_id": 0,
+  "hex_bot_id": 0,
+  "allowed_observers": [],
+  "live": false,
+  "receiver_scope_confirmed": false,
+  "credentials_file": "/data/project/YOUR_TOOL/hexdrill-private/credentials.json",
+  "session_file": "/data/project/YOUR_TOOL/hexdrill-private/bridge.session"
+}
