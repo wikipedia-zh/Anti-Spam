@@ -13,13 +13,17 @@ def configuration(path):
     config = json.loads(Path(path).read_text(encoding="utf-8"))
     required = {"source_db", "state_dir", "destination_chat_id", "account_id", "hex_bot_id",
                 "allowed_observers", "live", "receiver_scope_confirmed", "credentials_file", "session_file"}
-    if set(config) != required:
+    if not required <= set(config) or set(config) - required - {"operator_id"}:
         raise StopBridge("Unknown or missing configuration fields")
     if type(config["destination_chat_id"]) is not int or config["destination_chat_id"] >= 0:
         raise StopBridge("Set the destination's numeric group ID")
     for key in ("account_id", "hex_bot_id"):
         if type(config[key]) is not int or config[key] < 0:
             raise StopBridge("Invalid pinned Telegram identity")
+    if "operator_id" in config and (type(config["operator_id"]) is not int
+            or not 0 < config["operator_id"] < 2**52
+            or config["operator_id"] in (config["account_id"], config["hex_bot_id"])):
+        raise StopBridge("Invalid operator identity")
     if any(type(config[k]) is not bool for k in ("live", "receiver_scope_confirmed")):
         raise StopBridge("Live switches must be booleans")
     if not isinstance(config["allowed_observers"], list) or len(config["allowed_observers"]) > 3 or any(type(i) is not int or i <= 0 for i in config["allowed_observers"]):
@@ -61,9 +65,29 @@ async def telegram_command(config, command, ledger=None):
             print(json.dumps({"account_id": me.id, "hex_bot_id": bot.id, "destination_found": bool(groups)}))
             return
         transport = Telegram(client, config)
+        if command == "watch":
+            from control import Watch
+            await Watch(config, ledger, transport).run()
+            return
+        watch = None
+        if config.get("operator_id"):
+            from control import Watch
+            watch = Watch(config, ledger, transport)
         last = None
         while True:
-            result = await cycle(config, ledger, binding(config), transport, lambda: snapshot(config))
+            if watch:
+                await watch.tick()
+            if ledger.get("delivery_paused", False):
+                result = "paused; queries and alerts remain available"
+            else:
+                try:
+                    result = await cycle(config, ledger, binding(config), transport, lambda: snapshot(config))
+                except Exception:
+                    if not watch:
+                        raise
+                    with ledger.conn:
+                        ledger.put("delivery_paused", True)
+                    result = "delivery paused after error"
             if result != last:
                 print(result, flush=True)
                 last = result
@@ -87,6 +111,7 @@ def main():
     commands.add_parser("login")
     commands.add_parser("inspect")
     commands.add_parser("run")
+    commands.add_parser("watch")
     args = parser.parse_args()
     config = configuration(args.config)
     if args.command == "preview":
@@ -120,6 +145,9 @@ def main():
                 ledger.check(data, bound)
                 pending = ledger.pending()
                 print(json.dumps({"pending": {k: pending[k] for k in ("id", "state", "message_id")} if pending else None}))
+            elif args.command == "watch":
+                ledger.check(data, bound)
+                asyncio.run(telegram_command(config, "watch", ledger))
             else:
                 if not config["live"] or not config["receiver_scope_confirmed"]:
                     raise StopBridge("Sending is disabled; complete preview review and receiver permissions first")

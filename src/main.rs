@@ -12,6 +12,7 @@ mod origin_retry;
 mod moderation_queue;
 mod restriction_retry;
 mod queue_status;
+mod sync_status;
 mod queue_admin;
 mod host_maintenance;
 mod report_delivery;
@@ -3202,6 +3203,7 @@ enum ModerationCommand {
     SpamReport,
     CaseLookup(String),
     Queue(String),
+    SyncStatus(String),
     MlTrainSpam,
     MlCleanSpam,
     MlUndoCleanSpam,
@@ -3296,6 +3298,7 @@ fn parse_command(text: &str) -> ModerationCommand {
         "/spam" | "/report" => ModerationCommand::SpamReport,
         "/case" | "/lookup" => ModerationCommand::CaseLookup(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/queue" => ModerationCommand::Queue(text.split_whitespace().nth(1).unwrap_or("").to_string()),
+        "/sync" => ModerationCommand::SyncStatus(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/ml_score" | "/score" => ModerationCommand::ScoreTest(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
         "/setchat" => ModerationCommand::SetChat(text.split_whitespace().nth(1).unwrap_or("").to_string()),
         "/leave" => ModerationCommand::Leave(text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
@@ -7064,6 +7067,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         }
         ModerationCommand::Queue(case_id) => {
             queue_status::handle(&bot,&runtime,&message,&case_id).await?;
+        }
+        ModerationCommand::SyncStatus(reference) => {
+            sync_status::handle(&bot,&message,&reference).await?;
         }
         ModerationCommand::CaseLookup(case_id) => {
             match runtime.load_case_reference(&case_id).await {

@@ -108,6 +108,84 @@ class Telegram:
                 return message.id
         return None
 
+    async def reconcile(self, ledger):
+        """Observe one existing operation; this method cannot create or send one."""
+        operation = ledger.pending()
+        if not operation:
+            return
+        if not operation["message_id"]:
+            found = await self.recover(operation)
+            if not found:
+                ledger.uncertain(operation["id"])
+                return
+            ledger.sent(operation["id"], found)
+            operation = ledger.pending()
+        reply = await self.acknowledgement(operation)
+        if reply:
+            ledger.acknowledge(operation["id"], reply)
+            return
+        async for message in self.client.iter_messages(self.destination, limit=200):
+            if message.id <= operation["message_id"]:
+                break
+            if (message.chat_id == self.config["destination_chat_id"]
+                    and message.sender_id == self.config["hex_bot_id"]
+                    and message.reply_to_msg_id == operation["message_id"]
+                    and not message.fwd_from and not message.via_bot_id and not message.out
+                    and message.raw_text == "⚠️ 操作失敗，請稍後再試。"):
+                with ledger.conn:
+                    ledger.conn.execute("UPDATE operations SET state='uncertain',error='receiver_failed',reply_id=? WHERE id=?", (message.id, operation["id"]))
+                return
+        if int(time.time()) - operation["created_at"] > 120 and operation["error"] != "receiver_failed":
+            ledger.uncertain(operation["id"])
+
+    async def control_peers(self, users, group_ok):
+        me = await self.client.get_me()
+        if not me or me.bot or me.id != self.config["account_id"]:
+            raise StopBridge("Wrong Telegram account")
+        peers = {}
+        async for dialog in self.client.iter_dialogs():
+            if dialog.id in users and dialog.is_user and not getattr(dialog.entity, "bot", False):
+                peers[dialog.id] = dialog.entity
+        if group_ok:
+            peers[self.config["destination_chat_id"]] = self.destination
+            # Resolve the owner's access hash from verified membership for a first DM.
+            if self.config["operator_id"] not in peers:
+                members = await self.client.get_participants(self.destination, limit=10)
+                for member in members:
+                    if member.id == self.config["operator_id"] and not member.bot:
+                        peers[member.id] = member
+        return peers
+
+    async def control_messages(self, peer, cursor):
+        options = {"limit": 1} if cursor is None else {"limit": 50, "min_id": cursor, "reverse": True}
+        return [{"id": m.id, "actor": m.sender_id, "text": m.raw_text or "",
+                 "date": int(m.date.timestamp()),
+                 "trusted": not (m.fwd_from or m.via_bot_id or m.out or m.edit_date)}
+                async for m in self.client.iter_messages(peer, **options)]
+
+    async def send_notice(self, peer, notice):
+        from telethon import errors, functions
+        try:
+            result = await asyncio.wait_for(self.client(functions.messages.SendMessageRequest(
+                peer=await self.client.get_input_entity(peer), message=notice["body"],
+                random_id=notice["random_id"], no_webpage=True)), timeout=25)
+        except errors.FloodWaitError as error:
+            raise Flood(error.seconds) from None
+        if getattr(result, "id", None):
+            return result.id
+        for update in getattr(result, "updates", []):
+            if getattr(update, "random_id", None) == notice["random_id"]:
+                return update.id
+        raise StopBridge("Notice accepted without a message mapping")
+
+    async def recover_notice(self, peer, notice):
+        matches = [m.id async for m in self.client.iter_messages(peer, limit=100)
+                   if m.out and m.sender_id == self.config["account_id"] and not m.fwd_from
+                   and m.raw_text == notice["body"] and int(m.date.timestamp()) >= notice["created_at"] - 5]
+        if len(matches) > 1:
+            raise StopBridge("Duplicate notices; inspect the conversation")
+        return matches[0] if matches else None
+
 
 async def cycle(config, ledger, binding, transport, snapshot_reader):
     snapshot = snapshot_reader()

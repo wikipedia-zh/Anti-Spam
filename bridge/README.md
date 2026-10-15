@@ -52,3 +52,21 @@ python bridge.py --config /private/config.json run
 ```sh
 python -m unittest discover -s bridge -v
 ```
+
+## SPB-WATCH 查詢與通知
+
+在私密設定加入 `operator_id`（主持人的 Telegram 數字 ID），以 `watch` 啟動：
+
+```sh
+python bridge.py --config /private/config.json watch
+```
+
+這個模式只讀取案件、核對已送指令的回覆，以及發送查詢結果和警告，不能發送封禁或解封。與 `run` 共用 session lock，不能同時啟動。需要重新啟用同步時，先停止 watch、核對未確認紀錄及 `delivery_paused`，再由營運人員處理；聊天指令不能解除暫停。
+
+主持人可私訊 `/sudo ID` 授權查詢、`/sudo del ID` 撤權、`/sudo list` 查看名單。授權者不能再授權或操作封禁。群組成員白名單不會因此變更；獲授權者應私訊 SPB-WATCH。
+
+私訊 `/sync sync:追蹤碼`、`/sync #案件碼` 或 `/sync 使用者ID`。轉送群組改用 `/spb_sync`，避免與 SPB 重複回覆。啟動時略過既有聊天指令；重啟不重播已處理指令。轉寄、編輯及透過其他 bot 發出的指令不受理。
+
+SPB 主機器人也支援主持人在私訊用 `/sync`，需設定 `HEXDRILL_STATE_DB` 指向同步帳本。主機器人唯讀查詢報表；超過 90 秒未更新會標示舊資料。封禁成功只以 hexDrill 的有效回覆為準。
+
+未確認或失敗的操作會各通知主持人私訊及指定群組一次。群組成員無法核對時停止群組輸出，仍嘗試私訊。通知的 Telegram 發送結果不明時，只查找原訊息，不盲目重送；`watch_outbox` 保留兩個目的地的送達結果及錯誤。群組權限及來源讀取錯誤另外通知主持人。
