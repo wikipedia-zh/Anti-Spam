@@ -53,6 +53,24 @@ class Access(Fixture):
         self.ledger.uncertain(op["id"])
         return op
 
+    def test_sync_in_report_group_accepts_owner_and_sudo_only(self):
+        op = self.operation()
+        self.c.refresh()
+        query = '/sync sync:' + op['id'].replace('-', '')[:12]
+        self.c.handle(-10001, 1, 500, query)
+        with self.c.db:
+            self.c.db.execute('INSERT INTO sudo_users VALUES (600,0)')
+            self.c.advance(-10002, 0)
+        self.c.handle(-10001, 2, 600, query)
+        self.c.handle(-10001, 3, 700, query)
+        self.c.handle(-10001, 4, 500, query, trusted=False)
+        self.c.handle(-10002, 1, 500, query)
+        self.c.handle(-10001, 2, 600, query)  # Replayed command.
+        rows = self.c.db.execute("SELECT key,body FROM watch_outbox WHERE key LIKE 'reply:%' ORDER BY key").fetchall()
+        self.assertEqual([r[0] for r in rows], ['reply:-10001:1', 'reply:-10001:2'])
+        self.assertTrue(all('未確認成功' in r[1] for r in rows))
+        self.assertEqual(self.c.db.execute('SELECT count(*) FROM operations').fetchone()[0], 1)
+
     def test_lookup_reports_actual_status_and_rejects_collisions(self):
         op = self.operation()
         self.c.refresh()

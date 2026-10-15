@@ -10,7 +10,7 @@ import time
 from core import StopBridge
 from telegram_client import Flood
 
-HELP = "SPB-WATCH\n/sync sync:追蹤碼\n/sync #案件碼\n/sync 使用者ID\n/queue：查看剩餘寫入\n/queue resume：先重試一筆，成功後繼續\n群組查詢案件請用 /spb_sync，避免與 SPB 重複回覆。"
+HELP = "SPB-WATCH\n/sync sync:追蹤碼\n/sync #案件碼\n/sync 使用者ID\n/queue：查看剩餘寫入\n/queue resume：先重試一筆，成功後繼續\n報告群可使用 /sync 或 /spb_sync。"
 OWNER_HELP = "\n/sudo ID：授權查詢、清除、入群及審核\n/sudo del ID：撤權\n/sudo list：查看授權\n/purge：回覆起點訊息，刪除至最新訊息\n/join @群組或私人邀請連結\n/ignore 群組ID：停止掃描\n/ignore del 群組ID：恢復掃描\n/ignore list：查看排除名單"
 STATES = {"sending": "送出結果待確認", "sent": "已送出，等候 hexDrill 確認",
           "uncertain": "未確認成功，已停止後續封禁", "acked": "hexDrill 已確認成功",
@@ -104,7 +104,7 @@ class Control:
             command = parts[0].lower()
             if command not in ("/sync", "/spb_sync", "/sudo", "/unsudo", "/help", "/start", "/evidence", "/purge", "/join", "/ignore", "/queue"):
                 return
-            if chat < 0 and command in ("/sync", "/help", "/start"):
+            if chat < 0 and command in ("/help", "/start"):
                 return
             # A small per-actor limit also bounds replies after a large backlog.
             now = int(time.time())
@@ -169,7 +169,7 @@ class Control:
         if len(self.users()) >= 21 and not self.authorized(user):
             return "最多授權 20 人，請先移除不再需要的帳號。"
         self.db.execute("INSERT OR IGNORE INTO sudo_users VALUES (?,?)", (user, int(time.time())))
-        where = "請對方在指定群組使用 /spb_sync" if self.config.get("owner_only_private") else "請對方私訊 SPB-WATCH /help"
+        where = "請對方在指定群組使用 /sync 或 /spb_sync" if self.config.get("owner_only_private") else "請對方私訊 SPB-WATCH /help"
         return f"已授權 {user} 查詢、清除訊息、/join 入群、WATCH 案件核准及 /queue resume。{where}；/purge 可在所有群組及私訊使用。不能授權他人。"
 
     def refresh(self):

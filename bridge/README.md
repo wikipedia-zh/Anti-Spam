@@ -69,7 +69,7 @@ python bridge.py --config /private/config.json watch
 
 主持人可私訊 `/sudo ID` 授權、`/sudo del ID` 撤權、`/sudo list` 查看名單。授權包含查詢、清除訊息、入群、WATCH 案件核准及恢復佇列；授權者不能再授權他人。啟用 `owner_only_private` 時，一般查詢及佇列指令須在指定報告群使用。
 
-私訊 `/sync sync:追蹤碼`、`/sync #案件碼` 或 `/sync 使用者ID`。轉送群組改用 `/spb_sync`，避免與 SPB 重複回覆。啟動時略過既有聊天指令；重啟不重播已處理指令。轉寄、編輯及透過其他 bot 發出的指令不受理。
+私訊或指定報告群使用 `/sync sync:追蹤碼`、`/sync #案件碼` 或 `/sync 使用者ID`，也支援 `/spb_sync`。啟動時略過既有聊天指令；重啟不重播已處理指令。轉寄、編輯及透過其他 bot 發出的指令不受理。
 
 SPB 主機器人也支援主持人在私訊用 `/sync`，需設定 `HEXDRILL_STATE_DB` 指向同步帳本。主機器人唯讀查詢報表；超過 90 秒未更新會標示舊資料。封禁成功只以 hexDrill 的有效回覆為準。
 
