@@ -230,15 +230,17 @@ class Telegram:
                  "trusted": not (m.fwd_from or m.via_bot_id or m.out or m.edit_date or m.action)}
                 async for m in self.client.iter_messages(peer, **options)]
 
+    def purge_authorized(self, actor):
+        return actor == self.config['operator_id'] or (self.ledger is not None and self.ledger.conn.execute(
+            'SELECT 1 FROM sudo_users WHERE user_id=?', (actor,)).fetchone() is not None)
+
     @guarded
-    async def purge_bounds(self, peer, chat, command_id):
+    async def purge_bounds(self, peer, chat, command_id, actor):
         from telethon import utils
-        if chat not in (self.config['operator_id'], self.config['destination_chat_id']):
-            raise StopBridge("此對話不開放 /purge。")
-        if chat < 0:
-            await self.check_destination()
+        if not self.purge_authorized(actor) or not (chat < 0 or chat == actor):
+            raise StopBridge("此帳號沒有清除權限。")
         command = await self.client.get_messages(peer, ids=command_id)
-        if (not command or command.chat_id != chat or command.sender_id != self.config['operator_id']
+        if (not command or command.chat_id != chat or command.sender_id != actor
                 or command.out or command.fwd_from or command.via_bot_id or command.edit_date
                 or command.raw_text.strip() != '/purge'
                 or not 0 <= int(time.time()) - int(command.date.timestamp()) <= 120):
@@ -266,11 +268,9 @@ class Telegram:
         return [m.id for m in messages]
 
     @guarded
-    async def delete_purge_batch(self, peer, chat, ids):
-        if chat not in (self.config['operator_id'], self.config['destination_chat_id']) or not 0 < len(ids) <= 100:
+    async def delete_purge_batch(self, peer, chat, ids, actor):
+        if not self.purge_authorized(actor) or not (chat < 0 or chat == actor) or not 0 < len(ids) <= 100:
             raise StopBridge("Invalid purge batch")
-        if chat < 0:
-            await self.check_destination()
         await asyncio.wait_for(self.client.delete_messages(peer, ids, revoke=True), timeout=25)
 
     @guarded
@@ -292,10 +292,12 @@ class Telegram:
 
         async def incoming(event):
             message = event.message
+            purge_command = (message.raw_text or '').strip().split(' ', 1)[0] == '/purge' and self.purge_authorized(message.sender_id)
             if (message.chat_id > 0 and self.config.get("owner_only_private")
-                    and message.sender_id != self.config["operator_id"]):
+                    and message.sender_id != self.config["operator_id"] and not purge_command):
                 return
-            if message.chat_id != message.sender_id and message.chat_id != self.config["destination_chat_id"]:
+            if (message.chat_id != message.sender_id and message.chat_id != self.config["destination_chat_id"]
+                    and not (purge_command and message.chat_id < 0)):
                 return
             if message.fwd_from or message.via_bot_id or message.out or message.edit_date or message.action:
                 return

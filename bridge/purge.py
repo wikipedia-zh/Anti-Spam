@@ -1,4 +1,4 @@
-"""Owner-requested deletion of a fixed message range."""
+"""Authorized deletion of a fixed message range."""
 import time
 
 from core import StopBridge
@@ -25,8 +25,8 @@ def interrupted(control):
 
 
 def request(control, chat, message_id, actor):
-    if actor != control.owner:
-        return "只有主持人可以使用 /purge。"
+    if not control.authorized(actor):
+        return "只有主持人及授權人員可以使用 /purge。"
     if control.db.execute("SELECT 1 FROM purge_jobs WHERE state IN ('queued','running') LIMIT 1").fetchone():
         return "上一項清除工作尚未完成。"
     control.db.execute("INSERT OR IGNORE INTO purge_jobs(chat_id,command_id,actor,created_at) VALUES (?,?,?,?)",
@@ -39,8 +39,6 @@ async def run(control, transport, peers):
     if row is None or row['chat_id'] not in peers:
         return
     chat, command = row['chat_id'], row['command_id']
-    if row['actor'] != control.owner or chat not in (control.owner, control.config['destination_chat_id']):
-        raise StopBridge("Invalid purge destination or actor")
     with control.db:
         claimed = control.db.execute("UPDATE purge_jobs SET state='running' WHERE chat_id=? AND command_id=? AND state='queued'",
                                      (chat, command)).rowcount
@@ -48,7 +46,9 @@ async def run(control, transport, peers):
         return
     peer, deleted = peers[chat], 0
     try:
-        start, end = await transport.purge_bounds(peer, chat, command)
+        if not control.authorized(row['actor']) or not (chat < 0 or chat == row['actor']):
+            raise StopBridge("清除權限已撤銷。")
+        start, end = await transport.purge_bounds(peer, chat, command, row['actor'])
         with control.db:
             control.db.execute("UPDATE purge_jobs SET start_id=?,end_id=? WHERE chat_id=? AND command_id=?",
                                (start, end, chat, command))
@@ -59,7 +59,9 @@ async def run(control, transport, peers):
                 break
             if len(ids) > 100 or any(not cursor < value <= end for value in ids):
                 raise StopBridge("Invalid purge batch")
-            await transport.delete_purge_batch(peer, chat, ids)
+            if not control.authorized(row['actor']):
+                raise StopBridge("清除權限已撤銷。")
+            await transport.delete_purge_batch(peer, chat, ids, row['actor'])
             deleted += len(ids)
             cursor = max(ids)
             with control.db:
@@ -76,4 +78,4 @@ async def run(control, transport, peers):
         body = f"⚠️ 清除已停止，已確認刪除 {deleted} 則。\n{reason}"
     with control.db:
         control.db.execute("UPDATE purge_jobs SET state=?,error=? WHERE chat_id=? AND command_id=?", (state, error, chat, command))
-        control.enqueue(f"purge:{chat}:{command}", chat, body, control.owner)
+        control.enqueue(f"purge:{chat}:{command}", chat, body, row['actor'])

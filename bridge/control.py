@@ -11,7 +11,7 @@ from core import StopBridge
 from telegram_client import Flood
 
 HELP = "SPB-WATCH\n/sync sync:追蹤碼\n/sync #案件碼\n/sync 使用者ID\n群組請用 /spb_sync，避免與 SPB 重複回覆。"
-OWNER_HELP = "\n/sudo ID：授權查詢\n/sudo del ID：撤權\n/sudo list：查看授權\n/purge：回覆起點訊息，刪除至最新訊息"
+OWNER_HELP = "\n/sudo ID：授權查詢及清除訊息\n/sudo del ID：撤權\n/sudo list：查看授權\n/purge：回覆起點訊息，刪除至最新訊息"
 STATES = {"sending": "送出結果待確認", "sent": "已送出，等候 hexDrill 確認",
           "uncertain": "未確認成功，已停止後續封禁", "acked": "hexDrill 已確認成功",
           "cancelled": "已取消這次嘗試", "rejected": "已拒絕"}
@@ -90,9 +90,10 @@ class Control:
             if cursor is None or message_id <= cursor:
                 return
             self.advance(chat, message_id)
+            purge_command = text.strip().split(' ', 1)[0] == '/purge'
             if (not trusted or not self.authorized(actor)
-                    or (chat > 0 and self.config.get("owner_only_private") and actor != self.owner)
-                    or (chat != actor and chat != self.config["destination_chat_id"])):
+                    or (chat > 0 and self.config.get("owner_only_private") and actor != self.owner and not purge_command)
+                    or (chat != actor and chat != self.config["destination_chat_id"] and not (purge_command and chat < 0))):
                 return
             parts = text.strip().split()
             if not parts or len(text) > 160:
@@ -133,7 +134,8 @@ class Control:
                         body = "⚠️ 資料未能更新，以下為上次讀取結果。\n" + body
                 except ValueError as error:
                     body = str(error)
-            self.enqueue(f"reply:{chat}:{message_id}", chat, body, actor)
+            prefix = 'purge' if command == '/purge' else 'reply'
+            self.enqueue(f"{prefix}:{chat}:{message_id}", chat, body, actor)
 
     def sudo(self, parts):
         if parts == ["/sudo", "list"]:
@@ -154,7 +156,7 @@ class Control:
             return "最多授權 20 人，請先移除不再需要的帳號。"
         self.db.execute("INSERT OR IGNORE INTO sudo_users VALUES (?,?)", (user, int(time.time())))
         where = "請對方在指定群組使用 /spb_sync" if self.config.get("owner_only_private") else "請對方私訊 SPB-WATCH /help"
-        return f"已授權 {user} 查詢。{where}；不能授權他人或操作封禁。"
+        return f"已授權 {user} 查詢及清除訊息。{where}；/purge 可在所有群組及私訊使用。不能授權他人或操作封禁。"
 
     def refresh(self):
         # Read all related cases in one source transaction; never open it for writes.
@@ -219,9 +221,10 @@ class Watch:
 
     async def incoming(self, chat, message_id, actor, text, peer, date=None):
         c = self.control
-        if chat > 0 and c.config.get("owner_only_private") and actor != c.owner:
+        purge_command = text.strip().split(' ', 1)[0] == '/purge' and c.authorized(actor)
+        if chat > 0 and c.config.get("owner_only_private") and actor != c.owner and not purge_command:
             return
-        if chat != actor and chat != c.config["destination_chat_id"]:
+        if chat != actor and chat != c.config["destination_chat_id"] and not (purge_command and chat < 0):
             return
         if not c.authorized(actor) and not (chat == actor and c.config.get("dm_enabled")):
             return
@@ -236,7 +239,7 @@ class Watch:
         if hasattr(self.transport, "remember_peer"):
             self.transport.remember_peer(chat, peer)
         try:
-            if chat < 0:
+            if chat < 0 and not purge_command:
                 await self.transport.check_destination()
             if c.cursor(chat) is None:
                 with c.db:
@@ -344,8 +347,9 @@ class Watch:
         c, t = self.control, self.transport
         rows = c.db.execute("SELECT * FROM watch_outbox WHERE state IN ('queued','sending') AND next_at<=? AND (? IS NULL OR key=?) ORDER BY created_at,key LIMIT 20", (int(time.time()), key, key)).fetchall()
         for row in rows:
+            purge_notice = row['key'].startswith('purge:')
             if (c.config.get("owner_only_private") and row["chat_id"] > 0
-                    and row["chat_id"] != c.owner):
+                    and row["chat_id"] != c.owner and not purge_notice):
                 with c.db:
                     c.db.execute("UPDATE watch_outbox SET state='cancelled' WHERE key=?", (row["key"],))
                 continue
@@ -357,7 +361,7 @@ class Watch:
             if peer is None:
                 continue
             try:
-                if row["chat_id"] < 0:
+                if row["chat_id"] < 0 and not purge_notice:
                     await t.check_destination()
                 if row["state"] == "sending":
                     message_id = await t.recover_notice(peer, row)
