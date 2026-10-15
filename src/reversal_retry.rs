@@ -276,7 +276,7 @@ async fn apply_reversal(
         let _ = notify_group(bot, runtime, &case, id, "<b>封禁案例已撤銷</b>").await;
     }
     broadcast_unban_if_fully_clear(bot, runtime, case.target_user_id).await;
-    Ok(format!("已撤銷 case <code>{}</code>、移除 {removed} 筆訓練樣本；{retained} 個群組因其他有效案件而保留限制。", case.id))
+    Ok(format!("已撤銷案例 <code>{}</code>、移除 {removed} 筆訓練樣本；{retained} 個群組因其他有效案件而保留限制。", case_ids::display(&case.id)))
 }
 
 pub(super) async fn retry_due_reversals(bot: &Bot, runtime: &Runtime) -> Result<usize> {

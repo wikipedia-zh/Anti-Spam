@@ -257,6 +257,9 @@ fn snapshot(conn: &Connection, target: &Target, config: &Config) -> Result<Optio
                 .as_bytes()
         )
     ));
+    if let Some(id) = summary["case_id"].as_str() {
+        summary["short_case_id"] = json!(case_ids::display(id));
+    }
     summary["target"] = serde_json::to_value(target)?;
     summary.as_object_mut().unwrap().remove("job_key");
     summary["membership_state"] = json!(access.0);

@@ -238,7 +238,7 @@ fn details(conn: &Connection, case: &CaseRecord, offset: u32) -> Result<Value> {
         ))?);
     }
     Ok(
-        json!({"case":{"id":case.id,"action":case.action.as_str(),"chat_id":case.chat_id,
+        json!({"case":{"id":case.id,"short_id":case_ids::display(&case.id),"action":case.action.as_str(),"chat_id":case.chat_id,
         "target_user_id":case.target_user_id,"target_name":case.target_name,"status":case.status,
         "evidence":case.evidence_text,"reason":case.matched_rule_pattern,"model_score":case.model_score,
         "netban_eligible":eligible,"created_at":case.created_at},
@@ -290,7 +290,10 @@ impl Runtime {
         config.hostctl_secret = self.hostctl_secret().await;
         self.with_conn(move |conn| {
             let tx = conn.transaction()?;
-            let Some(case) = load(&tx, &query.case_id)? else {
+            let Some(id) = case_ids::resolve(&tx, &query.case_id)? else {
+                return Ok(None);
+            };
+            let Some(case) = load(&tx, &id)? else {
                 return Ok(None);
             };
             let mut data = details(&tx, &case, query.offset)?;

@@ -24,6 +24,7 @@ mod host_panel;
 mod host_cases;
 mod review_decisions;
 mod case_thresholds;
+mod case_ids;
 mod host_rules;
 mod host_model;
 mod model_rebuild;
@@ -3692,6 +3693,7 @@ fn help_text() -> String {
         "\n<b>━━ 所有人 ━━</b>\n",
         "<code>/spam</code> 回覆可疑訊息提交舉報\n",
         "<code>/case &lt;ID&gt;</code> 查詢封禁記錄\n",
+        "ID 可用 #8碼或完整編號\n",
         "<code>/whois &lt;user_id&gt;</code> 查詢某人的完整紀錄\n",
         "· 身分、封禁次數、跨群組黑名單等\n",
         "<code>/id</code> 取得自己的 User ID\n",
@@ -4625,6 +4627,7 @@ async fn notify_group(bot: &Bot, runtime: &Runtime, case: &CaseRecord, log_messa
 
 /// Announces a project ban and its exemption policy.
 async fn notify_project_ban_sync(bot: &Bot, chat_id: ChatId, target_user_id: i64, case_id: &str) {
+    let case_id = case_ids::display(case_id);
     let text = format!(
         "<b>已執行項目封禁（PB）</b>\n<b>對象</b>: <code>{target_user_id}</code>\n<b>案例</b>: <code>{case_id}</code>\n所有群組均適用，白名單及本群解封無效，僅維護組可解除。<a href=\"{TERMS_URL}#project-ban\">使用規範第 7 條</a>"
     );
@@ -4675,6 +4678,7 @@ async fn enforce_project_ban_or_terminate_group(bot: &Bot, runtime: &Arc<Runtime
 /// Project Ban clause commits to reacting immediately when a group is, in
 /// effect, shielding a Project-Banned account by keeping them an admin.
 async fn terminate_group_for_project_ban_evasion(bot: &Bot, runtime: &Arc<Runtime>, chat_id: ChatId, target_id: i64, case_id: &str) {
+    let case_id = case_ids::display(case_id);
     let reason = TerminationReason { label: "項目層級封禁遭規避（對象具管理員身分，機器人無法封禁）".to_string(), anchor: Some("project-ban") };
     let stored_reason = reason.label.clone();
     let _ = bot.send_message(chat_id, service_termination_text(&reason)).parse_mode(ParseMode::Html).await;
@@ -4707,6 +4711,7 @@ async fn alert_project_ban_bypass_attempt(bot: &Bot, runtime: &Runtime, actor_id
 
 /// Alerts admins when a locally banned user is observed posting again.
 async fn notify_reban_sync(bot: &Bot, chat_id: ChatId, target_user_id: i64, case_id: &str) {
+    let case_id = case_ids::display(case_id);
     let text = format!("<b>已重新封禁</b>\n<b>對象</b>: <code>{target_user_id}</code>\n本群封禁仍生效；因再次發言，已刪除訊息並重新封禁。\n<b>案例</b>: <code>{case_id}</code>");
     let Ok(sent) = bot.send_message(chat_id, text).parse_mode(ParseMode::Html).await else { return };
     let bot = bot.clone();
@@ -5818,7 +5823,7 @@ async fn handle_ban_mute_kick(bot: Bot, runtime: Arc<Runtime>, message: Message,
                 match runtime.load_case(&id).await {
                     Ok(Some(saved)) => {
                         match origin_retry::attempt_origin_ban(&bot, &runtime, saved).await {
-                            Ok(false) => { reply_ephemeral(&bot, &message, format!("封禁尚未完成。案件：{id}，可用 /case 查詢進度。")).await?; }
+                            Ok(false) => { reply_ephemeral(&bot, &message, format!("封禁尚未完成。案件：{}，可用 /case 查詢進度。", case_ids::display(&id))).await?; }
                             Ok(true) => {}
                             Err(err) => { log::warn!("manual ban {id}: {}", notices::diagnostic(&runtime.config, &err.to_string())); }
                         }
@@ -6400,7 +6405,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             out.push_str(&format!(
                 "<b>跨群組黑名單</b>: {}\n",
                 match &netban {
-                    Some(c) => format!("是（案例 <code>{}</code>）", c.id),
+                    Some(c) => format!("是（案例 <code>{}</code>）", case_ids::display(&c.id)),
                     None => "否".to_string(),
                 }
             ));
@@ -7061,12 +7066,15 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             queue_status::handle(&bot,&runtime,&message,&case_id).await?;
         }
         ModerationCommand::CaseLookup(case_id) => {
-            match runtime.load_case(&case_id).await {
+            match runtime.load_case_reference(&case_id).await {
                 Ok(Some(case)) => {
                     let link = case.log_message_id.filter(|id| *id > 0).map(|id| public_log_link(&runtime.config, id)).unwrap_or_else(|| "-".to_string());
                     let reason_link = runtime.blacklist_reason_link().await.unwrap_or_else(|| link.clone());
                     let text = format_case_lookup(&case, &link, &reason_link);
                     bot.send_message(message.chat.id, text).parse_mode(ParseMode::Html).await?;
+                }
+                Err(err) if err.downcast_ref::<case_ids::Ambiguous>().is_some() => {
+                    bot.send_message(message.chat.id, case_ids::AMBIGUOUS).await?;
                 }
                 _ => {
                     bot.send_message(message.chat.id, "找不到該案例。") .await?;
@@ -7141,6 +7149,19 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
         }
         ModerationCommand::MlPurge(case_id) => {
             require_maintainer!(&bot, runtime, from_id, message, "只有項目維護組可以使用此指令。");
+            let case_id = match runtime.resolve_case_reference(&case_id).await {
+                Ok(Some(id)) => id,
+                Ok(None) if case_ids::prefix(&case_id).is_none() => case_id,
+                Ok(None) => {
+                    bot.send_message(message.chat.id, "找不到該案例。").await?;
+                    return Ok(());
+                }
+                Err(err) => {
+                    let text = if err.downcast_ref::<case_ids::Ambiguous>().is_some() { case_ids::AMBIGUOUS } else { "無法讀取案件，請稍後重試。" };
+                    bot.send_message(message.chat.id, text).await?;
+                    return Ok(());
+                }
+            };
             let removed = runtime.purge_training_by_case(&case_id).await.unwrap_or(0);
             let _ = runtime.rebuild_model().await;
             bot.send_message(message.chat.id, format!("已刪除 {removed} 筆訓練樣本，並重建模型。")) .await?;
@@ -7883,8 +7904,12 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             } else if let Ok(user_id) = arg.trim().parse::<i64>() {
                 Some((message.chat.id.0, user_id, None))
             } else if !arg.trim().is_empty() {
-                match runtime.load_case(arg.trim()).await {
+                match runtime.load_case_reference(arg.trim()).await {
                     Ok(Some(case)) => Some((case.chat_id, case.target_user_id, Some(case))),
+                    Err(err) if err.downcast_ref::<case_ids::Ambiguous>().is_some() => {
+                        bot.send_message(message.chat.id, case_ids::AMBIGUOUS).await?;
+                        return Ok(());
+                    }
                     _ => None,
                 }
             } else {
@@ -7892,7 +7917,7 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             };
 
             let Some((chat_id, target_user_id, case_from_id)) = resolved else {
-                bot.send_message(message.chat.id, "請回覆要解封的用戶或頻道訊息、提供對象 ID，或提供 case_id。例如 /unban 123456789。").await?;
+                bot.send_message(message.chat.id, "請回覆要解封的用戶或頻道訊息，或輸入 /unban 對象ID、/unban #案件短碼。完整案件 ID 也可使用。").await?;
                 return Ok(());
             };
 
@@ -7980,8 +8005,12 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
             } else if let Ok(user_id) = arg.trim().parse::<i64>() {
                 Some((message.chat.id.0, user_id, None))
             } else if !arg.trim().is_empty() {
-                match runtime.load_case(arg.trim()).await {
+                match runtime.load_case_reference(arg.trim()).await {
                     Ok(Some(case)) => Some((case.chat_id, case.target_user_id, Some(case))),
+                    Err(err) if err.downcast_ref::<case_ids::Ambiguous>().is_some() => {
+                        bot.send_message(message.chat.id, case_ids::AMBIGUOUS).await?;
+                        return Ok(());
+                    }
                     _ => None,
                 }
             } else {
@@ -8969,6 +8998,7 @@ mod tests {
     mod host_cases;
     mod host_review;
     mod case_thresholds;
+    mod case_ids;
     mod host_rules;
     mod host_model;
     mod model_rebuild;

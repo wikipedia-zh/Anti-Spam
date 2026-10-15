@@ -169,10 +169,12 @@ class Policy(Fixture):
         key = self.add()
         op = self.ledger.create(("ban", 100, key))
         self.assertEqual(op["state"], "sending")
+        self.assertEqual(op["command"], f"/ban 100 +spb SPB #{uuid.UUID(key).hex[:8]} sync:{uuid.UUID(op['id']).hex[:12]}")
         self.ledger.close()
         self.ledger = Ledger(self.root / "state.db", self.source)
         self.addCleanup(self.ledger.close)
         self.assertEqual(self.ledger.pending()["random_id"], op["random_id"])
+        self.assertEqual(self.ledger.pending()["command"], op["command"])
         with self.assertRaises(StopBridge):
             self.ledger.create(("ban", 101, key))
         self.assertEqual(list(self.ledger.conn.execute("SELECT * FROM owned")), [])

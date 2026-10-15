@@ -100,6 +100,7 @@ impl Runtime {
             let tx = conn.transaction()?;
             let now = Utc::now().timestamp();
             let search = query.search.trim();
+            let case_prefix = case_ids::prefix(search).map(|p| format!("{p}%")).unwrap_or_default();
             let id = search.parse::<i64>().ok();
             let params = params![search, id, query.offset];
             let mut items = match query.view.as_str() {
@@ -125,7 +126,8 @@ impl Runtime {
                     evidence_text AS evidence,created_at,
                     (SELECT COUNT(*) FROM network_deliveries n WHERE n.case_id=c.id AND n.state='done') AS network_done,
                     (SELECT COUNT(*) FROM network_deliveries n WHERE n.case_id=c.id AND n.state='pending') AS network_pending
-                    FROM cases c WHERE (?1='' OR id=?1 OR target_user_id=?2 OR chat_id=?2)
+                    FROM cases c WHERE (?1='' OR id=?1 OR target_user_id=?2 OR chat_id=?2
+                        OR (?7<>'' AND lower(replace(id,'-','')) LIKE ?7))
                     AND (?4=''
                         OR (?4='pending_review' AND action='pending_report' AND status='pending_review')
                         OR (?4='pending_training' AND {PENDING_TRAINING})
@@ -139,7 +141,7 @@ impl Runtime {
                         OR (?4='cancelled' AND status='action_cancelled'))
                     AND (?5 IS NULL OR {CREATED_SECONDS}>=?5)
                     AND (?6 IS NULL OR {CREATED_SECONDS}<?6)
-                    ORDER BY rowid DESC LIMIT 26 OFFSET ?3"), params![search,id,query.offset,query.filter,query.created_from,query.created_before])?,
+                    ORDER BY rowid DESC LIMIT 26 OFFSET ?3"), params![search,id,query.offset,query.filter,query.created_from,query.created_before,case_prefix])?,
                 "rules" => rows(&tx, "SELECT r.id,r.description,SUBSTR(r.pattern,1,600) AS pattern,
                     (SELECT COUNT(*) FROM cases c WHERE c.matched_rule_id=r.id OR INSTR('；'||COALESCE(c.matched_rule_pattern,'')||'；','；REGEX@'||r.id||'；')>0) AS recorded_hits
                     FROM spam_rules r WHERE (?1='' OR r.id=?2 OR INSTR(LOWER(r.pattern),LOWER(?1))>0 OR INSTR(LOWER(r.description),LOWER(?1))>0)
@@ -171,9 +173,10 @@ impl Runtime {
                     last_error,COALESCE((SELECT state FROM group_access a WHERE a.chat_id=w.chat_id),'unknown') AS membership_state,
                     (kind IN ('跨群封禁','聯防訊息處理') AND EXISTS(SELECT 1 FROM group_access a WHERE a.chat_id=w.chat_id AND a.state IN ('left','unavailable'))) AS waiting_for_group
                     FROM ({}) w
-                    WHERE (?1='' OR case_id=?1 OR chat_id=?2)
+                    WHERE (?1='' OR case_id=?1 OR chat_id=?2
+                        OR (?5<>'' AND lower(replace(case_id,'-','')) LIKE ?5))
                     AND (?4='' OR (?4='failed' AND last_error IS NOT NULL) OR (?4='network' AND kind='跨群封禁'))
-                    ORDER BY (last_error IS NOT NULL) DESC,attempts DESC,next_attempt_at,kind,case_id,chat_id LIMIT 26 OFFSET ?3", queue_status::WORK), params![search,id,query.offset,query.filter])?,
+                    ORDER BY (last_error IS NOT NULL) DESC,attempts DESC,next_attempt_at,kind,case_id,chat_id LIMIT 26 OFFSET ?3", queue_status::WORK), params![search,id,query.offset,query.filter,case_prefix])?,
                 _ => unreachable!(),
             };
             let more = items.len() > 25;
@@ -181,6 +184,11 @@ impl Runtime {
             // Old command logs may contain sensitive diagnostic text too.
             for item in &mut items {
                 if let Some(object) = item.as_object_mut() {
+                    let field = if query.view == "cases" { "id" } else { "case_id" };
+                    if let Some(id) = object.get(field).and_then(Value::as_str) {
+                        let short = case_ids::display(id);
+                        object.insert("short_case_id".into(), json!(short));
+                    }
                     if let Some(Value::String(key))=object.remove("job_key") {
                         let target:queue_admin::Target=serde_json::from_str(&key)?;
                         object.insert("target".into(),serde_json::to_value(target)?);

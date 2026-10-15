@@ -35,7 +35,7 @@ async fn long_evidence_is_clipped_in_notices_but_preserved_in_storage() {
         assert!(text.contains("完整內容已保存在案例記錄"));
         assert!(text.contains("&lt;b&gt;evidence &amp; 😀&lt;/b&gt;"));
         assert!(!text.contains("<b>evidence"));
-        assert!(text.contains(&case.id));
+        assert!(text.contains(&crate::case_ids::display(&case.id)));
     }
     let lookup = format_case_lookup(&case, "-", "-");
     assert!(rendered_length(&lookup) <= 4096);
@@ -66,7 +66,7 @@ async fn a_failed_log_send_does_not_create_a_broken_group_link() {
         .unwrap();
     let text = args["text"].as_str().unwrap();
     assert!(text.starts_with("<b>禁言</b>"));
-    assert!(text.contains(&case.id));
+    assert!(text.contains(&crate::case_ids::display(&case.id)));
     assert!(!text.contains("href="));
 }
 

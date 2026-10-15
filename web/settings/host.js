@@ -44,6 +44,7 @@
   Object.assign(words['zh-Hant'],{model:'模型',overrides:'另設門檻的群組'});
   Object.assign(words['zh-Hans'],{model:'模型',overrides:'另设阈值的群组'});
   Object.assign(words.en,{model:'Model',overrides:'Groups with custom thresholds'});
+  words['zh-Hant'].fullCaseId='完整案件 ID';words['zh-Hans'].fullCaseId='完整案件 ID';words.en.fullCaseId='Full case ID';
   const fields = {
     cases:['id','chat_id','target_user_id','action','status','model_score','reason','netban_eligible','network_done','network_pending','created_at'],
     groups:['chat_id','membership_state','last_seen','netban','spam_threshold_override','service_denied','departure_state'],
@@ -144,10 +145,11 @@
       root.append(element('p',t('modelNote'),'host-note'));
     }else{
       if(!data.items.length)root.append(element('p',t('empty')));
-      for(const item of data.items){const card=element('article',undefined,'host-record');card.append(element('h3',item.target_name||item.title||(view==='rules'?`@${item.id} · ${item.description}`:'')||t(item.role)||item.case_id||item.id||t(view)));
+      for(const item of data.items){const card=element('article',undefined,'host-record');card.append(element('h3',item.target_name||item.title||(view==='rules'?`@${item.id} · ${item.description}`:'')||t(item.role)||item.short_case_id||item.case_id||item.id||t(view)));
         const brief=[item.target_user_id??item.user_id??item.chat_id,view==='groups'?value('membership_state',item.membership_state):item.status?value('status',item.status):item.kind||'',item.created_at?date(item.created_at):''].filter(v=>v!==''&&v!==undefined).join(' · ');card.append(element('p',brief,'host-meta'));
         if(item.waiting_for_group)card.append(element('p',t('waitingForGroup'),'host-note'));
-        const detail=element('details');detail.append(element('summary',t('details')));const dl=element('dl');for(const key of fields[view])dl.append(element('dt',t(key)),element('dd',key==='next_attempt_at'&&item.waiting_for_group?t('paused'):value(key,item[key])));detail.append(dl);
+        const detail=element('details');detail.append(element('summary',t('details')));const dl=element('dl');for(const key of fields[view])dl.append(element('dt',t(key)),element('dd',key==='next_attempt_at'&&item.waiting_for_group?t('paused'):value(key,(key==='case_id'||(view==='cases'&&key==='id'))?(item.short_case_id||item[key]):item[key])));detail.append(dl);
+        if(item.short_case_id){const full=element('details');full.append(element('summary',t('fullCaseId')),element('code',view==='cases'?item.id:item.case_id));detail.append(full);}
         for(const key of ['evidence','detail','last_error'])if(item[key]){detail.append(element('h4',t(key)),element('pre',item[key]));}card.append(detail);if(view==='people'&&item.role!=='host')card.append(button(t('editRoles'),()=>editRole(item.user_id)));
         if(view==='queue'&&item.target)card.append(button(t('retryJob'),()=>window.SPBQueue.open({request,language:lang,target:item.target,onAuthError:fail,onSaved:load})));
         if(view==='cases')card.append(button(t('caseDetails'),()=>window.SPBCasePanel.open({request,language:lang,caseId:item.id,status:s=>value('status',s),onAuthError:fail,onSaved:load})));

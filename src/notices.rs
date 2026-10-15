@@ -39,7 +39,7 @@ fn evidence(case: &CaseRecord) -> String {
 fn identity(case: &CaseRecord) -> String {
     format!(
         "\n<b>對象</b>: <code>{}</code> {}\n<b>群組</b>: <code>{}</code>\n<b>案例</b>: <code>{}</code>",
-        case.target_user_id, field(&case.target_name, 256), case.chat_id, field(&case.id, 64),
+        case.target_user_id, field(&case.target_name, 256), case.chat_id, field(&case_ids::display(&case.id), 64),
     )
 }
 
@@ -92,7 +92,7 @@ pub(super) fn group_notice(
     out.push_str(&reason(case, reason_link));
     out.push_str(&format!(
         "\n<b>案例</b>: <code>{}</code>",
-        field(&case.id, 64)
+        field(&case_ids::display(&case.id), 64)
     ));
     if let Some(link) = log_link {
         out.push_str(&format!("\n<a href=\"{link}\">查看日誌</a>"));

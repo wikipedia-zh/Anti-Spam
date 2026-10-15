@@ -14,6 +14,7 @@
   words['zh-Hant'].missingDetection='首次偵測門檻未保存。';
   words['zh-Hans'].missingDetection='首次检测阈值未保存。';
   words.en.missingDetection='The initial detection threshold was not saved.';
+  words['zh-Hant'].fullId='完整案件 ID';words['zh-Hans'].fullId='完整案件 ID';words.en.fullId='Full case ID';
   let dialog,context,lang='zh-Hant',data=null,busy=false,error='',confirming='',pending=null,conflict=false,saved=false,savedMessage='queued';
   const t=key=>words[lang][key]||key;
   const el=(tag,text,className)=>{const node=document.createElement(tag);if(text!==undefined)node.textContent=text;if(className)node.className=className;return node;};
@@ -26,9 +27,10 @@
     const status=el('p',error?t(error):busy?t(pending?'saving':'loading'):saved?t(savedMessage):'');status.setAttribute('role',error?'alert':'status');if(error)status.className='host-error';dialog.append(status);
     if(data){
       const c=data.case;const info=el('article',undefined,'host-record');const dl=el('dl');
-      for(const [label,value] of [['case',c.id],['user',`${c.target_user_id} · ${c.target_name}`],['group',c.chat_id],['status',context.status(c.status)]])dl.append(el('dt',t(label)),el('dd',String(value)));
+      for(const [label,value] of [['case',c.short_id||c.id],['user',`${c.target_user_id} · ${c.target_name}`],['group',c.chat_id],['status',context.status(c.status)]])dl.append(el('dt',t(label)),el('dd',String(value)));
       info.append(dl);dialog.append(info);
       if(!confirming){
+        const reference=el('details');reference.append(el('summary',t('fullId')),el('code',c.id));dialog.append(reference);
         const evidence=el('details');evidence.append(el('summary',t('evidence')),el('pre',c.evidence||t('unknown')));dialog.append(evidence);
         dialog.append(el('p',`${t('reason')}: ${c.reason||t('unknown')}`));
         dialog.append(el('p',`${t('netban')}: ${t(c.netban_eligible?'yes':'no')}`));
@@ -90,7 +92,7 @@
     if(['session_expired','forbidden'].includes(e.message)){dialog.close();data=null;pending=null;context.onAuthError(e);return;}
     error=Object.hasOwn(words.en,e.message)?e.message:'temporarily_unavailable';conflict=['settings_changed','invalid_request','case_not_found'].includes(e.message);
   }
-  async function read(offset=0){if(busy)return;busy=true;error='';render();try{data=await context.request('host-case','POST',{case_id:context.caseId,offset});pending=null;confirming='';conflict=false;}catch(e){fail(e);}finally{busy=false;render();}}
+  async function read(offset=0){if(busy)return;busy=true;error='';render();try{data=await context.request('host-case','POST',{case_id:context.caseId,offset});context.caseId=data.case.id;pending=null;confirming='';conflict=false;}catch(e){fail(e);}finally{busy=false;render();}}
   async function saveAction(){
     const reversing=confirming==='reverse';
     if(busy||conflict||(reversing?!data?.can_reverse:!data?.review?.can_review))return;

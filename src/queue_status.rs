@@ -26,6 +26,9 @@ pub(super) async fn handle(
     }
     let filter = (!case_id.is_empty()).then_some(case_id);
     let text = runtime.queue_status(filter).await.unwrap_or_else(|err| {
+        if err.downcast_ref::<case_ids::Ambiguous>().is_some() {
+            return case_ids::AMBIGUOUS.to_string();
+        }
         log::warn!("queue status: {err}");
         "無法讀取工作佇列，請稍後重試。".into()
     });
@@ -78,6 +81,10 @@ impl Runtime {
         let now = Utc::now().timestamp();
         let (groups,items,cooldown,reports)=self.with_conn(move |conn| {
             let tx=conn.transaction()?;
+            let case_id = match case_id {
+                Some(id) => Some(case_ids::resolve(&tx, &id)?.unwrap_or(id)),
+                None => None,
+            };
             let cooldown:i64=tx.query_row("SELECT not_before FROM telegram_retry_state WHERE id=1",[],|r|r.get(0))?;
             let groups={
                 let mut stmt=tx.prepare(&format!("SELECT kind,COUNT(*),SUM(last_error IS NOT NULL),SUM(next_attempt_at<=?2 AND ?3<=?2 AND NOT (kind IN ('跨群封禁','聯防訊息處理') AND EXISTS(SELECT 1 FROM group_access a WHERE a.chat_id=w.chat_id AND a.state IN ('left','unavailable')))) FROM ({WORK}) w WHERE (?1 IS NULL OR case_id=?1) GROUP BY kind ORDER BY kind"))?;
@@ -116,7 +123,7 @@ impl Runtime {
             if let Some(id) = item.case_id {
                 text.push_str(&format!(
                     "\n案例：<code>{}</code>",
-                    escape_html(&notices::preview(&id, 64))
+                    escape_html(&notices::preview(&case_ids::display(&id), 64))
                 ));
             }
             let wait = item.next.max(cooldown).saturating_sub(now).max(0);
