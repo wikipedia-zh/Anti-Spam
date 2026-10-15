@@ -231,6 +231,49 @@ class Telegram:
                 async for m in self.client.iter_messages(peer, **options)]
 
     @guarded
+    async def purge_bounds(self, peer, chat, command_id):
+        from telethon import utils
+        if chat not in (self.config['operator_id'], self.config['destination_chat_id']):
+            raise StopBridge("此對話不開放 /purge。")
+        if chat < 0:
+            await self.check_destination()
+        command = await self.client.get_messages(peer, ids=command_id)
+        if (not command or command.chat_id != chat or command.sender_id != self.config['operator_id']
+                or command.out or command.fwd_from or command.via_bot_id or command.edit_date
+                or command.raw_text.strip() != '/purge'
+                or not 0 <= int(time.time()) - int(command.date.timestamp()) <= 120):
+            raise StopBridge("指令已過期或無法核對，請重新回覆訊息並輸入 /purge。")
+        start = command.reply_to_msg_id
+        other_peer = getattr(command.reply_to, 'reply_to_peer_id', None)
+        if not start or start >= command_id or (other_peer and utils.get_peer_id(other_peer) != chat):
+            raise StopBridge("請回覆此對話中的起點訊息，再輸入 /purge。")
+        target = await self.client.get_messages(peer, ids=start)
+        if not target or target.chat_id != chat:
+            raise StopBridge("起點訊息不存在或不屬於此對話。")
+        latest = await self.client.get_messages(peer, limit=1)
+        if not latest or latest[0].chat_id != chat or latest[0].id < command_id:
+            raise StopBridge("無法確認最新訊息，未執行刪除。")
+        return start, latest[0].id
+
+    @guarded
+    async def purge_batch(self, peer, chat, cursor, end):
+        messages = [m async for m in self.client.iter_messages(peer, min_id=cursor, max_id=end + 1,
+                                                              reverse=True, limit=100)]
+        # Private message IDs are shared across dialogs: never construct an ID
+        # range for DeleteMessages. Use only messages returned for this chat.
+        if any(m.chat_id != chat or not cursor < m.id <= end for m in messages):
+            raise StopBridge("訊息範圍核對失敗，已停止刪除。")
+        return [m.id for m in messages]
+
+    @guarded
+    async def delete_purge_batch(self, peer, chat, ids):
+        if chat not in (self.config['operator_id'], self.config['destination_chat_id']) or not 0 < len(ids) <= 100:
+            raise StopBridge("Invalid purge batch")
+        if chat < 0:
+            await self.check_destination()
+        await asyncio.wait_for(self.client.delete_messages(peer, ids, revoke=True), timeout=25)
+
+    @guarded
     async def event_peer(self, event):
         # Short updates carry an authenticated sender ID but often no User.
         # The pinned owner does not need a profile lookup to use commands.
@@ -271,11 +314,13 @@ class Telegram:
 
     @guarded
     async def send_notice(self, peer, notice):
-        from telethon import errors, functions
+        from telethon import errors, functions, types
+        from formatting import code_spans
         try:
             result = await asyncio.wait_for(self.client(functions.messages.SendMessageRequest(
                 peer=await self.client.get_input_entity(peer), message=notice["body"],
-                random_id=notice["random_id"], no_webpage=True)), timeout=25)
+                random_id=notice["random_id"], no_webpage=True,
+                entities=[types.MessageEntityCode(offset, length) for offset, length in code_spans(notice["body"])])), timeout=25)
         except errors.FloodWaitError as error:
             raise Flood(error.seconds) from None
         if getattr(result, "id", None):

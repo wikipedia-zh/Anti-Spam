@@ -29,7 +29,7 @@ def capture(control, user, message_id, text, date):
     if date < control.ledger.get("dm_since", int(time.time())):
         return
     parts = text.strip().split()
-    if parts and parts[0].split("@")[0].lower() in ("/sudo", "/unsudo", "/sync", "/spb_sync", "/evidence"):
+    if parts and parts[0].split("@")[0].lower() in ("/sudo", "/unsudo", "/sync", "/spb_sync", "/evidence", "/purge"):
         return
     now = int(time.time())
     with control.db:

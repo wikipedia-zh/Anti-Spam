@@ -11,7 +11,7 @@ from core import StopBridge
 from telegram_client import Flood
 
 HELP = "SPB-WATCH\n/sync sync:追蹤碼\n/sync #案件碼\n/sync 使用者ID\n群組請用 /spb_sync，避免與 SPB 重複回覆。"
-OWNER_HELP = "\n/sudo ID：授權查詢\n/sudo del ID：撤權\n/sudo list：查看授權"
+OWNER_HELP = "\n/sudo ID：授權查詢\n/sudo del ID：撤權\n/sudo list：查看授權\n/purge：回覆起點訊息，刪除至最新訊息"
 STATES = {"sending": "送出結果待確認", "sent": "已送出，等候 hexDrill 確認",
           "uncertain": "未確認成功，已停止後續封禁", "acked": "hexDrill 已確認成功",
           "cancelled": "已取消這次嘗試", "rejected": "已拒絕"}
@@ -64,6 +64,8 @@ class Control:
             ledger.put("watch_owner", self.owner)
         from inbox import initialize
         initialize(self)
+        from purge import initialize as initialize_purge
+        initialize_purge(self)
 
     def authorized(self, user):
         return user == self.owner or self.db.execute("SELECT 1 FROM sudo_users WHERE user_id=?", (user,)).fetchone() is not None
@@ -96,7 +98,7 @@ class Control:
             if not parts or len(text) > 160:
                 return
             command = parts[0].lower()
-            if command not in ("/sync", "/spb_sync", "/sudo", "/unsudo", "/help", "/start", "/evidence"):
+            if command not in ("/sync", "/spb_sync", "/sudo", "/unsudo", "/help", "/start", "/evidence", "/purge"):
                 return
             if chat < 0 and command in ("/sync", "/help", "/start"):
                 return
@@ -106,7 +108,12 @@ class Control:
             if count >= 6:
                 return
             self.db.execute("INSERT INTO control_audit VALUES (?,?,?,?,?)", (chat, message_id, actor, command, now))
-            if command == "/evidence":
+            if command == "/purge":
+                from purge import request
+                body = request(self, chat, message_id, actor) if len(parts) == 1 else "請回覆起點訊息，再輸入 /purge。"
+                if body is None:
+                    return
+            elif command == "/evidence":
                 if actor != self.owner or chat != actor:
                     return
                 from inbox import evidence
@@ -207,6 +214,8 @@ class Watch:
         self.group_ok = False
         if hasattr(transport, "bind_ledger"):
             transport.bind_ledger(ledger)
+        from purge import interrupted
+        interrupted(self.control)
 
     async def incoming(self, chat, message_id, actor, text, peer, date=None):
         c = self.control
@@ -235,7 +244,10 @@ class Watch:
             c.handle(chat, message_id, actor, text)
             if chat == actor:
                 self.capture(actor, message_id, text, date or int(time.time()))
+            from purge import run
+            await run(c, self.transport, {chat: peer})
             await self.deliver({chat: peer}, key=f"reply:{chat}:{message_id}")
+            await self.deliver({chat: peer}, key=f"purge:{chat}:{message_id}")
         except Flood:
             pass  # Leave the response queued until Telegram's cooldown expires.
         except Exception as error:
@@ -300,6 +312,8 @@ class Watch:
             break
         from inbox import outcomes
         outcomes(c)
+        from purge import run
+        await run(c, t, peers)
         await self.deliver(peers)
 
     async def poll(self, chat, peer):
