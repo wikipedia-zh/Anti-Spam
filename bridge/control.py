@@ -62,6 +62,8 @@ class Control:
         """)
         with self.db:
             ledger.put("watch_owner", self.owner)
+        from inbox import initialize
+        initialize(self)
 
     def authorized(self, user):
         return user == self.owner or self.db.execute("SELECT 1 FROM sudo_users WHERE user_id=?", (user,)).fetchone() is not None
@@ -93,7 +95,7 @@ class Control:
             if not parts or len(text) > 160:
                 return
             command = parts[0].lower()
-            if command not in ("/sync", "/spb_sync", "/sudo", "/unsudo", "/help", "/start"):
+            if command not in ("/sync", "/spb_sync", "/sudo", "/unsudo", "/help", "/start", "/evidence"):
                 return
             if chat < 0 and command in ("/sync", "/help", "/start"):
                 return
@@ -103,7 +105,12 @@ class Control:
             if count >= 6:
                 return
             self.db.execute("INSERT INTO control_audit VALUES (?,?,?,?,?)", (chat, message_id, actor, command, now))
-            if command in ("/sudo", "/unsudo"):
+            if command == "/evidence":
+                if actor != self.owner or chat != actor:
+                    return
+                from inbox import evidence
+                body = evidence(self, parts[1] if len(parts) == 2 else "")
+            elif command in ("/sudo", "/unsudo"):
                 if actor != self.owner:
                     body = "只有主持人可以授權或撤權。"
                 else:
@@ -193,9 +200,11 @@ class Watch:
         self.control = Control(config, ledger)
         self.transport = transport
 
-    async def incoming(self, chat, message_id, actor, text, peer):
+    async def incoming(self, chat, message_id, actor, text, peer, date=None):
         c = self.control
-        if not c.authorized(actor) or (chat != actor and chat != c.config["destination_chat_id"]):
+        if chat != actor and chat != c.config["destination_chat_id"]:
+            return
+        if not c.authorized(actor) and not (chat == actor and c.config.get("dm_enabled")):
             return
         try:
             if chat < 0:
@@ -204,9 +213,17 @@ class Watch:
                 with c.db:
                     c.advance(chat, message_id - 1)
             c.handle(chat, message_id, actor, text)
+            if chat == actor:
+                self.capture(actor, message_id, text, date or int(time.time()))
             await self.deliver({chat: peer}, key=f"reply:{chat}:{message_id}")
         except Exception as error:
             print("watch command:", type(error).__name__, flush=True)
+
+    def capture(self, actor, message_id, text, date):
+        if self.control.authorized(actor) and text.strip().split(" ")[0] in ("/help", "/start"):
+            return
+        from inbox import capture
+        capture(self.control, actor, message_id, text, date)
 
     async def tick(self):
         c, t = self.control, self.transport
@@ -232,6 +249,8 @@ class Watch:
             except Exception as error:
                 print("watch commands:", chat, type(error).__name__, flush=True)
         await self.deliver(peers)
+        from inbox import outcomes
+        outcomes(c)
 
     async def poll(self, chat, peer):
         c, t = self.control, self.transport
@@ -245,9 +264,15 @@ class Watch:
                 for message in latest:
                     if message["date"] >= grant[0]:
                         c.handle(chat, message["id"], message["actor"], message["text"], message["trusted"])
+            if chat > 0:
+                for message in latest:
+                    if message["trusted"] and message["actor"] == chat:
+                        self.capture(chat, message["id"], message["text"], message["date"])
             return
         for message in await t.control_messages(peer, cursor):
             c.handle(chat, message["id"], message["actor"], message["text"], message["trusted"])
+            if chat > 0 and message["trusted"] and message["actor"] == chat:
+                self.capture(chat, message["id"], message["text"], message["date"])
 
     async def deliver(self, peers, key=None):
         c, t = self.control, self.transport

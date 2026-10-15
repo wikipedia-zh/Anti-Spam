@@ -193,8 +193,8 @@ pub(super) async fn deliver(bot: &Bot, runtime: &Runtime, id: &str) -> Result<()
         ]]);
         let text = notices::review_card(
             &case,
-            "待審核舉報 · /spam",
-            "受理：封禁並訓練。\n拒絕：標記為正常，並記錄舉報者被拒次數。",
+            if watch_inbox::is_case(&case) { "待審核私訊 · Spam Protection Bot" } else { "待審核舉報 · /spam" },
+            if watch_inbox::is_case(&case) { "只限主持人審核。受理：加入聯防黑名單；拒絕：不封禁。原文在角色帳號用 /evidence 查閱；不自動訓練。" } else { "受理：封禁並訓練。\n拒絕：標記為正常，並記錄舉報者被拒次數。" },
             None,
         );
         let request = bot
@@ -219,6 +219,14 @@ pub(super) async fn deliver(bot: &Bot, runtime: &Runtime, id: &str) -> Result<()
             conn.execute("UPDATE report_deliveries SET review_message_id=?2,last_error=NULL WHERE case_id=?1",params![id,sent.id.0])?;
             Ok(())
         }).await?;
+    }
+    if watch_inbox::is_case(&case) {
+        let id = id.to_string();
+        runtime.with_conn(move |conn| {
+            conn.execute("UPDATE report_deliveries SET state='done',last_error=NULL WHERE case_id=?1",[id])?;
+            Ok(())
+        }).await?;
+        return Ok(());
     }
     if confirmation.is_none() {
         let text = if pending {

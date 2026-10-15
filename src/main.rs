@@ -13,6 +13,7 @@ mod moderation_queue;
 mod restriction_retry;
 mod queue_status;
 mod sync_status;
+mod watch_inbox;
 mod queue_admin;
 mod host_maintenance;
 mod report_delivery;
@@ -8674,6 +8675,7 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     let bot = Bot::new(config.bot_token.clone());
     let runtime = Arc::new(Runtime::load(config).await?);
+    watch_inbox::spawn(runtime.clone());
     let miniapp_server = miniapp::start(bot.clone(), runtime.clone()).await?;
     let reversal_worker = spawn_reversal_worker(bot.clone(), runtime.clone());
     let network_worker = spawn_network_worker(bot.clone(), runtime.clone());
@@ -8989,6 +8991,7 @@ mod tests {
     mod guest_delivery;
     mod model_updates;
     mod tokenizer_upgrade;
+    mod watch_inbox;
     mod moderation_queue;
     mod restriction_retry;
     mod queue_status;

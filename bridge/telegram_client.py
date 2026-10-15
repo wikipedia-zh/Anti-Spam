@@ -144,7 +144,7 @@ class Telegram:
             raise StopBridge("Wrong Telegram account")
         peers = {}
         async for dialog in self.client.iter_dialogs():
-            if dialog.id in users and dialog.is_user and not getattr(dialog.entity, "bot", False):
+            if (dialog.id in users or self.config.get("dm_enabled")) and dialog.is_user and not getattr(dialog.entity, "bot", False):
                 peers[dialog.id] = dialog.entity
         if group_ok:
             peers[self.config["destination_chat_id"]] = self.destination
@@ -160,7 +160,7 @@ class Telegram:
         options = {"limit": 1} if cursor is None else {"limit": 50, "min_id": cursor, "reverse": True}
         return [{"id": m.id, "actor": m.sender_id, "text": m.raw_text or "",
                  "date": int(m.date.timestamp()),
-                 "trusted": not (m.fwd_from or m.via_bot_id or m.out or m.edit_date)}
+                 "trusted": not (m.fwd_from or m.via_bot_id or m.out or m.edit_date or m.action)}
                 async for m in self.client.iter_messages(peer, **options)]
 
     def install_control_handler(self, handler):
@@ -168,10 +168,13 @@ class Telegram:
 
         async def incoming(event):
             message = event.message
-            if message.fwd_from or message.via_bot_id or message.out or message.edit_date:
+            if message.fwd_from or message.via_bot_id or message.out or message.edit_date or message.action:
+                return
+            sender = await event.get_sender()
+            if not sender or getattr(sender, "bot", False):
                 return
             await handler(message.chat_id, message.id, message.sender_id,
-                          message.raw_text or "", await event.get_input_chat())
+                          message.raw_text or "", await event.get_input_chat(), int(message.date.timestamp()))
 
         self.client.add_event_handler(incoming, events.NewMessage(incoming=True))
 
