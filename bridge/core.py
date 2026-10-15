@@ -235,7 +235,8 @@ class Ledger:
         if action not in ("ban", "unban") or not isinstance(user, int) or not 0 < user < 2**52 or (case != "revoked" and not case_uuid(case)):
             raise StopBridge("Invalid command target")
         op = str(uuid.uuid4())
-        command = f"/{action} {user} +spb SPB {case} sync:{op}"
+        reference = uuid.UUID(op).hex[:12]
+        command = f"/{action} {user} +spb SPB {case} sync:{reference}"
         with self.conn:
             self.conn.execute("INSERT INTO operations(id,user_id,action,case_id,command,random_id,state,created_at) VALUES (?,?,?,?,?,?,'sending',?)", (op, user, action, case, command, secrets.randbits(63) or 1, now))
         return self.pending()
