@@ -216,6 +216,10 @@ class Watch:
             return
         if not c.authorized(actor) and not (chat == actor and c.config.get("dm_enabled")):
             return
+        if actor == c.owner:
+            with c.db:
+                c.ledger.put("watch_last_owner_event", {"message_id": message_id,
+                    "received_at": int(time.time()), "message_at": date})
         self.incoming_peers.pop(chat, None)
         self.incoming_peers[chat] = peer
         while len(self.incoming_peers) > 512:
@@ -355,6 +359,9 @@ class Watch:
                     message_id = await t.send_notice(peer, row)
                 with c.db:
                     c.db.execute("UPDATE watch_outbox SET state='sent',message_id=?,error=NULL WHERE key=?", (message_id, row["key"]))
+                    if row["chat_id"] == c.owner and row["actor"] == c.owner:
+                        c.ledger.put("watch_last_owner_reply", {"key": row["key"],
+                            "sent_at": int(time.time()), "message_id": message_id})
             except Flood as error:
                 with c.db:
                     c.db.execute("UPDATE watch_outbox SET state=?,next_at=?,error='flood_wait' WHERE key=?", (row["state"], int(time.time()) + error.seconds + 5, row["key"]))

@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 
 from control import Control, Watch, lookup
 from core import StopBridge
@@ -271,6 +271,47 @@ class Access(Fixture):
         asyncio.run(watch.deliver({500:500, 600:600}))
         self.assertEqual(watch.transport.sent, [500])
         self.assertEqual(self.c.db.execute("SELECT state FROM watch_outbox WHERE key='old-greeting'").fetchone()[0], "cancelled")
+
+    def test_owner_short_update_replies_without_profile_or_history_fetch(self):
+        class Client:
+            def add_event_handler(self, handler, event):
+                self.handler = handler
+        client = Client()
+        transport = Telegram(client, dict(self.config, owner_only_private=True, dm_enabled=False))
+        transport.send_notice = AsyncMock(return_value=90)
+        watch = Watch(transport.config, self.ledger, transport)
+        transport.remember_peer(500, "cached-owner-peer")
+        event = SimpleNamespace(sender=None, input_chat=None,
+            get_sender=AsyncMock(side_effect=AssertionError("owner profile is unnecessary")),
+            get_input_chat=AsyncMock(side_effect=AssertionError("use cached peer")),
+            message=SimpleNamespace(chat_id=500, sender_id=500, id=1, raw_text="/sudo list",
+                date=datetime.now(timezone.utc), fwd_from=None, via_bot_id=None,
+                out=False, edit_date=None, action=None))
+        events = SimpleNamespace(NewMessage=lambda **kwargs: kwargs)
+        with patch.dict("sys.modules", {"telethon": SimpleNamespace(events=events)}):
+            transport.install_control_handler(watch.incoming)
+        asyncio.run(client.handler(event))
+        transport.send_notice.assert_awaited_once()
+        self.assertEqual(transport.send_notice.call_args.args[0], "cached-owner-peer")
+        self.assertEqual(self.c.db.execute("SELECT state FROM watch_outbox WHERE key='reply:500:1'").fetchone()[0], "sent")
+        self.assertEqual(self.ledger.get("watch_last_owner_event")["message_id"], 1)
+        event.message.chat_id = event.message.sender_id = 600
+        asyncio.run(client.handler(event))
+        transport.send_notice.assert_awaited_once()
+
+    def test_owner_short_update_resolves_only_missing_peer_and_honors_cooldown(self):
+        transport = Telegram(None, self.config)
+        transport.bind_ledger(self.ledger)
+        event = SimpleNamespace(sender=None, input_chat=None,
+            message=SimpleNamespace(sender_id=500, chat_id=500),
+            get_sender=AsyncMock(side_effect=AssertionError("no owner profile lookup")),
+            get_input_chat=AsyncMock(return_value="resolved-owner-peer"))
+        self.assertEqual(asyncio.run(transport.event_peer(event)), "resolved-owner-peer")
+        event.get_input_chat.assert_awaited_once()
+        transport.wait_until = int(time.time()) + 300
+        with self.assertRaises(Flood):
+            asyncio.run(transport.event_peer(event))
+        event.get_input_chat.assert_awaited_once()
 
 
 class FakeTransport:

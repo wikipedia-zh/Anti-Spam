@@ -219,6 +219,7 @@ class Telegram:
                 for member in members:
                     if member.id == self.config["operator_id"] and not member.bot:
                         peers[member.id] = member
+                        self.remember_peer(member.id, member)
         return peers
 
     @guarded
@@ -228,6 +229,20 @@ class Telegram:
                  "date": int(m.date.timestamp()),
                  "trusted": not (m.fwd_from or m.via_bot_id or m.out or m.edit_date or m.action)}
                 async for m in self.client.iter_messages(peer, **options)]
+
+    @guarded
+    async def event_peer(self, event):
+        # Short updates carry an authenticated sender ID but often no User.
+        # The pinned owner does not need a profile lookup to use commands.
+        sender = event.sender
+        if sender is None and event.message.sender_id != self.config["operator_id"]:
+            sender = await event.get_sender()
+            if sender is None:
+                return None
+        if sender is not None and getattr(sender, "bot", False):
+            return None
+        peer = event.input_chat or self.peers.get(event.message.chat_id)
+        return peer if peer is not None else await event.get_input_chat()
 
     def install_control_handler(self, handler):
         from telethon import events
@@ -241,14 +256,16 @@ class Telegram:
                 return
             if message.fwd_from or message.via_bot_id or message.out or message.edit_date or message.action:
                 return
-            # Events normally include both entities. Do not fetch missing senders
-            # while Telegram is rate limiting us.
-            sender = event.sender
-            peer = event.input_chat
-            if not sender or not peer or getattr(sender, "bot", False):
-                return
-            await handler(message.chat_id, message.id, message.sender_id,
-                          message.raw_text or "", peer, int(message.date.timestamp()))
+            try:
+                peer = await self.event_peer(event)
+                if peer is None:
+                    return
+                await handler(message.chat_id, message.id, message.sender_id,
+                              message.raw_text or "", peer, int(message.date.timestamp()))
+            except Flood:
+                pass  # The bounded recovery poll will pick up missed commands.
+            except Exception as error:
+                print("watch update:", type(error).__name__, flush=True)
 
         self.client.add_event_handler(incoming, events.NewMessage(incoming=True))
 
