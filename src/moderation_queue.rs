@@ -190,7 +190,10 @@ async fn deliver_review_update(bot: &Bot, runtime: &Runtime, id: &str) -> Result
             "review_status",
             chat,
             msg,
-            notices::review_card(&case, title, &note, actor.or(case.actor_user_id)),
+            if watch_spy::is_case(&case) {
+                watch_spy::review_card(&case,chat.context("missing WATCH review location")?,
+                    if case.status == "approved_and_banned" {"WATCH · 已加入 SPB 黑名單"} else {title},&note,actor.or(case.actor_user_id))?
+            } else { notices::review_card(&case, title, &note, actor.or(case.actor_user_id)) },
             review_status,
         ),
         (

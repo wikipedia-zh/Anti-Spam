@@ -7,8 +7,10 @@ pub(super) fn eligible_target(
     chat_id: i64,
     test_group: Option<i64>,
 ) -> Result<Option<i64>> {
+    if watch_spy::is_report_chat(chat_id) { return Ok(None); }
     Ok(conn.query_row("SELECT c.target_user_id FROM cases c JOIN group_module_settings g ON g.chat_id=?2
         WHERE c.id=?1 AND c.netban_eligible=1 AND g.netban=1
+        AND (COALESCE(c.matched_rule_pattern,'')!='WATCH_SPY' OR c.chat_id!=g.chat_id)
         AND (?3 IS NULL OR g.chat_id!=?3)
         AND c.action IN ('auto_ban','spam_ban','report_approved','guest_bot_ban','guest_invoker_ban')
         AND c.status NOT IN ('ban_pending','ban_failed','reversal_pending','reversed')

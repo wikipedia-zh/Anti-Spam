@@ -10,7 +10,7 @@ pub(super) fn begin_reversal_tx(
     actor_id: i64,
     actor_name: &str,
 ) -> Result<()> {
-    if case.status != "reversal_pending" && !watch_inbox::is_case(case) {
+    if case.status != "reversal_pending" && !watch_inbox::is_case(case) && !watch_spy::is_case(case) {
         tx.execute(
                     "INSERT OR IGNORE INTO network_ban_targets(case_id,chat_id,created_at) VALUES (?1,?2,?3)",
                     params![case.id, case.chat_id, Utc::now().to_rfc3339()],
@@ -273,7 +273,7 @@ async fn apply_reversal(
         if let Err(err) = runtime.persist_case(&case).await {
             log::warn!("could not save reversal log for {}: {err}", case.id);
         }
-        if !watch_inbox::is_case(&case) {
+        if !watch_inbox::is_case(&case) && !watch_spy::is_case(&case) {
             let _ = notify_group(bot, runtime, &case, id, "<b>封禁案例已撤銷</b>").await;
         }
     }

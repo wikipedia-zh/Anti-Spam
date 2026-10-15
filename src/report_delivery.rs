@@ -187,16 +187,17 @@ pub(super) async fn deliver(bot: &Bot, runtime: &Runtime, id: &str) -> Result<()
     // A reviewer may have acted on a card whose send response was lost.
     // The decision already owns that card; never send a fresh pending card.
     if review_message.is_none() && pending {
+        let kind = if watch_spy::is_case(&case) { "watch" } else { "review" };
         let keyboard = InlineKeyboardMarkup::new(vec![vec![
-            InlineKeyboardButton::callback("受理並封禁", format!("review:approve:{id}")),
-            InlineKeyboardButton::callback("拒絕並標記正常", format!("review:reject:{id}")),
+            InlineKeyboardButton::callback("受理並封禁", format!("{kind}:approve:{id}")),
+            InlineKeyboardButton::callback(if kind == "watch" {"拒絕"} else {"拒絕並標記正常"}, format!("{kind}:reject:{id}")),
         ]]);
-        let text = notices::review_card(
+        let text = if watch_spy::is_case(&case) { watch_spy::card(&case,review_chat)? } else { notices::review_card(
             &case,
             if watch_inbox::is_case(&case) { "待審核私訊 · Spam Protection Bot" } else { "待審核舉報 · /spam" },
             if watch_inbox::is_case(&case) { "只限主持人審核。受理：加入聯防黑名單；拒絕：不封禁。原文在角色帳號用 /evidence 查閱；不自動訓練。" } else { "受理：封禁並訓練。\n拒絕：標記為正常，並記錄舉報者被拒次數。" },
             None,
-        );
+        ) };
         let request = bot
             .send_message(ChatId(review_chat), text)
             .parse_mode(ParseMode::Html)
@@ -220,7 +221,7 @@ pub(super) async fn deliver(bot: &Bot, runtime: &Runtime, id: &str) -> Result<()
             Ok(())
         }).await?;
     }
-    if watch_inbox::is_case(&case) {
+    if watch_inbox::is_case(&case) || watch_spy::is_case(&case) {
         let id = id.to_string();
         runtime.with_conn(move |conn| {
             conn.execute("UPDATE report_deliveries SET state='done',last_error=NULL WHERE case_id=?1",[id])?;

@@ -9,7 +9,7 @@ pub(super) fn is_case(case: &CaseRecord) -> bool {
         && case.matched_rule_pattern.as_deref() == Some(MARKER)
 }
 
-fn private_db() -> Result<Connection> {
+pub(super) fn private_db() -> Result<Connection> {
     let conn = Connection::open_with_flags(
         env::var("HEXDRILL_STATE_DB")?,
         OpenFlags::SQLITE_OPEN_READ_WRITE,
@@ -41,7 +41,7 @@ pub(super) fn protected_in_bridge(conn: &Connection, user: i64) -> Result<bool> 
         )?)
 }
 
-fn protected_in_spb(conn: &Connection, user: i64) -> Result<bool> {
+pub(super) fn protected_in_spb(conn: &Connection, user: i64) -> Result<bool> {
     Ok(is_host(user) || is_platform_pseudo_user(user) || conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM global_whitelist WHERE user_id=?1) OR EXISTS(SELECT 1 FROM maintainers WHERE user_id=?1) OR EXISTS(SELECT 1 FROM reviewers WHERE user_id=?1)", [user], |row| row.get::<_,bool>(0))?)
 }

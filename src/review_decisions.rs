@@ -40,7 +40,9 @@ pub(super) fn report(
         return Ok(false);
     };
     let mut note = String::new();
-    if watch_inbox::review(tx, id, decision, actor.0)? {
+    if watch_spy::review(tx, id, decision, actor.0, location)? {
+        note = if decision == "approve" {"\nWATCH：已加入 SPB；hexDrill 結果由 WATCH 另行確認。來源群組不執行動作。"} else {"\nWATCH：已拒絕，不封禁、不訓練。"}.into();
+    } else if watch_inbox::review(tx, id, decision, actor.0)? {
         note = "\n私訊案件：已保存決定；不以私訊自動訓練模型。".into();
     } else if decision == "approve" {
         tx.execute("UPDATE cases SET action='report_approved',status='ban_pending',actor_user_id=?2,actor_name=?3,log_message_id=NULL WHERE id=?1", params![id,actor.0,actor.1])?;

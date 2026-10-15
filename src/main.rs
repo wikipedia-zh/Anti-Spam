@@ -14,6 +14,7 @@ mod restriction_retry;
 mod queue_status;
 mod sync_status;
 mod watch_inbox;
+mod watch_spy;
 mod queue_admin;
 mod host_maintenance;
 mod report_delivery;
@@ -1518,7 +1519,7 @@ impl Runtime {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, action, chat_id, target_user_id, target_name, actor_user_id, actor_name, source_message_id, evidence_text, model_score, matched_rule_id, matched_rule_pattern, status, log_message_id, created_at
-                 FROM cases WHERE chat_id = ?1 AND target_user_id = ?2
+                 FROM cases WHERE chat_id = ?1 AND target_user_id = ?2 AND COALESCE(matched_rule_pattern,'')!='WATCH_SPY'
                  AND status NOT IN ('ban_pending','ban_failed','reversal_pending') AND action IN ('auto_ban', 'spam_ban', 'report_approved')
                  ORDER BY created_at DESC LIMIT 1",
             )?;
@@ -8210,11 +8211,16 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
     let kind = parts.next().unwrap_or("");
     let decision = parts.next().unwrap_or("");
     let case_id = parts.next().unwrap_or("");
-    if !matches!(kind, "review" | "train") || case_id.is_empty() {
+    if !matches!(kind, "review" | "train" | "watch") || case_id.is_empty() {
         return Ok(());
     }
 
-    if q.message.as_ref().map(|m| m.chat().id.0 != runtime.config.report_channel_id).unwrap_or(true) {
+    if kind == "watch" {
+        if !q.message.as_ref().map(|m| watch_spy::allowed_location(from_id,m.chat().id.0)).unwrap_or(false) {
+            bot.answer_callback_query(q.id).text("只限主持人及 WATCH 授權人員在指定群組審核").await?;
+            return Ok(());
+        }
+    } else if q.message.as_ref().map(|m| m.chat().id.0 != runtime.config.report_channel_id).unwrap_or(true) {
         bot.answer_callback_query(q.id).text("此按鈕只能在舉報處理頻道使用").await?;
         return Ok(());
     }
@@ -8224,7 +8230,7 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
     // into the shared model, so it takes an explicit reviewer grant (or
     // maintainer). Checked once, before any decision branch, so no button
     // added later can miss it.
-    if !runtime.can_review(from_id).await {
+    if kind != "watch" && !runtime.can_review(from_id).await {
         bot.answer_callback_query(q.id).text("只有審核員或維護組可以處理此項目").await?;
         return Ok(());
     }
@@ -8242,6 +8248,11 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
         bot.answer_callback_query(q.id).text("Case 不存在或已處理").await?;
         return Ok(());
     };
+
+    if (kind == "watch") != watch_spy::is_case(&case) {
+        bot.answer_callback_query(q.id).text("案件與按鈕不符").await?;
+        return Ok(());
+    }
 
     let Some(message) = q.message.as_ref() else {
         bot.answer_callback_query(q.id).text("找不到原始訊息").await?;
@@ -8296,12 +8307,21 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
             return Ok(());
         }
     }
+    if kind == "watch" {
+        bot.answer_callback_query(q.id).text(if decision == "approve" {"已加入 SPB；hexDrill 等待確認"} else {"已拒絕受理"}).await?;
+        if let Err(err) = moderation_queue::deliver_review_updates(&bot, &runtime, Some(&case.id)).await {
+            log::warn!("WATCH review update {}: {}",case.id,notices::diagnostic(&runtime.config,&err.to_string()));
+        }
+        return Ok(());
+    }
     let mut banned = false;
     if decision == "approve" {
         if let Ok(Some(approved)) = runtime.load_case(&case.id).await {
+            if !watch_spy::is_case(&approved) {
             match origin_retry::attempt_origin_ban(&bot, &runtime, approved).await {
                 Ok(done) => banned = done,
                 Err(err) => log::warn!("report ban {}: {}", case.id, notices::diagnostic(&runtime.config, &err.to_string())),
+            }
             }
         }
         if let Err(err) = deliver_network_bans(&bot, &runtime, Some(&case.id)).await {
@@ -8311,7 +8331,7 @@ async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> R
     if let Err(err) = moderation_queue::deliver_review_updates(&bot, &runtime, Some(&case.id)).await {
         log::warn!("report notification {}: {}", case.id, notices::diagnostic(&runtime.config, &err.to_string()));
     }
-    let toast = if decision == "reject" { "已拒絕受理" } else if banned { "已受理並封禁" } else { "已受理，封禁待處理" };
+    let toast = if decision == "reject" { "已拒絕受理" } else if kind == "watch" { "已加入 SPB；hexDrill 等待確認" } else if banned { "已受理並封禁" } else { "已受理，封禁待處理" };
     bot.answer_callback_query(q.id).text(toast).await?;
     Ok(())
 }
@@ -8676,6 +8696,7 @@ async fn main() -> Result<()> {
     let bot = Bot::new(config.bot_token.clone());
     let runtime = Arc::new(Runtime::load(config).await?);
     watch_inbox::spawn(runtime.clone());
+    watch_spy::spawn(runtime.clone());
     let miniapp_server = miniapp::start(bot.clone(), runtime.clone()).await?;
     let reversal_worker = spawn_reversal_worker(bot.clone(), runtime.clone());
     let network_worker = spawn_network_worker(bot.clone(), runtime.clone());
@@ -8743,6 +8764,9 @@ async fn main() -> Result<()> {
         move |bot: Bot, message: Message| {
             let runtime = runtime.clone();
             async move {
+                if watch_spy::is_report_chat(message.chat.id.0) {
+                    return Ok(());
+                }
                 // Runs before delete_service_message_if_enabled, which might
                 // otherwise delete this same "message pinned" notification
                 // first (if NoServiceMessage is also on for this chat) - this
@@ -8992,6 +9016,7 @@ mod tests {
     mod model_updates;
     mod tokenizer_upgrade;
     mod watch_inbox;
+    mod watch_spy;
     mod moderation_queue;
     mod restriction_retry;
     mod queue_status;

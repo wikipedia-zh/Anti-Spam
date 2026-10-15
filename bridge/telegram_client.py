@@ -109,9 +109,18 @@ class Telegram:
         if (utils.get_peer_id(fresh) != self.config["destination_chat_id"] or getattr(fresh, "username", None)
                 or getattr(fresh, "broadcast", False) or getattr(fresh, "left", False)):
             raise StopBridge("Destination must remain the pinned private group")
-        members = await self.client.get_participants(fresh, limit=10)
+        members = await self.client.get_participants(fresh, limit=32 if self.config.get('spy_enabled') else 10)
         ids = {m.id for m in members}
         allowed = {me.id, hex_bot.id} | set(self.config["allowed_observers"])
+        if self.config.get('spy_enabled') and self.ledger is not None:
+            allowed.update(r[0] for r in self.ledger.conn.execute('SELECT user_id FROM sudo_users'))
+        if self.config.get('spb_bot_id'):
+            spb = await self.client.get_entity('WikiBlacklistRobot')
+            if not spb.bot or spb.id != self.config['spb_bot_id']:
+                raise StopBridge('SPB identity changed')
+            allowed.add(spb.id)
+            if self.config.get('spy_enabled') and spb.id not in ids:
+                raise StopBridge('SPB must be in the review group')
         if not {me.id, hex_bot.id} <= ids or not ids <= allowed or members.total != len(members):
             raise StopBridge("Destination membership changed or cannot be verified")
         self.destination = fresh
@@ -165,6 +174,10 @@ class Telegram:
     async def reconcile(self, ledger):
         """Observe one existing operation; this method cannot create or send one."""
         operation = ledger.pending()
+        await self.reconcile_operation(ledger, operation)
+
+    @guarded
+    async def reconcile_operation(self, ledger, operation):
         if not operation:
             return
         if operation["error"] == "receiver_failed" and operation["reply_id"]:
@@ -175,7 +188,7 @@ class Telegram:
                 ledger.uncertain(operation["id"])
                 return
             ledger.sent(operation["id"], found)
-            operation = ledger.pending()
+            operation = dict(ledger.conn.execute('SELECT * FROM operations WHERE id=?', (operation['id'],)).fetchone())
         reply = await self.acknowledgement(operation)
         if reply:
             ledger.acknowledge(operation["id"], reply)
@@ -292,9 +305,19 @@ class Telegram:
 
         async def incoming(event):
             message = event.message
+            if message.fwd_from or message.via_bot_id or message.out or message.edit_date or message.action:
+                return
+            if self.config.get('spy_enabled') and event.is_group and message.sender_id:
+                try:
+                    await self.capture_spy(event, handler.__self__.control)
+                except Flood:
+                    return
+                except Exception as error:
+                    print('watch scan update:',type(error).__name__,flush=True)
             purge_command = (message.raw_text or '').strip().split(' ', 1)[0] == '/purge' and self.purge_authorized(message.sender_id)
+            group_command = (message.raw_text or '').strip().split(' ', 1)[0] in ('/join', '/ignore') and self.purge_authorized(message.sender_id)
             if (message.chat_id > 0 and self.config.get("owner_only_private")
-                    and message.sender_id != self.config["operator_id"] and not purge_command):
+                    and message.sender_id != self.config["operator_id"] and not (purge_command or group_command)):
                 return
             if (message.chat_id != message.sender_id and message.chat_id != self.config["destination_chat_id"]
                     and not (purge_command and message.chat_id < 0)):
@@ -313,6 +336,73 @@ class Telegram:
                 print("watch update:", type(error).__name__, flush=True)
 
         self.client.add_event_handler(incoming, events.NewMessage(incoming=True))
+
+    @guarded
+    async def capture_spy(self, event, control):
+        from spy import capture, excluded
+        message=event.message
+        if excluded(control,message.chat_id):
+            return
+        sender=event.sender or await event.get_sender()
+        chat=event.chat or await event.get_chat()
+        if (sender is None or getattr(sender,'bot',False) or chat is None
+                or getattr(message,'noforwards',False) or getattr(chat,'noforwards',False)):
+            return
+        capture(control,message.chat_id,message.id,message.sender_id,message.raw_text or '',int(message.date.timestamp()))
+
+    @guarded
+    async def joined_group(self, value, actor):
+        from telethon import functions, types, utils
+        from spy import target
+        if not self.purge_authorized(actor):
+            raise StopBridge('Authorization revoked')
+        kind,name=target(value)
+        if kind=='invite':
+            invite=await self.client(functions.messages.CheckChatInviteRequest(name))
+            entity=invite.chat if isinstance(invite,types.ChatInviteAlready) else None
+        else:
+            entity=await self.client.get_entity(name)
+        if entity is None or getattr(entity,'left',False):
+            return None
+        if not isinstance(entity,(types.Chat,types.Channel)) or getattr(entity,'broadcast',False):
+            raise StopBridge('Only groups can be joined')
+        return utils.get_peer_id(entity)
+
+    @guarded
+    async def join_group(self, value, actor):
+        from telethon import functions, types, utils, errors
+        from spy import target
+        if not self.purge_authorized(actor):
+            raise StopBridge('Authorization revoked')
+        kind, name = target(value)
+        if kind == 'invite':
+            invite = await self.client(functions.messages.CheckChatInviteRequest(name))
+            entity = getattr(invite, 'chat', None)
+            if (getattr(invite, 'broadcast', False) or getattr(entity, 'broadcast', False)
+                    or (entity is None and not isinstance(invite, types.ChatInvite))):
+                raise StopBridge('Only groups can be joined')
+            if isinstance(invite, types.ChatInviteAlready):
+                return utils.get_peer_id(entity), False
+            if not self.purge_authorized(actor):
+                raise StopBridge('Authorization revoked')
+            try:
+                result = await self.client(functions.messages.ImportChatInviteRequest(name))
+            except errors.InviteRequestSentError:
+                return '等待群組管理員批准', True
+            groups = [g for g in result.chats if isinstance(g, (types.Channel, types.Chat)) and not getattr(g, 'broadcast', False)]
+            if len(groups) != 1:
+                raise StopBridge('Joined group cannot be verified')
+            return utils.get_peer_id(groups[0]), False
+        entity = await self.client.get_entity(name)
+        if not isinstance(entity, types.Channel) or not entity.megagroup or entity.broadcast:
+            raise StopBridge('Only groups can be joined')
+        if not self.purge_authorized(actor):
+            raise StopBridge('Authorization revoked')
+        try:
+            await self.client(functions.channels.JoinChannelRequest(entity))
+        except errors.InviteRequestSentError:
+            return utils.get_peer_id(entity), True
+        return utils.get_peer_id(entity), False
 
     @guarded
     async def send_notice(self, peer, notice):

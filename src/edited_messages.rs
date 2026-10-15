@@ -5,6 +5,7 @@ pub(super) async fn moderate_edited_message(
     runtime: Arc<Runtime>,
     message: Message,
 ) -> ResponseResult<()> {
+    if watch_spy::is_report_chat(message.chat.id.0) { return Ok(()); }
     if (!message.chat.is_group() && !message.chat.is_supergroup())
         || runtime.is_group_banned(message.chat.id.0).await
     {

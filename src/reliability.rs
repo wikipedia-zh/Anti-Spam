@@ -7,7 +7,7 @@ pub(super) const OTHER_BAN_IN_CHAT: &str = "SELECT EXISTS(SELECT 1 FROM cases c 
                  AND c.status NOT IN ('reversal_pending','reversed')
                  AND (c.status NOT IN ('ban_failed','ban_pending') OR
                     (c.chat_id=?2 AND EXISTS(SELECT 1 FROM origin_ban_jobs o WHERE o.case_id=c.id AND o.outcome_unknown=1)))
-                 AND (c.chat_id=?2 OR c.action='project_ban' OR EXISTS(
+                 AND ((c.chat_id=?2 AND COALESCE(c.matched_rule_pattern,'')!='WATCH_SPY') OR c.action='project_ban' OR EXISTS(
                     SELECT 1 FROM network_ban_targets n WHERE n.case_id=c.id AND n.chat_id=?2)
                     OR EXISTS(SELECT 1 FROM network_deliveries d WHERE d.case_id=c.id AND d.chat_id=?2 AND d.outcome_unknown=1)))";
 

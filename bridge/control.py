@@ -11,7 +11,7 @@ from core import StopBridge
 from telegram_client import Flood
 
 HELP = "SPB-WATCH\n/sync sync:追蹤碼\n/sync #案件碼\n/sync 使用者ID\n群組請用 /spb_sync，避免與 SPB 重複回覆。"
-OWNER_HELP = "\n/sudo ID：授權查詢及清除訊息\n/sudo del ID：撤權\n/sudo list：查看授權\n/purge：回覆起點訊息，刪除至最新訊息"
+OWNER_HELP = "\n/sudo ID：授權查詢、清除、入群及審核\n/sudo del ID：撤權\n/sudo list：查看授權\n/purge：回覆起點訊息，刪除至最新訊息\n/join @群組或私人邀請連結\n/ignore 群組ID：停止掃描\n/ignore del 群組ID：恢復掃描\n/ignore list：查看排除名單"
 STATES = {"sending": "送出結果待確認", "sent": "已送出，等候 hexDrill 確認",
           "uncertain": "未確認成功，已停止後續封禁", "acked": "hexDrill 已確認成功",
           "cancelled": "已取消這次嘗試", "rejected": "已拒絕"}
@@ -66,6 +66,8 @@ class Control:
         initialize(self)
         from purge import initialize as initialize_purge
         initialize_purge(self)
+        from spy import initialize as initialize_spy
+        initialize_spy(self)
 
     def authorized(self, user):
         return user == self.owner or self.db.execute("SELECT 1 FROM sudo_users WHERE user_id=?", (user,)).fetchone() is not None
@@ -91,15 +93,16 @@ class Control:
                 return
             self.advance(chat, message_id)
             purge_command = text.strip().split(' ', 1)[0] == '/purge'
+            group_command = text.strip().split(' ', 1)[0] in ('/join', '/ignore')
             if (not trusted or not self.authorized(actor)
-                    or (chat > 0 and self.config.get("owner_only_private") and actor != self.owner and not purge_command)
+                    or (chat > 0 and self.config.get("owner_only_private") and actor != self.owner and not (purge_command or group_command))
                     or (chat != actor and chat != self.config["destination_chat_id"] and not (purge_command and chat < 0))):
                 return
             parts = text.strip().split()
-            if not parts or len(text) > 160:
+            if not parts or len(text) > 180:
                 return
             command = parts[0].lower()
-            if command not in ("/sync", "/spb_sync", "/sudo", "/unsudo", "/help", "/start", "/evidence", "/purge"):
+            if command not in ("/sync", "/spb_sync", "/sudo", "/unsudo", "/help", "/start", "/evidence", "/purge", "/join", "/ignore"):
                 return
             if chat < 0 and command in ("/sync", "/help", "/start"):
                 return
@@ -109,7 +112,12 @@ class Control:
             if count >= 6:
                 return
             self.db.execute("INSERT INTO control_audit VALUES (?,?,?,?,?)", (chat, message_id, actor, command, now))
-            if command == "/purge":
+            if group_command:
+                from spy import command as group_control
+                body = group_control(self, chat, message_id, actor, parts)
+                if body is None:
+                    return
+            elif command == "/purge":
                 from purge import request
                 body = request(self, chat, message_id, actor) if len(parts) == 1 else "請回覆起點訊息，再輸入 /purge。"
                 if body is None:
@@ -134,12 +142,12 @@ class Control:
                         body = "⚠️ 資料未能更新，以下為上次讀取結果。\n" + body
                 except ValueError as error:
                     body = str(error)
-            prefix = 'purge' if command == '/purge' else 'reply'
+            prefix = 'groupctl' if group_command else 'purge' if command == '/purge' else 'reply'
             self.enqueue(f"{prefix}:{chat}:{message_id}", chat, body, actor)
 
     def sudo(self, parts):
         if parts == ["/sudo", "list"]:
-            return "主持人：%s\n可查詢：%s" % (self.owner, "、".join(str(i) for i in sorted(self.users() - {self.owner})) or "無")
+            return "主持人：%s\n授權人員：%s" % (self.owner, "、".join(str(i) for i in sorted(self.users() - {self.owner})) or "無")
         remove = parts[0] == "/unsudo" or (len(parts) == 3 and parts[1] == "del")
         valid = len(parts) == 2 or (len(parts) == 3 and parts[1] in ("add", "del"))
         if not valid or not re.fullmatch(r"[1-9][0-9]{0,15}", parts[-1]) or int(parts[-1]) >= 2**52:
@@ -156,7 +164,7 @@ class Control:
             return "最多授權 20 人，請先移除不再需要的帳號。"
         self.db.execute("INSERT OR IGNORE INTO sudo_users VALUES (?,?)", (user, int(time.time())))
         where = "請對方在指定群組使用 /spb_sync" if self.config.get("owner_only_private") else "請對方私訊 SPB-WATCH /help"
-        return f"已授權 {user} 查詢及清除訊息。{where}；/purge 可在所有群組及私訊使用。不能授權他人或操作封禁。"
+        return f"已授權 {user} 查詢、清除訊息、/join 入群及 WATCH 案件核准。{where}；/purge 可在所有群組及私訊使用。不能授權他人。"
 
     def refresh(self):
         # Read all related cases in one source transaction; never open it for writes.
@@ -218,11 +226,14 @@ class Watch:
             transport.bind_ledger(ledger)
         from purge import interrupted
         interrupted(self.control)
+        from spy import interrupted as interrupted_joins
+        interrupted_joins(self.control)
 
     async def incoming(self, chat, message_id, actor, text, peer, date=None):
         c = self.control
         purge_command = text.strip().split(' ', 1)[0] == '/purge' and c.authorized(actor)
-        if chat > 0 and c.config.get("owner_only_private") and actor != c.owner and not purge_command:
+        group_command = text.strip().split(' ', 1)[0] in ('/join', '/ignore') and c.authorized(actor)
+        if chat > 0 and c.config.get("owner_only_private") and actor != c.owner and not (purge_command or group_command):
             return
         if chat != actor and chat != c.config["destination_chat_id"] and not (purge_command and chat < 0):
             return
@@ -249,8 +260,13 @@ class Watch:
                 self.capture(actor, message_id, text, date or int(time.time()))
             from purge import run
             await run(c, self.transport, {chat: peer})
+            from spy import joins
+            await joins(c, self.transport)
             await self.deliver({chat: peer}, key=f"reply:{chat}:{message_id}")
             await self.deliver({chat: peer}, key=f"purge:{chat}:{message_id}")
+            await self.deliver({chat: peer}, key=f"groupctl:{chat}:{message_id}")
+            for state in ('done','waiting','uncertain'):
+                await self.deliver({chat: peer}, key=f"groupctl:{chat}:{message_id}:{state}")
         except Flood:
             pass  # Leave the response queued until Telegram's cooldown expires.
         except Exception as error:
@@ -315,6 +331,24 @@ class Watch:
             break
         from inbox import outcomes
         outcomes(c)
+        from spy import joins
+        await joins(c, t)
+        if group_ok and c.config.get('spy_enabled'):
+            from spy_delivery import tick
+            try:
+                await tick(c, t)
+            except Flood:
+                raise
+            except Exception as error:
+                print('watch reviewed delivery:',type(error).__name__,flush=True)
+                with c.db:
+                    for chat in (c.owner,c.config['destination_chat_id']):
+                        c.enqueue('spy-worker-error:'+str(chat),chat,'⚠️ WATCH 未能更新審核或同步狀態，請檢查服務；未確認的操作不會自動重送。')
+        if c.config.get('spy_enabled'):
+            oldest=c.db.execute("SELECT min(received_at) FROM watch_spy WHERE status='pending'").fetchone()[0]
+            if oldest and int(time.time())-oldest>120:
+                with c.db:
+                    c.enqueue('spy-scan-delayed',c.owner,'⚠️ WATCH 模型掃描已延遲超過兩分鐘，請檢查 SPB 服務。')
         from purge import run
         await run(c, t, peers)
         await self.deliver(peers)
@@ -348,8 +382,9 @@ class Watch:
         rows = c.db.execute("SELECT * FROM watch_outbox WHERE state IN ('queued','sending') AND next_at<=? AND (? IS NULL OR key=?) ORDER BY created_at,key LIMIT 20", (int(time.time()), key, key)).fetchall()
         for row in rows:
             purge_notice = row['key'].startswith('purge:')
+            group_notice = row['key'].startswith('groupctl:')
             if (c.config.get("owner_only_private") and row["chat_id"] > 0
-                    and row["chat_id"] != c.owner and not purge_notice):
+                    and row["chat_id"] != c.owner and not (purge_notice or group_notice)):
                 with c.db:
                     c.db.execute("UPDATE watch_outbox SET state='cancelled' WHERE key=?", (row["key"],))
                 continue
