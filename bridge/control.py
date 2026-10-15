@@ -248,9 +248,9 @@ class Watch:
                 await self.poll(chat, peer)
             except Exception as error:
                 print("watch commands:", chat, type(error).__name__, flush=True)
-        await self.deliver(peers)
         from inbox import outcomes
         outcomes(c)
+        await self.deliver(peers)
 
     async def poll(self, chat, peer):
         c, t = self.control, self.transport
