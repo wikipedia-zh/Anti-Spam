@@ -14,7 +14,7 @@ def configuration(path):
     config = json.loads(Path(path).read_text(encoding="utf-8"))
     required = {"source_db", "state_dir", "destination_chat_id", "account_id", "hex_bot_id",
                 "allowed_observers", "live", "receiver_scope_confirmed", "credentials_file", "session_file"}
-    if not required <= set(config) or set(config) - required - {"operator_id", "dm_enabled"}:
+    if not required <= set(config) or set(config) - required - {"operator_id", "dm_enabled", "owner_only_private"}:
         raise StopBridge("Unknown or missing configuration fields")
     if type(config["destination_chat_id"]) is not int or config["destination_chat_id"] >= 0:
         raise StopBridge("Set the destination's numeric group ID")
@@ -29,6 +29,8 @@ def configuration(path):
         raise StopBridge("Live switches must be booleans")
     if "dm_enabled" in config and type(config["dm_enabled"]) is not bool:
         raise StopBridge("dm_enabled must be a boolean")
+    if "owner_only_private" in config and type(config["owner_only_private"]) is not bool:
+        raise StopBridge("owner_only_private must be a boolean")
     if not isinstance(config["allowed_observers"], list) or len(config["allowed_observers"]) > 3 or any(type(i) is not int or i <= 0 for i in config["allowed_observers"]):
         raise StopBridge("Invalid observer allowlist")
     for key in ("source_db", "state_dir", "credentials_file", "session_file"):

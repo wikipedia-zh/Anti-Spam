@@ -21,6 +21,8 @@ def initialize(control):
 
 
 def capture(control, user, message_id, text, date):
+    if control.config.get("owner_only_private") and user != control.owner:
+        return
     if (not control.config.get("dm_enabled") or user <= 0 or user >= 2**52 or user in PROTECTED
             or user in (control.config["account_id"], control.config["hex_bot_id"])):
         return

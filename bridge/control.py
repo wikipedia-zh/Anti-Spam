@@ -89,6 +89,7 @@ class Control:
                 return
             self.advance(chat, message_id)
             if (not trusted or not self.authorized(actor)
+                    or (chat > 0 and self.config.get("owner_only_private") and actor != self.owner)
                     or (chat != actor and chat != self.config["destination_chat_id"])):
                 return
             parts = text.strip().split()
@@ -145,7 +146,8 @@ class Control:
         if len(self.users()) >= 21 and not self.authorized(user):
             return "最多授權 20 人，請先移除不再需要的帳號。"
         self.db.execute("INSERT OR IGNORE INTO sudo_users VALUES (?,?)", (user, int(time.time())))
-        return f"已授權 {user} 查詢。請對方私訊 SPB-WATCH /help；不能授權他人或操作封禁。"
+        where = "請對方在指定群組使用 /spb_sync" if self.config.get("owner_only_private") else "請對方私訊 SPB-WATCH /help"
+        return f"已授權 {user} 查詢。{where}；不能授權他人或操作封禁。"
 
     def refresh(self):
         # Read all related cases in one source transaction; never open it for writes.
@@ -208,6 +210,8 @@ class Watch:
 
     async def incoming(self, chat, message_id, actor, text, peer, date=None):
         c = self.control
+        if chat > 0 and c.config.get("owner_only_private") and actor != c.owner:
+            return
         if chat != actor and chat != c.config["destination_chat_id"]:
             return
         if not c.authorized(actor) and not (chat == actor and c.config.get("dm_enabled")):
@@ -271,13 +275,14 @@ class Watch:
             print("watch source:", type(error).__name__, flush=True)
             with c.db:
                 c.enqueue("source-unavailable", c.owner, "⚠️ SPB-WATCH 無法更新 SPB 案件。查詢可能顯示舊資料，請檢查服務。")
+        private_users = {c.owner} if c.config.get("owner_only_private") else c.users()
         peers = dict(self.incoming_peers)
-        peers.update(await t.control_peers(c.users(), group_ok))
+        peers.update(await t.control_peers(private_users, group_ok))
         if not group_ok:
             peers.pop(c.config["destination_chat_id"], None)
         # Events handle new messages immediately. Poll at most one authorized
         # conversation per cycle to recover missed commands after reconnecting.
-        candidates = c.users() | ({c.config["destination_chat_id"]} if group_ok else set())
+        candidates = private_users | ({c.config["destination_chat_id"]} if group_ok else set())
         for chat in sorted(candidates, key=lambda chat: (self.polled_at.get(chat, 0), chat)):
             if chat not in peers or int(time.time()) - self.polled_at.get(chat, 0) < 60:
                 continue
@@ -295,6 +300,8 @@ class Watch:
 
     async def poll(self, chat, peer):
         c, t = self.control, self.transport
+        if chat > 0 and c.config.get("owner_only_private") and chat != c.owner:
+            return
         cursor = c.cursor(chat)
         if cursor is None:
             grant = c.db.execute("SELECT granted_at FROM sudo_users WHERE user_id=?", (chat,)).fetchone()
@@ -319,6 +326,11 @@ class Watch:
         c, t = self.control, self.transport
         rows = c.db.execute("SELECT * FROM watch_outbox WHERE state IN ('queued','sending') AND next_at<=? AND (? IS NULL OR key=?) ORDER BY created_at,key LIMIT 20", (int(time.time()), key, key)).fetchall()
         for row in rows:
+            if (c.config.get("owner_only_private") and row["chat_id"] > 0
+                    and row["chat_id"] != c.owner):
+                with c.db:
+                    c.db.execute("UPDATE watch_outbox SET state='cancelled' WHERE key=?", (row["key"],))
+                continue
             if row["actor"] is not None and not c.authorized(row["actor"]):
                 with c.db:
                     c.db.execute("UPDATE watch_outbox SET state='cancelled' WHERE key=?", (row["key"],))

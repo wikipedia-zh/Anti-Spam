@@ -234,6 +234,9 @@ class Telegram:
 
         async def incoming(event):
             message = event.message
+            if (message.chat_id > 0 and self.config.get("owner_only_private")
+                    and message.sender_id != self.config["operator_id"]):
+                return
             if message.chat_id != message.sender_id and message.chat_id != self.config["destination_chat_id"]:
                 return
             if message.fwd_from or message.via_bot_id or message.out or message.edit_date or message.action:

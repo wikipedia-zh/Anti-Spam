@@ -240,6 +240,38 @@ class Access(Fixture):
         self.assertEqual(client.scans, 1)
         self.assertEqual(client.limit, 100)
 
+    def test_owner_only_private_keeps_owner_and_group_commands(self):
+        config = dict(self.config, owner_only_private=True, dm_enabled=False)
+        transport = FakeTransport(dm_bad=False)
+        watch = Watch(config, self.ledger, transport)
+        async def exercise():
+            await watch.incoming(500, 1, 500, "/sudo 600", 500)
+            await watch.incoming(600, 2, 600, "/sync 100", 600)
+            await watch.incoming(700, 3, 700, "casino", 700)
+            await watch.incoming(-10001, 4, 600, "/spb_sync 100", -10001)
+            await watch.incoming(500, 5, 500, "/sudo list", 500)
+        asyncio.run(exercise())
+        self.assertEqual(transport.sent, [500, -10001, 500])
+        self.assertTrue(watch.control.authorized(600))
+        self.assertEqual(watch.control.db.execute("SELECT count(*) FROM watch_inbox").fetchone()[0], 0)
+        self.assertNotIn(600, watch.incoming_peers)
+        self.assertNotIn(700, watch.incoming_peers)
+        body = watch.control.db.execute("SELECT body FROM watch_outbox WHERE key='reply:500:1'").fetchone()[0]
+        self.assertIn("指定群組", body)
+
+    def test_owner_only_private_cancels_old_replies_without_reading_history(self):
+        class NoHistory(FakeTransport):
+            async def control_messages(self, *args):
+                raise AssertionError("non-owner private history must not be read")
+        watch = Watch(dict(self.config, owner_only_private=True), self.ledger, NoHistory(dm_bad=False))
+        with self.c.db:
+            self.c.enqueue("old-greeting", 600, "hello")
+            self.c.enqueue("owner-alert", 500, "warning")
+        asyncio.run(watch.poll(600, 600))
+        asyncio.run(watch.deliver({500:500, 600:600}))
+        self.assertEqual(watch.transport.sent, [500])
+        self.assertEqual(self.c.db.execute("SELECT state FROM watch_outbox WHERE key='old-greeting'").fetchone()[0], "cancelled")
+
 
 class FakeTransport:
     def __init__(self, group_bad=False, dm_bad=True):
