@@ -18,7 +18,7 @@ def source(c):
     return db
 
 
-def candidates(c):
+def candidates(c, *, include_pending=False, notify=True):
     snapshot = read_source(c.config['source_db'], c.users() | {c.config['account_id'], c.config['hex_bot_id'], c.config['spb_bot_id']})
     db = source(c)
     try:
@@ -30,6 +30,8 @@ def candidates(c):
         for row in db.execute("""SELECT d.case_id FROM report_deliveries d JOIN cases c ON c.id=d.case_id
             WHERE c.matched_rule_pattern='WATCH_SPY' AND d.state='pending'
             AND (d.last_error IS NOT NULL OR (d.attempts>1 AND d.review_message_id IS NULL))"""):
+            if not notify:
+                continue
             with c.db:
                 for chat in (c.owner,c.config['destination_chat_id']):
                     c.enqueue(f"spy-report-error:{row[0]}:{chat}",chat,f"⚠️ WATCH 案件 #{row[0].replace('-','')[:8]} 未能送出審核卡，尚未加入黑名單。")
@@ -45,7 +47,7 @@ def candidates(c):
             continue
         if c.db.execute('SELECT 1 FROM owned WHERE user_id=? AND active=1',(row['target_user_id'],)).fetchone():
             continue
-        if c.db.execute("SELECT 1 FROM spy_operations s JOIN operations o ON o.id=s.operation_id WHERE s.case_id=? AND o.action='ban' AND o.state!='cancelled'",(row['id'],)).fetchone():
+        if not include_pending and c.db.execute("SELECT 1 FROM spy_operations s JOIN operations o ON o.id=s.operation_id WHERE s.case_id=? AND o.action='ban' AND o.state!='cancelled'",(row['id'],)).fetchone():
             continue
         changes.append(('ban',row['target_user_id'],row['id']))
     return changes

@@ -1,4 +1,4 @@
-"""Owner-controlled queries and delivery alerts. Never creates moderation operations."""
+"""Authorized commands, queries and delivery alerts."""
 import asyncio
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -10,7 +10,7 @@ import time
 from core import StopBridge
 from telegram_client import Flood
 
-HELP = "SPB-WATCH\n/sync sync:追蹤碼\n/sync #案件碼\n/sync 使用者ID\n群組請用 /spb_sync，避免與 SPB 重複回覆。"
+HELP = "SPB-WATCH\n/sync sync:追蹤碼\n/sync #案件碼\n/sync 使用者ID\n/queue：查看剩餘寫入\n/queue resume：先重試一筆，成功後繼續\n群組查詢案件請用 /spb_sync，避免與 SPB 重複回覆。"
 OWNER_HELP = "\n/sudo ID：授權查詢、清除、入群及審核\n/sudo del ID：撤權\n/sudo list：查看授權\n/purge：回覆起點訊息，刪除至最新訊息\n/join @群組或私人邀請連結\n/ignore 群組ID：停止掃描\n/ignore del 群組ID：恢復掃描\n/ignore list：查看排除名單"
 STATES = {"sending": "送出結果待確認", "sent": "已送出，等候 hexDrill 確認",
           "uncertain": "未確認成功，已停止後續封禁", "acked": "hexDrill 已確認成功",
@@ -86,7 +86,7 @@ class Control:
     def advance(self, chat, message):
         self.db.execute("INSERT INTO control_cursors VALUES (?,?) ON CONFLICT(chat_id) DO UPDATE SET message_id=max(message_id,excluded.message_id)", (chat, message))
 
-    def handle(self, chat, message_id, actor, text, trusted=True):
+    def handle(self, chat, message_id, actor, text, trusted=True, date=None):
         with self.db:
             cursor = self.cursor(chat)
             if cursor is None or message_id <= cursor:
@@ -102,7 +102,7 @@ class Control:
             if not parts or len(text) > 180:
                 return
             command = parts[0].lower()
-            if command not in ("/sync", "/spb_sync", "/sudo", "/unsudo", "/help", "/start", "/evidence", "/purge", "/join", "/ignore"):
+            if command not in ("/sync", "/spb_sync", "/sudo", "/unsudo", "/help", "/start", "/evidence", "/purge", "/join", "/ignore", "/queue"):
                 return
             if chat < 0 and command in ("/sync", "/help", "/start"):
                 return
@@ -112,7 +112,13 @@ class Control:
             if count >= 6:
                 return
             self.db.execute("INSERT INTO control_audit VALUES (?,?,?,?,?)", (chat, message_id, actor, command, now))
-            if group_command:
+            if command == '/queue':
+                from delivery_queue import command as queue_command
+                try:
+                    body = queue_command(self, chat, message_id, actor, parts, date)
+                except Exception:
+                    body = '無法讀取目前佇列，未啟動寫入。請檢查來源資料庫及同步設定。'
+            elif group_command:
                 from spy import command as group_control
                 body = group_control(self, chat, message_id, actor, parts)
                 if body is None:
@@ -164,7 +170,7 @@ class Control:
             return "最多授權 20 人，請先移除不再需要的帳號。"
         self.db.execute("INSERT OR IGNORE INTO sudo_users VALUES (?,?)", (user, int(time.time())))
         where = "請對方在指定群組使用 /spb_sync" if self.config.get("owner_only_private") else "請對方私訊 SPB-WATCH /help"
-        return f"已授權 {user} 查詢、清除訊息、/join 入群及 WATCH 案件核准。{where}；/purge 可在所有群組及私訊使用。不能授權他人。"
+        return f"已授權 {user} 查詢、清除訊息、/join 入群、WATCH 案件核准及 /queue resume。{where}；/purge 可在所有群組及私訊使用。不能授權他人。"
 
     def refresh(self):
         # Read all related cases in one source transaction; never open it for writes.
@@ -255,7 +261,7 @@ class Watch:
             if c.cursor(chat) is None:
                 with c.db:
                     c.advance(chat, message_id - 1)
-            c.handle(chat, message_id, actor, text)
+            c.handle(chat, message_id, actor, text, date=date)
             if chat == actor:
                 self.capture(actor, message_id, text, date or int(time.time()))
             from purge import run
@@ -333,7 +339,19 @@ class Watch:
         outcomes(c)
         from spy import joins
         await joins(c, t)
-        if group_ok and c.config.get('spy_enabled'):
+        from delivery_queue import managed, tick as queue_tick, pause
+        queue_managed = managed(c)
+        if queue_managed:
+            if group_ok:
+                try:
+                    await queue_tick(c, t)
+                except Flood:
+                    raise
+                except Exception as error:
+                    print('watch queue:', type(error).__name__, flush=True)
+            else:
+                pause(c, '無法核對指定群組，未繼續寫入。')
+        if group_ok and c.config.get('spy_enabled') and not queue_managed:
             from spy_delivery import tick
             try:
                 await tick(c, t)
@@ -366,14 +384,14 @@ class Watch:
             if grant:
                 for message in latest:
                     if message["date"] >= grant[0]:
-                        c.handle(chat, message["id"], message["actor"], message["text"], message["trusted"])
+                        c.handle(chat, message["id"], message["actor"], message["text"], message["trusted"], date=message['date'])
             if chat > 0:
                 for message in latest:
                     if message["trusted"] and message["actor"] == chat:
                         self.capture(chat, message["id"], message["text"], message["date"])
             return
         for message in await t.control_messages(peer, cursor):
-            c.handle(chat, message["id"], message["actor"], message["text"], message["trusted"])
+            c.handle(chat, message["id"], message["actor"], message["text"], message["trusted"], date=message['date'])
             if chat > 0 and message["trusted"] and message["actor"] == chat:
                 self.capture(chat, message["id"], message["text"], message["date"])
 

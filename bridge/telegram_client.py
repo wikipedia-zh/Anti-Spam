@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import time
 
-from core import HEX_USERNAME, StopBridge, valid_ack
+from core import HEX_USERNAME, StopBridge, valid_ack, valid_failure
 
 
 class Flood(Exception):
@@ -171,6 +171,20 @@ class Telegram:
         return None
 
     @guarded
+    async def confirmed_failure(self, operation):
+        command = await self.client.get_messages(self.destination, ids=operation['message_id'])
+        if (not command or command.chat_id != self.config['destination_chat_id']
+                or command.sender_id != self.config['account_id'] or not command.out
+                or command.raw_text != operation['command'] or command.fwd_from or command.edit_date):
+            return False
+        reply = await self.client.get_messages(self.destination, ids=operation['reply_id'])
+        return bool(reply and valid_failure({
+            'chat_id': reply.chat_id, 'sender_id': reply.sender_id, 'reply_to': reply.reply_to_msg_id,
+            'forwarded': bool(reply.fwd_from), 'via_bot': bool(reply.via_bot_id),
+            'out': reply.out, 'text': reply.raw_text or ''}, operation,
+            self.config['hex_bot_id'], self.config['destination_chat_id']))
+
+    @guarded
     async def reconcile(self, ledger):
         """Observe one existing operation; this method cannot create or send one."""
         operation = ledger.pending()
@@ -196,11 +210,11 @@ class Telegram:
         async for message in self.client.iter_messages(self.destination, limit=200):
             if message.id <= operation["message_id"]:
                 break
-            if (message.chat_id == self.config["destination_chat_id"]
-                    and message.sender_id == self.config["hex_bot_id"]
-                    and message.reply_to_msg_id == operation["message_id"]
-                    and not message.fwd_from and not message.via_bot_id and not message.out
-                    and message.raw_text == "⚠️ 操作失敗，請稍後再試。"):
+            if valid_failure({'chat_id': message.chat_id, 'sender_id': message.sender_id,
+                    'reply_to': message.reply_to_msg_id, 'forwarded': bool(message.fwd_from),
+                    'via_bot': bool(message.via_bot_id), 'out': message.out,
+                    'text': message.raw_text or ''}, operation,
+                    self.config['hex_bot_id'], self.config['destination_chat_id']):
                 with ledger.conn:
                     ledger.conn.execute("UPDATE operations SET state='uncertain',error='receiver_failed',reply_id=? WHERE id=?", (message.id, operation["id"]))
                 return

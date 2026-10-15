@@ -260,7 +260,7 @@ class Ledger:
         if not row or row["state"] not in ("sent", "uncertain") or not row["message_id"]:
             raise StopBridge("No sent operation to acknowledge")
         with self.conn:
-            self.conn.execute("UPDATE operations SET state='acked',reply_id=? WHERE id=?", (reply_id, op))
+            self.conn.execute("UPDATE operations SET state='acked',reply_id=?,error=NULL WHERE id=?", (reply_id, op))
             self.conn.execute("INSERT INTO owned VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET active=excluded.active", (row["user_id"], int(row["action"] == "ban")))
 
 
@@ -272,3 +272,10 @@ def valid_ack(message, operation, hex_id, destination_id):
     lines = message.get("text", "").strip().splitlines()
     ending = "✅ +spb：已加入，封鎖（永久）" if operation["action"] == "ban" else "➖ +spb：已移除"
     return len(lines) >= 2 and lines[-2:] == ["📋 阻擋清單：", ending]
+
+
+def valid_failure(message, operation, hex_id, destination_id):
+    return (message.get('chat_id') == destination_id and message.get('sender_id') == hex_id
+            and message.get('reply_to') == operation['message_id']
+            and not any(message.get(k) for k in ('forwarded', 'via_bot', 'out'))
+            and message.get('text', '').strip() == '⚠️ 操作失敗，請稍後再試。')

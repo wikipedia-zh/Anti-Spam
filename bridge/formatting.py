@@ -3,7 +3,7 @@ import re
 
 TOKENS = re.compile(
     r"(?<![\w])(?:sync:[0-9a-f]{12,32}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"
-    r"|#[0-9a-f]{8,32}|-?[1-9][0-9]{4,15}|/(?:spb_sync|sync|sudo|unsudo|purge|evidence|help|start|join|ignore))(?![\w])",
+    r"|#[0-9a-f]{8,32}|-?[1-9][0-9]{4,15}|/(?:spb_sync|sync|sudo|unsudo|purge|evidence|help|start|join|ignore|queue))(?![\w])",
     re.IGNORECASE,
 )
 
