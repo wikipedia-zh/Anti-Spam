@@ -193,6 +193,21 @@ class Watch:
         self.control = Control(config, ledger)
         self.transport = transport
 
+    async def incoming(self, chat, message_id, actor, text, peer):
+        c = self.control
+        if not c.authorized(actor) or (chat != actor and chat != c.config["destination_chat_id"]):
+            return
+        try:
+            if chat < 0:
+                await self.transport.check_destination()
+            if c.cursor(chat) is None:
+                with c.db:
+                    c.advance(chat, message_id - 1)
+            c.handle(chat, message_id, actor, text)
+            await self.deliver({chat: peer}, key=f"reply:{chat}:{message_id}")
+        except Exception as error:
+            print("watch command:", type(error).__name__, flush=True)
+
     async def tick(self):
         c, t = self.control, self.transport
         group_ok = False
@@ -234,9 +249,9 @@ class Watch:
         for message in await t.control_messages(peer, cursor):
             c.handle(chat, message["id"], message["actor"], message["text"], message["trusted"])
 
-    async def deliver(self, peers):
+    async def deliver(self, peers, key=None):
         c, t = self.control, self.transport
-        rows = c.db.execute("SELECT * FROM watch_outbox WHERE state IN ('queued','sending') AND next_at<=? ORDER BY created_at,key LIMIT 20", (int(time.time()),)).fetchall()
+        rows = c.db.execute("SELECT * FROM watch_outbox WHERE state IN ('queued','sending') AND next_at<=? AND (? IS NULL OR key=?) ORDER BY created_at,key LIMIT 20", (int(time.time()), key, key)).fetchall()
         for row in rows:
             if row["actor"] is not None and not c.authorized(row["actor"]):
                 with c.db:
@@ -254,7 +269,9 @@ class Watch:
                         continue  # Unknown RPC outcome: never blindly repeat a notice.
                 else:
                     with c.db:
-                        c.db.execute("UPDATE watch_outbox SET state='sending' WHERE key=?", (row["key"],))
+                        claimed = c.db.execute("UPDATE watch_outbox SET state='sending' WHERE key=? AND state='queued'", (row["key"],)).rowcount
+                    if not claimed:
+                        continue
                     message_id = await t.send_notice(peer, row)
                 with c.db:
                     c.db.execute("UPDATE watch_outbox SET state='sent',message_id=?,error=NULL WHERE key=?", (message_id, row["key"]))
@@ -267,6 +284,7 @@ class Watch:
                 print("watch notice:", row["chat_id"], type(error).__name__, flush=True)
 
     async def run(self):
+        self.transport.install_control_handler(self.incoming)
         while True:
             try:
                 await self.tick()

@@ -30,7 +30,7 @@ def make_client(config):
         private_file(session)
     client = TelegramClient(str(session), int(credentials["api_id"]), credentials["api_hash"],
         request_retries=0, connection_retries=2, timeout=10, flood_sleep_threshold=0,
-        receive_updates=False, device_model="SPB bridge", app_version="1.0")
+        receive_updates=bool(config.get("operator_id")), device_model="SPB-WATCH", app_version="1.1")
     client.session.save_entities = False
     return client
 
@@ -162,6 +162,18 @@ class Telegram:
                  "date": int(m.date.timestamp()),
                  "trusted": not (m.fwd_from or m.via_bot_id or m.out or m.edit_date)}
                 async for m in self.client.iter_messages(peer, **options)]
+
+    def install_control_handler(self, handler):
+        from telethon import events
+
+        async def incoming(event):
+            message = event.message
+            if message.fwd_from or message.via_bot_id or message.out or message.edit_date:
+                return
+            await handler(message.chat_id, message.id, message.sender_id,
+                          message.raw_text or "", await event.get_input_chat())
+
+        self.client.add_event_handler(incoming, events.NewMessage(incoming=True))
 
     async def send_notice(self, peer, notice):
         from telethon import errors, functions

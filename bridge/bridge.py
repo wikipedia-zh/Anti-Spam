@@ -73,6 +73,7 @@ async def telegram_command(config, command, ledger=None):
         if config.get("operator_id"):
             from control import Watch
             watch = Watch(config, ledger, transport)
+            transport.install_control_handler(watch.incoming)
         last = None
         while True:
             if watch:

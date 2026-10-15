@@ -132,6 +132,22 @@ class Access(Fixture):
         self.assertEqual(self.ledger.pending()["reply_id"], 11)
         self.assertEqual(self.c.db.execute("SELECT count(*) FROM owned").fetchone()[0], 0)
 
+    def test_live_commands_reply_without_waiting_for_poll_and_do_not_replay(self):
+        transport = FakeTransport(dm_bad=False)
+        watch = Watch(self.config, self.ledger, transport)
+        async def exercise():
+            await watch.incoming(500, 1, 500, "/sudo list", 500)
+            await watch.incoming(500, 1, 500, "/sudo list", 500)
+            await watch.incoming(600, 2, 600, "/sudo 700", 600)
+        asyncio.run(exercise())
+        self.assertEqual(transport.sent, [500])
+        self.assertFalse(self.c.authorized(700))
+
+    def test_live_group_commands_require_fresh_membership(self):
+        watch = Watch(self.config, self.ledger, FakeTransport(group_bad=True))
+        asyncio.run(watch.incoming(-10001, 1, 500, "/sudo 600", -10001))
+        self.assertFalse(self.c.authorized(600))
+
 
 class FakeTransport:
     def __init__(self, group_bad=False, dm_bad=True):
