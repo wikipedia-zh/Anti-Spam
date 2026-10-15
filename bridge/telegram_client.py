@@ -1,5 +1,6 @@
 """The only module allowed to send Telegram messages."""
 import asyncio
+from functools import wraps
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,39 @@ from core import HEX_USERNAME, StopBridge, valid_ack
 class Flood(Exception):
     def __init__(self, seconds):
         self.seconds = seconds
+
+
+def flood_seconds(error):
+    if isinstance(error, Flood):
+        return error.seconds
+    try:
+        from telethon.errors import FloodWaitError
+    except ImportError:
+        return None
+    return error.seconds if isinstance(error, FloodWaitError) else None
+
+
+def guarded(method):
+    @wraps(method)
+    async def call(self, *args, **kwargs):
+        remaining = self.wait_until - int(time.time())
+        if remaining > 0:
+            raise Flood(remaining)
+        try:
+            return await method(self, *args, **kwargs)
+        except Exception as error:
+            if isinstance(error, Flood) and self.wait_until > int(time.time()):
+                raise
+            seconds = flood_seconds(error)
+            if seconds is None:
+                raise
+            self.wait_until = max(self.wait_until, int(time.time()) + seconds + 5)
+            if self.ledger is not None:
+                with self.ledger.conn:
+                    self.ledger.put("telegram_wait_until", self.wait_until)
+            print("Telegram rate limit; waiting until", self.wait_until, flush=True)
+            raise Flood(self.wait_until - int(time.time())) from None
+    return call
 
 
 def private_file(path):
@@ -39,7 +73,23 @@ class Telegram:
     def __init__(self, client, config):
         self.client, self.config = client, config
         self.destination = None
+        self.ledger = None
+        self.wait_until = 0
+        self.peers = {}
+        self.peers_checked_at = 0
 
+    def bind_ledger(self, ledger):
+        self.ledger = ledger
+        self.wait_until = ledger.get("telegram_wait_until", 0)
+
+    def remember_peer(self, chat, peer):
+        if chat > 0:
+            self.peers.pop(chat, None)
+            self.peers[chat] = peer
+            while len(self.peers) > 512:
+                del self.peers[next(iter(self.peers))]
+
+    @guarded
     async def check_destination(self):
         from telethon import utils
         me = await self.client.get_me()
@@ -66,6 +116,7 @@ class Telegram:
             raise StopBridge("Destination membership changed or cannot be verified")
         self.destination = fresh
 
+    @guarded
     async def send(self, operation):
         from telethon import errors, functions
         try:
@@ -82,6 +133,7 @@ class Telegram:
                 return update.id
         raise StopBridge("Telegram accepted the request without a message mapping")
 
+    @guarded
     async def recover(self, operation):
         matches = []
         async for message in self.client.iter_messages(self.destination, limit=200):
@@ -93,6 +145,7 @@ class Telegram:
             raise StopBridge("Duplicate command messages; inspect the group")
         return matches[0] if matches else None
 
+    @guarded
     async def acknowledgement(self, operation):
         # Only replies from the pinned bot to our exact command count.
         command = await self.client.get_messages(self.destination, ids=operation["message_id"])
@@ -108,11 +161,14 @@ class Telegram:
                 return message.id
         return None
 
+    @guarded
     async def reconcile(self, ledger):
         """Observe one existing operation; this method cannot create or send one."""
         operation = ledger.pending()
         if not operation:
             return
+        if operation["error"] == "receiver_failed" and operation["reply_id"]:
+            return  # A recorded rejection is final for this attempt.
         if not operation["message_id"]:
             found = await self.recover(operation)
             if not found:
@@ -138,14 +194,23 @@ class Telegram:
         if int(time.time()) - operation["created_at"] > 120 and operation["error"] != "receiver_failed":
             ledger.uncertain(operation["id"])
 
+    @guarded
     async def control_peers(self, users, group_ok):
         me = await self.client.get_me()
         if not me or me.bot or me.id != self.config["account_id"]:
             raise StopBridge("Wrong Telegram account")
-        peers = {}
-        async for dialog in self.client.iter_dialogs():
-            if (dialog.id in users or self.config.get("dm_enabled")) and dialog.is_user and not getattr(dialog.entity, "bot", False):
-                peers[dialog.id] = dialog.entity
+        # Recover only pending replies and authorized conversations after a restart.
+        # Ordinary private messages arrive through events, never a history scan.
+        if int(time.time()) - self.peers_checked_at >= 300:
+            wanted = set(users)
+            if self.ledger is not None:
+                wanted.update(r[0] for r in self.ledger.conn.execute(
+                    "SELECT DISTINCT chat_id FROM watch_outbox WHERE state IN ('queued','sending') AND chat_id>0"))
+            async for dialog in self.client.iter_dialogs(limit=100):
+                if dialog.id in wanted and dialog.is_user and not getattr(dialog.entity, "bot", False):
+                    self.remember_peer(dialog.id, dialog.entity)
+            self.peers_checked_at = int(time.time())
+        peers = dict(self.peers)
         if group_ok:
             peers[self.config["destination_chat_id"]] = self.destination
             # Resolve the owner's access hash from verified membership for a first DM.
@@ -156,6 +221,7 @@ class Telegram:
                         peers[member.id] = member
         return peers
 
+    @guarded
     async def control_messages(self, peer, cursor):
         options = {"limit": 1} if cursor is None else {"limit": 50, "min_id": cursor, "reverse": True}
         return [{"id": m.id, "actor": m.sender_id, "text": m.raw_text or "",
@@ -168,16 +234,22 @@ class Telegram:
 
         async def incoming(event):
             message = event.message
+            if message.chat_id != message.sender_id and message.chat_id != self.config["destination_chat_id"]:
+                return
             if message.fwd_from or message.via_bot_id or message.out or message.edit_date or message.action:
                 return
-            sender = await event.get_sender()
-            if not sender or getattr(sender, "bot", False):
+            # Events normally include both entities. Do not fetch missing senders
+            # while Telegram is rate limiting us.
+            sender = event.sender
+            peer = event.input_chat
+            if not sender or not peer or getattr(sender, "bot", False):
                 return
             await handler(message.chat_id, message.id, message.sender_id,
-                          message.raw_text or "", await event.get_input_chat(), int(message.date.timestamp()))
+                          message.raw_text or "", peer, int(message.date.timestamp()))
 
         self.client.add_event_handler(incoming, events.NewMessage(incoming=True))
 
+    @guarded
     async def send_notice(self, peer, notice):
         from telethon import errors, functions
         try:
@@ -193,6 +265,7 @@ class Telegram:
                 return update.id
         raise StopBridge("Notice accepted without a message mapping")
 
+    @guarded
     async def recover_notice(self, peer, notice):
         matches = [m.id async for m in self.client.iter_messages(peer, limit=100)
                    if m.out and m.sender_id == self.config["account_id"] and not m.fwd_from

@@ -199,6 +199,12 @@ class Watch:
     def __init__(self, config, ledger, transport):
         self.control = Control(config, ledger)
         self.transport = transport
+        self.incoming_peers = {}
+        self.polled_at = {}
+        self.group_checked_at = 0
+        self.group_ok = False
+        if hasattr(transport, "bind_ledger"):
+            transport.bind_ledger(ledger)
 
     async def incoming(self, chat, message_id, actor, text, peer, date=None):
         c = self.control
@@ -206,6 +212,12 @@ class Watch:
             return
         if not c.authorized(actor) and not (chat == actor and c.config.get("dm_enabled")):
             return
+        self.incoming_peers.pop(chat, None)
+        self.incoming_peers[chat] = peer
+        while len(self.incoming_peers) > 512:
+            del self.incoming_peers[next(iter(self.incoming_peers))]
+        if hasattr(self.transport, "remember_peer"):
+            self.transport.remember_peer(chat, peer)
         try:
             if chat < 0:
                 await self.transport.check_destination()
@@ -216,6 +228,8 @@ class Watch:
             if chat == actor:
                 self.capture(actor, message_id, text, date or int(time.time()))
             await self.deliver({chat: peer}, key=f"reply:{chat}:{message_id}")
+        except Flood:
+            pass  # Leave the response queued until Telegram's cooldown expires.
         except Exception as error:
             print("watch command:", type(error).__name__, flush=True)
 
@@ -226,28 +240,55 @@ class Watch:
         capture(self.control, actor, message_id, text, date)
 
     async def tick(self):
-        c, t = self.control, self.transport
-        group_ok = False
         try:
-            await t.check_destination()
-            group_ok = True
-            await t.reconcile(c.ledger)
-        except Exception as error:
-            print("watch destination:", type(error).__name__, flush=True)
-            with c.db:
-                c.enqueue("destination-unavailable", c.owner, "⚠️ SPB-WATCH 無法核對指定群組或封禁回覆。群組輸出已停止，請檢查成員及權限。")
+            await self.check_and_poll()
+        except Flood:
+            pass  # Stop this entire RPC cycle, not just the current conversation.
+
+    async def check_and_poll(self):
+        c, t = self.control, self.transport
+        if getattr(t, "wait_until", 0) > int(time.time()):
+            return
+        if int(time.time()) - self.group_checked_at >= 60:
+            self.group_ok = False
+            self.group_checked_at = int(time.time())
+            try:
+                await t.check_destination()
+                await t.reconcile(c.ledger)
+                self.group_ok = True
+                with c.db:
+                    c.ledger.put("watch_group_verified_at", int(time.time()))
+            except Flood:
+                raise
+            except Exception as error:
+                print("watch destination:", type(error).__name__, flush=True)
+                with c.db:
+                    c.enqueue("destination-unavailable", c.owner, "⚠️ SPB-WATCH 無法核對指定群組或封禁回覆。群組輸出已停止，請檢查成員及權限。")
+        group_ok = self.group_ok
         try:
             c.refresh()
         except Exception as error:
             print("watch source:", type(error).__name__, flush=True)
             with c.db:
                 c.enqueue("source-unavailable", c.owner, "⚠️ SPB-WATCH 無法更新 SPB 案件。查詢可能顯示舊資料，請檢查服務。")
-        peers = await t.control_peers(c.users(), group_ok)
-        for chat, peer in peers.items():
+        peers = dict(self.incoming_peers)
+        peers.update(await t.control_peers(c.users(), group_ok))
+        if not group_ok:
+            peers.pop(c.config["destination_chat_id"], None)
+        # Events handle new messages immediately. Poll at most one authorized
+        # conversation per cycle to recover missed commands after reconnecting.
+        candidates = c.users() | ({c.config["destination_chat_id"]} if group_ok else set())
+        for chat in sorted(candidates, key=lambda chat: (self.polled_at.get(chat, 0), chat)):
+            if chat not in peers or int(time.time()) - self.polled_at.get(chat, 0) < 60:
+                continue
+            self.polled_at[chat] = int(time.time())
             try:
-                await self.poll(chat, peer)
+                await self.poll(chat, peers[chat])
+            except Flood:
+                raise
             except Exception as error:
                 print("watch commands:", chat, type(error).__name__, flush=True)
+            break
         from inbox import outcomes
         outcomes(c)
         await self.deliver(peers)
@@ -291,6 +332,8 @@ class Watch:
                 if row["state"] == "sending":
                     message_id = await t.recover_notice(peer, row)
                     if not message_id:
+                        with c.db:
+                            c.db.execute("UPDATE watch_outbox SET next_at=? WHERE key=?", (int(time.time()) + 300, row["key"]))
                         continue  # Unknown RPC outcome: never blindly repeat a notice.
                 else:
                     with c.db:
@@ -302,7 +345,8 @@ class Watch:
                     c.db.execute("UPDATE watch_outbox SET state='sent',message_id=?,error=NULL WHERE key=?", (message_id, row["key"]))
             except Flood as error:
                 with c.db:
-                    c.db.execute("UPDATE watch_outbox SET state='queued',next_at=?,error='flood_wait' WHERE key=?", (int(time.time()) + error.seconds + 5, row["key"]))
+                    c.db.execute("UPDATE watch_outbox SET state=?,next_at=?,error='flood_wait' WHERE key=?", (row["state"], int(time.time()) + error.seconds + 5, row["key"]))
+                raise
             except Exception as error:
                 with c.db:
                     c.db.execute("UPDATE watch_outbox SET error=?,next_at=? WHERE key=?", (type(error).__name__, int(time.time()) + 300, row["key"]))

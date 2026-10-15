@@ -3,10 +3,11 @@ from datetime import datetime, timezone
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from control import Control, Watch, lookup
 from core import StopBridge
-from telegram_client import Telegram
+from telegram_client import Telegram, Flood
 from test_bridge import Fixture
 
 
@@ -147,6 +148,97 @@ class Access(Fixture):
         watch = Watch(self.config, self.ledger, FakeTransport(group_bad=True))
         asyncio.run(watch.incoming(-10001, 1, 500, "/sudo 600", -10001))
         self.assertFalse(self.c.authorized(600))
+
+    def test_old_private_dialogs_are_not_polled(self):
+        class ManyDialogs(FakeTransport):
+            def __init__(self):
+                super().__init__(dm_bad=False)
+                self.polled = []
+            async def control_peers(self, users, group_ok):
+                return await super().control_peers(users, group_ok) | {i: i for i in range(1000, 2000)}
+            async def control_messages(self, peer, cursor):
+                self.polled.append(peer)
+                return []
+        transport = ManyDialogs()
+        watch = Watch(dict(self.config, dm_enabled=True), self.ledger, transport)
+        asyncio.run(watch.tick())
+        asyncio.run(watch.tick())
+        self.assertEqual(set(transport.polled), {500, -10001})
+        self.assertEqual(len(transport.polled), 2)
+
+    def test_flood_stops_cycle_without_membership_warning(self):
+        class Limited(FakeTransport):
+            async def check_destination(self):
+                raise Flood(600)
+            async def control_peers(self, *args):
+                raise AssertionError("must stop after first rate limit")
+        asyncio.run(Watch(self.config, self.ledger, Limited()).tick())
+        self.assertEqual(self.c.db.execute("SELECT count(*) FROM watch_outbox").fetchone()[0], 0)
+
+    def test_new_private_event_keeps_peer_for_delayed_model_reply(self):
+        transport = FakeTransport(dm_bad=False)
+        watch = Watch(dict(self.config, dm_enabled=True), self.ledger, transport)
+        asyncio.run(watch.incoming(600, 1, 600, "hello", 600))
+        with self.c.db:
+            self.c.db.execute("UPDATE watch_inbox SET status='ham'")
+        asyncio.run(watch.tick())
+        self.assertEqual(transport.sent, [600])
+        self.assertFalse(self.c.authorized(600))
+
+    def test_recovery_flood_never_requeues_an_uncertain_send(self):
+        class Limited(FakeTransport):
+            async def recover_notice(self, *args):
+                raise Flood(600)
+        with self.c.db:
+            self.c.enqueue("already-sending", 500, "test")
+            self.c.db.execute("UPDATE watch_outbox SET state='sending'")
+        watch = Watch(self.config, self.ledger, Limited())
+        with self.assertRaises(Flood):
+            asyncio.run(watch.deliver({500: 500}))
+        row = self.c.db.execute("SELECT state,next_at FROM watch_outbox").fetchone()
+        self.assertEqual(row[0], "sending")
+        self.assertGreater(row[1], int(time.time()) + 590)
+
+    def test_transport_persists_flood_and_blocks_other_rpc_after_restart(self):
+        class FloodWaitError(Exception):
+            seconds = 600
+        class Client:
+            calls = 0
+            async def iter_messages(self, *args, **kwargs):
+                self.calls += 1
+                raise FloodWaitError()
+                yield
+            async def get_me(self):
+                raise AssertionError("cooldown must cover all RPC methods")
+        client = Client()
+        transport = Telegram(client, self.config)
+        transport.bind_ledger(self.ledger)
+        with patch.dict("sys.modules", {"telethon.errors": SimpleNamespace(FloodWaitError=FloodWaitError)}):
+            with self.assertRaises(Flood):
+                asyncio.run(transport.control_messages(500, 0))
+        restarted = Telegram(client, self.config)
+        restarted.bind_ledger(self.ledger)
+        with self.assertRaises(Flood):
+            asyncio.run(restarted.control_peers({500}, True))
+        self.assertEqual(client.calls, 1)
+        self.assertGreater(self.ledger.get("telegram_wait_until"), int(time.time()) + 590)
+
+    def test_peer_discovery_is_bounded_and_does_not_collect_old_dms(self):
+        class Client:
+            scans = 0
+            async def get_me(self):
+                return SimpleNamespace(id=11, bot=False)
+            async def iter_dialogs(self, *, limit):
+                self.scans += 1
+                self.limit = limit
+                for user in range(500, 500 + limit):
+                    yield SimpleNamespace(id=user, is_user=True, entity=SimpleNamespace(id=user, bot=False))
+        client = Client()
+        transport = Telegram(client, dict(self.config, dm_enabled=True))
+        self.assertEqual(set(asyncio.run(transport.control_peers({500}, False))), {500})
+        self.assertEqual(set(asyncio.run(transport.control_peers({500}, False))), {500})
+        self.assertEqual(client.scans, 1)
+        self.assertEqual(client.limit, 100)
 
 
 class FakeTransport:

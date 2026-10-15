@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 from core import HEX_USERNAME, Ledger, POLICY, StopBridge, preview, read_source
 
@@ -52,21 +53,29 @@ async def telegram_command(config, command, ledger=None):
     from telegram_client import Telegram, cycle, make_client
     client = make_client(config)
     try:
+        if ledger:
+            deadline = ledger.get("telegram_wait_until", 0)
+            if deadline > int(time.time()):
+                print("Waiting for Telegram cooldown until", deadline, flush=True)
+            while deadline > int(time.time()):
+                await asyncio.sleep(min(15, deadline - int(time.time())))
         if command == "login":
             await client.start()
         else:
             await client.connect()
             if not await client.is_user_authorized():
                 raise StopBridge("Log in interactively first; service mode never requests login codes")
-        me = await client.get_me()
-        bot = await client.get_entity(HEX_USERNAME)
-        if me.bot or not bot.bot:
-            raise StopBridge("Use a dedicated user account and the hexDrill bot")
         if command in ("login", "inspect"):
+            me = await client.get_me()
+            bot = await client.get_entity(HEX_USERNAME)
+            if me.bot or not bot.bot:
+                raise StopBridge("Use a dedicated user account and the hexDrill bot")
             groups = [d.id async for d in client.iter_dialogs() if d.id == config["destination_chat_id"]]
             print(json.dumps({"account_id": me.id, "hex_bot_id": bot.id, "destination_found": bool(groups)}))
             return
         transport = Telegram(client, config)
+        if ledger:
+            transport.bind_ledger(ledger)
         if command == "watch":
             from control import Watch
             await Watch(config, ledger, transport).run()
