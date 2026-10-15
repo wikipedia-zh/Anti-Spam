@@ -37,9 +37,14 @@ fn evidence(case: &CaseRecord) -> String {
 }
 
 fn identity(case: &CaseRecord) -> String {
+    let source = if case.chat_id > 0 {
+        "\n<b>來源</b>: 私訊".to_string()
+    } else {
+        format!("\n<b>群組</b>: <code>{}</code>", case.chat_id)
+    };
     format!(
-        "\n<b>對象</b>: <code>{}</code> {}\n<b>群組</b>: <code>{}</code>\n<b>案例</b>: <code>{}</code>",
-        case.target_user_id, field(&case.target_name, 256), case.chat_id, field(&case_ids::display(&case.id), 64),
+        "\n<b>對象</b>: <code>{}</code> {}{source}\n<b>案例</b>: <code>{}</code>",
+        case.target_user_id, field(&case.target_name, 256), field(&case_ids::display(&case.id), 64),
     )
 }
 
