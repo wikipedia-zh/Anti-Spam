@@ -67,7 +67,9 @@ def status(c):
     label = labels.get(state(c).get('status'), '未啟動')
     unsent = len({(x[0], x[1]) for x in todo} - {(x['action'], x['user_id']) for x in waiting})
     text = f'hexDrill +spb 佇列：{label}\n剩餘：{total} 筆\n尚未發送：{unsent} 筆\n已回覆失敗：{failed} 筆\n等候回覆／結果不明：{unknown} 筆'
-    if total:
+    if total and state(c).get('mode') == 'burst' and not unsent and not failed and all(op['message_id'] for op in waiting):
+        text += '\n所有指令已送出，正在核對回覆，請勿重送。'
+    elif total:
         text += '\n/queue resume：先重試最近失敗的一筆，成功後繼續。'
     cooldown = max(c.ledger.get('not_before', 0), c.ledger.get('telegram_wait_until', 0))
     if cooldown > int(time.time()):
@@ -149,7 +151,8 @@ def claim(c, run, change, previous):
 
 
 async def tick(c, t):
-    if state(c).get('status') not in ACTIVE:
+    run = state(c)
+    if run.get('status') not in ACTIVE and not (run.get('mode') == 'burst' and run.get('status') == 'paused'):
         return
     try:
         if state(c).get('mode') == 'burst':

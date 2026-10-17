@@ -208,10 +208,12 @@ class Control:
                 reports.append((op["id"], op["user_id"], op["case_id"], "\n".join(lines)[:1050], op["created_at"], now))
             with self.db:
                 self.db.executemany("INSERT INTO operation_reports VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body,updated_at=excluded.updated_at", reports)
+                batch = self.ledger.get('delivery_queue', {})
+                batch_users = {x[1] for x in batch.get('items', [])} if batch.get('mode') == 'burst' and batch.get('status') in ('running', 'paused') else set()
                 for op in operations:
-                    if op["state"] == "acked":
+                    if op["state"] == "acked" or op['user_id'] in batch_users:
                         self.db.execute("UPDATE watch_outbox SET state='cancelled' WHERE key LIKE ? AND state='queued'", (f"failure:{op['id']}:%",))
-                    if op["state"] == "uncertain":
+                    if op["state"] == "uncertain" and op["user_id"] not in batch_users:
                         self.ledger.put("delivery_paused", True)
                         report = next(r[3] for r in reports if r[0] == op["id"])
                         for chat in (self.owner, self.config["destination_chat_id"]):

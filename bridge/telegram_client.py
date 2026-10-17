@@ -204,11 +204,6 @@ class Telegram:
                 raise StopBridge('Sent command was removed or changed')
         async for message in self.client.iter_messages(self.destination, min_id=min(op['message_id'] for op in sent), limit=1000):
             self.observe_reply(message)
-        for op in sent:
-            if int(time.time()) - op['created_at'] > 120:
-                current = ledger.conn.execute('SELECT state FROM operations WHERE id=?', (op['id'],)).fetchone()[0]
-                if current == 'sent':
-                    ledger.uncertain(op['id'])
 
     @guarded
     async def confirmed_failure(self, operation):
@@ -227,6 +222,9 @@ class Telegram:
     @guarded
     async def reconcile(self, ledger):
         """Observe one existing operation; this method cannot create or send one."""
+        run = ledger.get("delivery_queue", {})
+        if run.get("mode") == "burst" and run.get("status") in ("running", "paused"):
+            return  # The batch worker reconciles every outstanding reply, including while paused.
         operation = ledger.pending()
         await self.reconcile_operation(ledger, operation)
 
