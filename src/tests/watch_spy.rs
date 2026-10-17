@@ -191,7 +191,7 @@ fn report_case_queries_require_trusted_actor_and_pinned_location() {
     let message = |actor, chat, text: &str| {
         let mut value =
             serde_json::to_value(spam_ban_message(actor, text, Some("/ban 200 +spb"))).unwrap();
-        value["chat"]["id"] = json!(chat);
+        value["chat"]["id"] = serde_json::json!(chat);
         serde_json::from_value::<Message>(value).unwrap()
     };
     let before = conn.total_changes();
@@ -230,7 +230,7 @@ fn report_case_queries_require_trusted_actor_and_pinned_location() {
         .is_none());
     let mut forwarded = serde_json::to_value(message(HOST_ID, -10001, "/case #aab3bf04")).unwrap();
     forwarded["forward_origin"] =
-        json!({"type":"hidden_user", "date":0, "sender_user_name":"Someone"});
+        serde_json::json!({"type":"hidden_user", "date":0, "sender_user_name":"Someone"});
     assert!(
         crate::watch_spy::report_query(&conn, &serde_json::from_value(forwarded).unwrap())
             .unwrap()
