@@ -171,6 +171,45 @@ class Telegram:
                 return message.id
         return None
 
+    def observe_reply(self, message):
+        if self.ledger is None or not message.reply_to_msg_id:
+            return
+        row = self.ledger.conn.execute("SELECT * FROM operations WHERE message_id=? AND state IN ('sent','uncertain')", (message.reply_to_msg_id,)).fetchone()
+        if not row:
+            return
+        op = dict(row)
+        if op['error'] == 'receiver_failed':
+            return
+        candidate = {'chat_id': message.chat_id, 'sender_id': message.sender_id,
+                     'reply_to': message.reply_to_msg_id, 'forwarded': bool(message.fwd_from),
+                     'via_bot': bool(message.via_bot_id), 'out': message.out,
+                     'text': message.raw_text or ''}
+        if valid_ack(candidate, op, self.config['hex_bot_id'], self.config['destination_chat_id']):
+            self.ledger.acknowledge(op['id'], message.id)
+        elif valid_failure(candidate, op, self.config['hex_bot_id'], self.config['destination_chat_id']):
+            with self.ledger.conn:
+                self.ledger.conn.execute("UPDATE operations SET state='uncertain',error='receiver_failed',reply_id=? WHERE id=?", (message.id, op['id']))
+
+    @guarded
+    async def reconcile_batch(self, ledger, operations):
+        self.ledger = ledger
+        sent = [op for op in operations if op['message_id'] and not op['error'] == 'receiver_failed']
+        if not sent:
+            return
+        commands = await self.client.get_messages(self.destination, ids=[op['message_id'] for op in sent])
+        commands = {m.id: m for m in commands if m}
+        for op in sent:
+            m = commands.get(op['message_id'])
+            if not m or m.sender_id != self.config['account_id'] or not m.out or m.raw_text != op['command'] or m.fwd_from or m.edit_date:
+                raise StopBridge('Sent command was removed or changed')
+        async for message in self.client.iter_messages(self.destination, min_id=min(op['message_id'] for op in sent), limit=1000):
+            self.observe_reply(message)
+        for op in sent:
+            if int(time.time()) - op['created_at'] > 120:
+                current = ledger.conn.execute('SELECT state FROM operations WHERE id=?', (op['id'],)).fetchone()[0]
+                if current == 'sent':
+                    ledger.uncertain(op['id'])
+
     @guarded
     async def confirmed_failure(self, operation):
         command = await self.client.get_messages(self.destination, ids=operation['message_id'])
@@ -322,7 +361,9 @@ class Telegram:
             message = event.message
             if (message.chat_id == self.config['destination_chat_id']
                     and message.sender_id == self.config['hex_bot_id']):
-                self.delivery_wakeup.set()  # The worker still verifies the exact command and reply.
+                if self.ledger is not None and self.ledger.get('delivery_queue', {}).get('mode') == 'burst':
+                    self.observe_reply(message)
+                self.delivery_wakeup.set()
                 return
             if message.fwd_from or message.via_bot_id or message.out or message.edit_date or message.action:
                 return

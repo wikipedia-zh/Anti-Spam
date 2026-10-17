@@ -10,7 +10,7 @@ import time
 from core import StopBridge
 from telegram_client import Flood
 
-HELP = "SPB-WATCH\n/sync sync:追蹤碼\n/sync #案件碼\n/sync 使用者ID\n/queue：查看剩餘寫入\n/queue resume：先重試一筆，成功後繼續\n報告群可使用 /sync 或 /spb_sync。"
+HELP = "SPB-WATCH\n/sync sync:追蹤碼\n/sync #案件碼\n/sync 使用者ID\n/queue：查看剩餘寫入\n/queue flush：連續送出本批已核准項目\n/queue resume：先重試一筆，成功後繼續\n報告群可使用 /sync 或 /spb_sync。"
 OWNER_HELP = "\n/sudo ID：授權查詢、清除、入群及審核\n/sudo del ID：撤權\n/sudo list：查看授權\n/purge：回覆起點訊息，刪除至最新訊息\n/join @群組或私人邀請連結\n/ignore 群組ID：停止掃描\n/ignore del 群組ID：恢復掃描\n/ignore list：查看排除名單"
 STATES = {"sending": "送出結果待確認", "sent": "已送出，等候 hexDrill 確認",
           "uncertain": "未確認成功，已停止後續封禁", "acked": "hexDrill 已確認成功",
@@ -304,6 +304,7 @@ class Watch:
                 with c.db:
                     c.ledger.put("watch_group_verified_at", int(time.time()))
             except Flood:
+                self.group_checked_at = 0  # Recheck after cooldown, not a false membership failure.
                 raise
             except Exception as error:
                 print("watch destination:", type(error).__name__, flush=True)

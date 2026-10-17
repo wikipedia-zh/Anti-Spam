@@ -78,8 +78,13 @@ def status(c):
 def command(c, chat, message, actor, parts, date):
     if parts == ['/queue']:
         return status(c)
+    if parts == ['/queue', 'flush']:
+        if date is None or not 0 <= int(time.time()) - date <= 120:
+            return '指令已過期，請重新輸入 /queue flush。'
+        from burst_queue import request
+        return request(c, actor, f'{chat}:{message}')
     if parts != ['/queue', 'resume']:
-        return '用法：/queue 或 /queue resume'
+        return '用法：/queue、/queue resume 或 /queue flush'
     if date is None or not 0 <= int(time.time()) - date <= 120:
         return '指令已過期，請重新輸入 /queue resume。'
     if not c.config.get('receiver_scope_confirmed'):
@@ -147,7 +152,11 @@ async def tick(c, t):
     if state(c).get('status') not in ACTIVE:
         return
     try:
-        await advance(c, t)
+        if state(c).get('mode') == 'burst':
+            from burst_queue import advance as burst_advance
+            await burst_advance(c, t)
+        else:
+            await advance(c, t)
     except Flood:
         raise
     except Exception:
