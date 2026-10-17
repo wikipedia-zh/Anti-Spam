@@ -444,13 +444,15 @@ class Telegram:
             if not self.purge_authorized(actor):
                 raise StopBridge('Authorization revoked')
             try:
-                result = await self.client(functions.messages.ImportChatInviteRequest(name))
+                await self.client(functions.messages.ImportChatInviteRequest(name))
             except errors.InviteRequestSentError:
                 return '等待群組管理員批准', True
-            groups = [g for g in result.chats if isinstance(g, (types.Channel, types.Chat)) and not getattr(g, 'broadcast', False)]
-            if len(groups) != 1:
+            # Import may return UpdatesTooLong, which contains no chats.
+            # Resolve this exact invitation again to confirm membership.
+            group = await self.joined_group(value, actor)
+            if group is None:
                 raise StopBridge('Joined group cannot be verified')
-            return utils.get_peer_id(groups[0]), False
+            return group, False
         entity = await self.client.get_entity(name)
         if not isinstance(entity, types.Channel) or not entity.megagroup or entity.broadcast:
             raise StopBridge('Only groups can be joined')

@@ -1,7 +1,7 @@
 import asyncio
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from control import Control, Watch
 from core import StopBridge
@@ -137,3 +137,79 @@ class Spy(Fixture):
         asyncio.run(tick(self.c,t))
         t.send.assert_not_called()
         self.assertEqual(t.reconcile_operation.call_args[0][1]['id'],op['id'])
+
+
+class Chat(SimpleNamespace):
+    pass
+
+
+class Channel(SimpleNamespace):
+    pass
+
+
+class ChatInvite(SimpleNamespace):
+    pass
+
+
+class ChatInviteAlready(SimpleNamespace):
+    pass
+
+
+class InviteRequestSentError(Exception):
+    pass
+
+
+class JoinVerification(Fixture):
+    def setUp(self):
+        super().setUp()
+        self.config = {'source_db': str(self.source), 'operator_id': 500, 'account_id': 11,
+                       'hex_bot_id': 12, 'destination_chat_id': -10001, 'spy_enabled': True,
+                       'spb_bot_id': 13, 'spy_excluded_chats': [], 'owner_only_private': True,
+                       'receiver_scope_confirmed': True}
+        self.c = Control(self.config, self.ledger)
+        with self.c.db:
+            self.c.advance(500, 0)
+    def transport(self, replies):
+        from telegram_client import Telegram
+        fake = SimpleNamespace(
+            types=SimpleNamespace(Chat=Chat, Channel=Channel, ChatInvite=ChatInvite,
+                                  ChatInviteAlready=ChatInviteAlready),
+            utils=SimpleNamespace(get_peer_id=lambda chat: chat.id),
+            errors=SimpleNamespace(InviteRequestSentError=InviteRequestSentError),
+            functions=SimpleNamespace(messages=SimpleNamespace(
+                CheckChatInviteRequest=lambda value: ('check', value),
+                ImportChatInviteRequest=lambda value: ('import', value))))
+        client = AsyncMock(side_effect=replies)
+        return fake, Telegram(client, self.config), client
+
+    def test_join_without_chats_in_updates_verifies_exact_invite_and_enrolls(self):
+        fake, t, client = self.transport([ChatInvite(), SimpleNamespace(),
+            ChatInviteAlready(chat=Chat(id=-10004, left=False))])
+        self.c.handle(500, 1, 500, '/join https://t.me/+abcdefgh1234')
+        with patch.dict('sys.modules', {'telethon': fake}):
+            asyncio.run(joins(self.c, t))
+        self.assertFalse(excluded(self.c, -10004))
+        self.assertEqual([call.args[0] for call in client.await_args_list],
+            [('check', 'abcdefgh1234'), ('import', 'abcdefgh1234'), ('check', 'abcdefgh1234')])
+        self.assertEqual(self.c.db.execute('SELECT state FROM watch_join_jobs').fetchone()[0], 'done')
+        capture(self.c, -10004, 10, 100, 'spam', int(time.time()))
+        self.assertEqual(self.c.db.execute('SELECT status FROM watch_spy').fetchone()[0], 'pending')
+
+    def test_import_result_does_not_enroll_unverified_or_broadcast_chat(self):
+        for response in [ChatInvite(), ChatInviteAlready(chat=Channel(id=-10004, broadcast=True)),
+                         ChatInviteAlready(chat=Chat(id=-10004, left=True))]:
+            fake, t, _ = self.transport([ChatInvite(), SimpleNamespace(chats=[Chat(id=-10005)]), response])
+            with patch.dict('sys.modules', {'telethon': fake}):
+                with self.assertRaises(StopBridge):
+                    asyncio.run(t.join_group('https://t.me/+abcdefgh1234', 500))
+            self.assertTrue(excluded(self.c, -10004))
+            self.assertTrue(excluded(self.c, -10005))
+
+    def test_reissuing_join_after_membership_does_not_repeat_import(self):
+        fake, t, client = self.transport([ChatInviteAlready(chat=Chat(id=-10004, left=False))])
+        self.c.handle(500, 1, 500, '/join https://t.me/+abcdefgh1234')
+        with patch.dict('sys.modules', {'telethon': fake}):
+            asyncio.run(joins(self.c, t))
+        self.assertFalse(excluded(self.c, -10004))
+        self.assertEqual(client.await_count, 1)
+        self.assertEqual(client.await_args.args[0][0], 'check')
