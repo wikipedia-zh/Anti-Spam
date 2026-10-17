@@ -224,17 +224,21 @@ class Queue(Fixture):
         client.get_messages = AsyncMock(return_value=command)
         self.assertFalse(asyncio.run(Telegram(client, self.config).confirmed_failure(op)))
 
-    def test_hourly_limit_leaves_probe_queued(self):
+    def test_full_speed_ignores_old_hourly_and_daily_caps_but_waits_for_ack(self):
         self.failed()
         with self.c.db:
-            for i in range(29):
+            for i in range(150):
                 self.c.db.execute("INSERT INTO operations(id,user_id,action,case_id,command,random_id,state,created_at) VALUES (?,100,'ban',?,'old',1,'cancelled',?)",
-                                  (f'old-{i}', self.first, int(time.time()) - 100))
+                                  (f'old-{i}', self.first, int(time.time())))
         self.resume()
         self.run_tick()
-        self.t.send.assert_not_called()
-        self.assertEqual(state(self.c)['status'], 'requested')
-        self.assertIn('冷卻', status(self.c))
+        self.assertEqual(self.t.send.await_count, 1)
+        self.run_tick()
+        self.assertEqual(self.t.send.await_count, 1)
+        self.ledger.acknowledge(self.ledger.pending()['id'], 51)
+        self.run_tick()
+        self.assertEqual(self.t.send.await_count, 2)
+        self.assertEqual(self.ledger.pending()['user_id'], 101)
 
     def test_failed_claim_rolls_back_cancellation(self):
         old = self.failed()

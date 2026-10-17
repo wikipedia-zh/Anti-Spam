@@ -8765,7 +8765,7 @@ async fn main() -> Result<()> {
             let runtime = runtime.clone();
             async move {
                 if watch_spy::is_report_chat(message.chat.id.0) {
-                    return Ok(());
+                    return watch_spy::handle_report_message(&bot, &runtime, &message).await;
                 }
                 // Runs before delete_service_message_if_enabled, which might
                 // otherwise delete this same "message pinned" notification

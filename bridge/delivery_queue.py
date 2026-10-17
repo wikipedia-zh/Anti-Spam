@@ -70,11 +70,6 @@ def status(c):
     if total:
         text += '\n/queue resume：先重試最近失敗的一筆，成功後繼續。'
     cooldown = max(c.ledger.get('not_before', 0), c.ledger.get('telegram_wait_until', 0))
-    recent = [r[0] for r in c.db.execute('SELECT created_at FROM operations WHERE created_at>? ORDER BY created_at DESC', (int(time.time()) - 86400,))]
-    if len(recent) >= 30:
-        cooldown = max(cooldown, recent[29] + 3600)
-    if len(recent) >= 150:
-        cooldown = max(cooldown, recent[149] + 86400)
     if cooldown > int(time.time()):
         text += f'\n發送冷卻剩餘：{cooldown - int(time.time())} 秒'
     return text
@@ -124,9 +119,7 @@ def pause(c, reason):
 
 def claim(c, run, change, previous):
     now = int(time.time())
-    recent = [r[0] for r in c.db.execute('SELECT created_at FROM operations WHERE created_at>? ORDER BY created_at DESC', (now - 86400,))]
-    if ((recent and now - recent[0] < 20) or sum(t > now - 3600 for t in recent) >= 30
-            or len(recent) >= 150 or now < c.ledger.get('not_before', 0)):
+    if now < max(c.ledger.get('not_before', 0), c.ledger.get('telegram_wait_until', 0)):
         return None
     action, user, case = change
     op_id = str(uuid.uuid4())
@@ -191,7 +184,6 @@ async def advance(c, t):
             return
         with c.db:
             c.ledger.put(KEY, run)
-        return
     waiting = pending(c)
     if any(not rejected(op) for op in waiting):
         pause(c, '仍有操作未確認結果，請先用 /sync 核對。')

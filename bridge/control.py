@@ -444,9 +444,16 @@ class Watch:
 
     async def run(self):
         self.transport.install_control_handler(self.incoming)
+        wake = self.transport.delivery_wakeup
         while True:
+            wake.clear()
             try:
                 await self.tick()
             except Exception as error:
                 print("watch:", type(error).__name__, flush=True)
-            await asyncio.sleep(15)
+            from delivery_queue import state, ACTIVE
+            delay = 1 if state(self.control).get('status') in ACTIVE else 15
+            try:
+                await asyncio.wait_for(wake.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass

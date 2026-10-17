@@ -184,3 +184,72 @@ async fn scan_uses_global_threshold_and_exemptions_without_training() {
         .await
         .unwrap();
 }
+
+#[test]
+fn report_case_queries_require_trusted_actor_and_pinned_location() {
+    let conn = bridge();
+    let message = |actor, chat, text: &str| {
+        let mut value =
+            serde_json::to_value(spam_ban_message(actor, text, Some("/ban 200 +spb"))).unwrap();
+        value["chat"]["id"] = json!(chat);
+        serde_json::from_value::<Message>(value).unwrap()
+    };
+    let before = conn.total_changes();
+    for text in [
+        "/case #aab3bf04",
+        "/case@WikiBlacklistRobot #aab3bf04",
+        "/lookup #aab3bf04",
+    ] {
+        for actor in [HOST_ID, 600] {
+            assert_eq!(
+                crate::watch_spy::report_query(&conn, &message(actor, -10001, text))
+                    .unwrap()
+                    .as_deref(),
+                Some("#aab3bf04")
+            );
+        }
+    }
+    for (actor, chat, text) in [
+        (777, -10001, "/case #aab3bf04"),
+        (HOST_ID, -10002, "/case #aab3bf04"),
+        (HOST_ID, -10001, "/case@OtherBot #aab3bf04"),
+        (HOST_ID, -10001, "/ban 200"),
+        (HOST_ID, -10001, "/unban #aab3bf04"),
+        (HOST_ID, -10001, "/sync sync:841a90626f07"),
+    ] {
+        assert!(
+            crate::watch_spy::report_query(&conn, &message(actor, chat, text))
+                .unwrap()
+                .is_none()
+        );
+    }
+    let mut bot = message(HOST_ID, -10001, "/case #aab3bf04");
+    bot.from.as_mut().unwrap().is_bot = true;
+    assert!(crate::watch_spy::report_query(&conn, &bot)
+        .unwrap()
+        .is_none());
+    let mut forwarded = serde_json::to_value(message(HOST_ID, -10001, "/case #aab3bf04")).unwrap();
+    forwarded["forward_origin"] =
+        json!({"type":"hidden_user", "date":0, "sender_user_name":"Someone"});
+    assert!(
+        crate::watch_spy::report_query(&conn, &serde_json::from_value(forwarded).unwrap())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(before, conn.total_changes());
+    conn.execute("DELETE FROM sudo_users", []).unwrap();
+    assert!(
+        crate::watch_spy::report_query(&conn, &message(600, -10001, "/case #aab3bf04"))
+            .unwrap()
+            .is_none()
+    );
+    conn.execute(
+        "UPDATE meta SET value='0' WHERE key='watch_group_verified_at'",
+        [],
+    )
+    .unwrap();
+    assert!(
+        crate::watch_spy::report_query(&conn, &message(HOST_ID, -10001, "/case #aab3bf04"))
+            .is_err()
+    );
+}

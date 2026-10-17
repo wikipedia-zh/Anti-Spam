@@ -10,6 +10,75 @@ pub(super) fn is_report_chat(chat: i64) -> bool {
         == Some(chat)
 }
 
+pub(super) fn report_query(conn: &Connection, message: &Message) -> Result<Option<String>> {
+    let Some(user) = message.from.as_ref() else {
+        return Ok(None);
+    };
+    if user.is_bot
+        || message.sender_chat.is_some()
+        || message.via_bot.is_some()
+        || message.forward_origin().is_some()
+        || message.edit_date().is_some()
+    {
+        return Ok(None);
+    }
+    let text = message.text().unwrap_or("");
+    let first = text.split_whitespace().next().unwrap_or("");
+    if let Some((_, username)) = first.split_once('@') {
+        if !username.eq_ignore_ascii_case("WikiBlacklistRobot") {
+            return Ok(None);
+        }
+    }
+    let ModerationCommand::CaseLookup(reference) = parse_command(text) else {
+        return Ok(None);
+    };
+    if !authorized(conn, user.id.0 as i64)? || destination(conn)? != message.chat.id.0 {
+        return Ok(None);
+    }
+    Ok(Some(reference))
+}
+
+pub(super) async fn handle_report_message(
+    bot: &Bot,
+    runtime: &Arc<Runtime>,
+    message: &Message,
+) -> ResponseResult<()> {
+    let reference =
+        (|| -> Result<Option<String>> { report_query(&watch_inbox::private_db()?, message) })()
+            .ok()
+            .flatten();
+    let Some(reference) = reference else {
+        return Ok(());
+    };
+    let text = if reference.is_empty() {
+        "用法：<code>/case #案件碼</code>".to_string()
+    } else {
+        match runtime.load_case_reference(&reference).await {
+            Ok(Some(case)) => {
+                let link = case
+                    .log_message_id
+                    .filter(|id| *id > 0)
+                    .map(|id| public_log_link(&runtime.config, id))
+                    .unwrap_or_else(|| "-".to_string());
+                let reason = runtime
+                    .blacklist_reason_link()
+                    .await
+                    .unwrap_or_else(|| link.clone());
+                format_case_lookup(&case, &link, &reason)
+            }
+            Err(err) if err.downcast_ref::<case_ids::Ambiguous>().is_some() => {
+                case_ids::AMBIGUOUS.to_string()
+            }
+            Ok(None) => "找不到這個案件。".to_string(),
+            Err(_) => "暫時無法讀取案件，請稍後再試。".to_string(),
+        }
+    };
+    bot.send_message(message.chat.id, text)
+        .parse_mode(ParseMode::Html)
+        .await?;
+    Ok(())
+}
+
 pub(super) fn is_case(case: &CaseRecord) -> bool {
     case.matched_rule_pattern.as_deref() == Some(MARKER)
 }
@@ -151,7 +220,10 @@ pub(super) fn review_card(
     let mut display = case.clone();
     display.evidence_text = text;
     let mut body = notices::review_card(&display, title, note, reviewer);
-    body = body.replace("（證據過長，完整內容已保存在案例記錄。）", "（內容過長，請開啟來源訊息查看全文。）");
+    body = body.replace(
+        "（證據過長，完整內容已保存在案例記錄。）",
+        "（內容過長，請開啟來源訊息查看全文。）",
+    );
     if let Some(message) = case.source_message_id {
         if let Some(group) = case.chat_id.to_string().strip_prefix("-100") {
             body.push_str(&format!(

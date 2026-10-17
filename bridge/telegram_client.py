@@ -77,6 +77,7 @@ class Telegram:
         self.wait_until = 0
         self.peers = {}
         self.peers_checked_at = 0
+        self.delivery_wakeup = asyncio.Event()
 
     def bind_ledger(self, ledger):
         self.ledger = ledger
@@ -319,6 +320,10 @@ class Telegram:
 
         async def incoming(event):
             message = event.message
+            if (message.chat_id == self.config['destination_chat_id']
+                    and message.sender_id == self.config['hex_bot_id']):
+                self.delivery_wakeup.set()  # The worker still verifies the exact command and reply.
+                return
             if message.fwd_from or message.via_bot_id or message.out or message.edit_date or message.action:
                 return
             if self.config.get('spy_enabled') and event.is_group and message.sender_id:
