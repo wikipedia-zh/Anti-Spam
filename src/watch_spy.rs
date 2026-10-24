@@ -104,7 +104,7 @@ pub(super) fn authorized(conn: &Connection, actor: i64) -> Result<bool> {
         )?)
 }
 
-fn destination(conn: &Connection) -> Result<i64> {
+pub(super) fn destination(conn: &Connection) -> Result<i64> {
     let verified: String = conn.query_row(
         "SELECT value FROM meta WHERE key='watch_group_verified_at'",
         [],

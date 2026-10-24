@@ -292,6 +292,7 @@ class Telegram:
         options = {"limit": 1} if cursor is None else {"limit": 50, "min_id": cursor, "reverse": True}
         return [{"id": m.id, "actor": m.sender_id, "text": m.raw_text or "",
                  "date": int(m.date.timestamp()),
+                 "log_trusted": not (m.via_bot_id or m.out or m.edit_date or m.action),
                  "trusted": not (m.fwd_from or m.via_bot_id or m.out or m.edit_date or m.action)}
                 async for m in self.client.iter_messages(peer, **options)]
 
@@ -363,7 +364,19 @@ class Telegram:
                     self.observe_reply(message)
                 self.delivery_wakeup.set()
                 return
-            if message.fwd_from or message.via_bot_id or message.out or message.edit_date or message.action:
+            if message.via_bot_id or message.out or message.edit_date or message.action:
+                return
+            if message.fwd_from:
+                if message.chat_id == message.sender_id == self.config['operator_id']:
+                    try:
+                        peer = await self.event_peer(event)
+                        if peer is not None:
+                            await handler(message.chat_id, message.id, message.sender_id,
+                                          message.raw_text or '', peer, int(message.date.timestamp()), forwarded=True)
+                    except Flood:
+                        pass
+                    except Exception as error:
+                        print('watch log:', type(error).__name__, flush=True)
                 return
             if self.config.get('spy_enabled') and event.is_group and message.sender_id:
                 try:

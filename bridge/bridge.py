@@ -53,8 +53,12 @@ def binding(config):
     return {k: config[k] for k in ("source_db", "destination_chat_id", "account_id", "hex_bot_id", "allowed_observers")}
 
 
-def snapshot(config):
-    return read_source(config["source_db"], [config["account_id"], config["hex_bot_id"]])
+def snapshot(config, control=None):
+    result = read_source(config["source_db"], [config["account_id"], config["hex_bot_id"]])
+    if control is not None:
+        from log_import import augment
+        result = augment(control, result)
+    return result
 
 
 async def telegram_command(config, command, ledger=None):
@@ -101,7 +105,7 @@ async def telegram_command(config, command, ledger=None):
                 result = "paused; queries and alerts remain available"
             else:
                 try:
-                    result = await cycle(config, ledger, binding(config), transport, lambda: snapshot(config))
+                    result = await cycle(config, ledger, binding(config), transport, lambda: snapshot(config, watch.control if watch else None))
                 except Exception:
                     if not watch:
                         raise

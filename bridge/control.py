@@ -68,6 +68,8 @@ class Control:
         initialize_purge(self)
         from spy import initialize as initialize_spy
         initialize_spy(self)
+        from log_import import initialize as initialize_logs
+        initialize_logs(self)
 
     def authorized(self, user):
         return user == self.owner or self.db.execute("SELECT 1 FROM sudo_users WHERE user_id=?", (user,)).fetchone() is not None
@@ -237,7 +239,7 @@ class Watch:
         from spy import interrupted as interrupted_joins
         interrupted_joins(self.control)
 
-    async def incoming(self, chat, message_id, actor, text, peer, date=None):
+    async def incoming(self, chat, message_id, actor, text, peer, date=None, forwarded=False):
         c = self.control
         purge_command = text.strip().split(' ', 1)[0] == '/purge' and c.authorized(actor)
         group_command = text.strip().split(' ', 1)[0] in ('/join', '/ignore') and c.authorized(actor)
@@ -258,6 +260,12 @@ class Watch:
         if hasattr(self.transport, "remember_peer"):
             self.transport.remember_peer(chat, peer)
         try:
+            from log_import import capture as capture_log
+            if capture_log(c, chat, message_id, actor, text, date):
+                await self.deliver({chat: peer}, key=f"log:{chat}:{message_id}")
+                return
+            if forwarded:
+                return
             if chat < 0 and not purge_command:
                 await self.transport.check_destination()
             if c.cursor(chat) is None:
@@ -340,6 +348,8 @@ class Watch:
             break
         from inbox import outcomes
         outcomes(c)
+        from log_import import outcomes as log_outcomes
+        log_outcomes(c)
         from spy import joins
         await joins(c, t)
         from delivery_queue import managed, tick as queue_tick, pause
@@ -354,7 +364,7 @@ class Watch:
                     print('watch queue:', type(error).__name__, flush=True)
             else:
                 pause(c, '無法核對指定群組，未繼續寫入。')
-        if group_ok and c.config.get('spy_enabled') and not queue_managed:
+        if group_ok and (c.config.get('spy_enabled') or c.db.execute("SELECT 1 FROM watch_log_requests WHERE status='approved' LIMIT 1").fetchone()) and not queue_managed:
             from spy_delivery import tick
             try:
                 await tick(c, t)
@@ -394,6 +404,9 @@ class Watch:
                         self.capture(chat, message["id"], message["text"], message["date"])
             return
         for message in await t.control_messages(peer, cursor):
+            from log_import import capture as capture_log
+            if message.get('log_trusted', message['trusted']) and capture_log(c, chat, message['id'], message['actor'], message['text'], message['date']):
+                continue
             c.handle(chat, message["id"], message["actor"], message["text"], message["trusted"], date=message['date'])
             if chat > 0 and message["trusted"] and message["actor"] == chat:
                 self.capture(chat, message["id"], message["text"], message["date"])

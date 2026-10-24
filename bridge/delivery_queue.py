@@ -34,8 +34,11 @@ def changes(c):
     from bridge import binding
     snapshot = read_source(c.config['source_db'], c.users() | {
         c.config['account_id'], c.config['hex_bot_id'], c.config.get('spb_bot_id')})
+    from log_import import augment, approved_cases
+    snapshot = augment(c, snapshot)
     c.ledger.check(snapshot, binding(c.config))
     approved = {r[0] for r in c.db.execute('SELECT case_id FROM seen WHERE approved=1')}
+    approved.update(approved_cases(c))
     owned = {r[0] for r in c.db.execute('SELECT user_id FROM owned WHERE active=1')}
     active = {v['user_id'] for v in snapshot['cases'].values()}
     targets = {}
@@ -141,7 +144,8 @@ def claim(c, run, change, previous):
             c.db.execute("UPDATE watch_outbox SET state='cancelled' WHERE key LIKE ? AND state='queued'", (f"failure:{old['id']}:%",))
         c.db.execute("INSERT INTO operations(id,user_id,action,case_id,command,random_id,state,created_at) VALUES (?,?,?,?,?,?,'sending',?)",
                      (op_id, user, action, case, text, secrets.randbits(63) or 1, now))
-        if c.db.execute('SELECT 1 FROM watch_spy WHERE id=?', (case,)).fetchone():
+        if (c.db.execute('SELECT 1 FROM watch_spy WHERE id=?', (case,)).fetchone()
+                or c.db.execute("SELECT 1 FROM watch_log_requests WHERE case_id=? AND status='approved'", (case,)).fetchone()):
             c.db.execute('INSERT INTO spy_operations VALUES (?,?)', (op_id, case))
         run['operation'] = op_id
         if run['status'] == 'requested':

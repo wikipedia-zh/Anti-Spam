@@ -20,6 +20,9 @@ def source(c):
 
 def candidates(c, *, include_pending=False, notify=True):
     snapshot = read_source(c.config['source_db'], c.users() | {c.config['account_id'], c.config['hex_bot_id'], c.config['spb_bot_id']})
+    from log_import import augment, approved_cases
+    snapshot = augment(c, snapshot)
+    manual = approved_cases(c)
     db = source(c)
     try:
         approved = db.execute("""SELECT c.id,c.target_user_id FROM cases c JOIN review_updates r ON r.case_id=c.id
@@ -50,6 +53,15 @@ def candidates(c, *, include_pending=False, notify=True):
         if not include_pending and c.db.execute("SELECT 1 FROM spy_operations s JOIN operations o ON o.id=s.operation_id WHERE s.case_id=? AND o.action='ban' AND o.state!='cancelled'",(row['id'],)).fetchone():
             continue
         changes.append(('ban',row['target_user_id'],row['id']))
+    selected = {x[1] for x in changes if x[0] == 'ban'}
+    for case, item in manual.items():
+        user = item['user_id']
+        if user in selected or c.db.execute('SELECT 1 FROM owned WHERE user_id=? AND active=1', (user,)).fetchone():
+            continue
+        if not include_pending and c.db.execute("SELECT 1 FROM operations WHERE case_id=? AND action='ban' AND state!='cancelled'", (case,)).fetchone():
+            continue
+        changes.append(('ban', user, case))
+        selected.add(user)
     return changes
 
 

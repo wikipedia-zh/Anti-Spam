@@ -15,6 +15,7 @@ mod queue_status;
 mod sync_status;
 mod watch_inbox;
 mod watch_spy;
+mod watch_logs;
 mod queue_admin;
 mod host_maintenance;
 mod report_delivery;
@@ -8204,6 +8205,9 @@ async fn handle_command(bot: Bot, runtime: Arc<Runtime>, message: Message) -> Re
 
 async fn handle_callback(bot: Bot, runtime: Arc<Runtime>, q: CallbackQuery) -> ResponseResult<()> {
     let Some(data) = q.data.clone() else { return Ok(()); };
+    if data.starts_with("log:") {
+        return watch_logs::callback(&bot,&runtime,q).await;
+    }
     let from = q.from.clone();
     let from_id = from.id.0 as i64;
 
@@ -8697,6 +8701,7 @@ async fn main() -> Result<()> {
     let runtime = Arc::new(Runtime::load(config).await?);
     watch_inbox::spawn(runtime.clone());
     watch_spy::spawn(runtime.clone());
+    watch_logs::spawn(bot.clone(),runtime.clone());
     let miniapp_server = miniapp::start(bot.clone(), runtime.clone()).await?;
     let reversal_worker = spawn_reversal_worker(bot.clone(), runtime.clone());
     let network_worker = spawn_network_worker(bot.clone(), runtime.clone());
@@ -9017,6 +9022,7 @@ mod tests {
     mod tokenizer_upgrade;
     mod watch_inbox;
     mod watch_spy;
+    mod watch_logs;
     mod moderation_queue;
     mod restriction_retry;
     mod queue_status;
