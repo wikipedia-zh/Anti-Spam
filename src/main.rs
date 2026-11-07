@@ -16,6 +16,7 @@ mod sync_status;
 mod watch_inbox;
 mod watch_spy;
 mod watch_logs;
+mod seele;
 mod queue_admin;
 mod host_maintenance;
 mod report_delivery;
@@ -4791,12 +4792,6 @@ fn unban_noop_reason(err: &teloxide::RequestError) -> Option<&'static str> {
     if text.contains("user is an administrator") {
         return Some("對象目前是該群管理員，本來就未被封禁");
     }
-    if text.contains("chat not found") || text.contains("bot was kicked") || text.contains("bot is not a member") {
-        return Some("機器人已不在該群組");
-    }
-    if text.contains("user not found") || text.contains("participant_id_invalid") || text.contains("user_not_participant") {
-        return Some("對象不在該群組");
-    }
     None
 }
 
@@ -8523,7 +8518,10 @@ async fn try_send_exchange_message(bot: &Bot, chat: i64, action: &str, kind: &st
 async fn handle_exchange_query_bad(bot: &Bot, runtime: &Runtime, chat: i64, data: serde_json::Value) {
     let Some(user_id) = data.get("id").and_then(|v| v.as_i64()) else { return };
     let request_id = data.get("request_id").and_then(|v| v.as_str()).unwrap_or_default();
-    let banned = runtime.find_active_bans_for_user(user_id).await.map(|cases| !cases.is_empty()).unwrap_or(false);
+    let banned = match runtime.find_active_bans_for_user(user_id).await {
+        Ok(cases) => !cases.is_empty(),
+        Err(err) => { log::warn!("appeal status query failed: {err}"); return; }
+    };
     // "report"/"bad" with an explicit is_banned field, mirroring bad_detail's
     // shape - not the old add/remove-verb encoding (easy to misread: which
     // verb means "banned" isn't obvious out of context).
@@ -8533,7 +8531,10 @@ async fn handle_exchange_query_bad(bot: &Bot, runtime: &Runtime, chat: i64, data
 async fn handle_exchange_query_bad_detail(bot: &Bot, runtime: &Runtime, chat: i64, data: serde_json::Value) {
     let Some(user_id) = data.get("id").and_then(|v| v.as_i64()) else { return };
     let request_id = data.get("request_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let cases = runtime.find_active_bans_for_user(user_id).await.unwrap_or_default();
+    let cases = match runtime.find_active_bans_for_user(user_id).await {
+        Ok(cases) => cases,
+        Err(err) => { log::warn!("appeal detail query failed: {err}"); return; }
+    };
 
     let Some(case) = cases.first() else {
         send_exchange_message(bot, chat, "report", "bad_detail", serde_json::json!({
@@ -8603,16 +8604,29 @@ async fn handle_exchange_request_unban(bot: &Bot, runtime: &Runtime, chat: i64, 
     let operator_id = data.get("operator_id").and_then(|v| v.as_i64()).unwrap_or(0);
     let operator_name = data.get("operator_name").and_then(|v| v.as_str()).unwrap_or(EXCHANGE_SENDER_PM).to_string();
 
-    let cases = runtime.find_active_bans_for_user(user_id).await.unwrap_or_default();
+    if request_id.is_empty() || !runtime.can_review(operator_id).await {
+        send_exchange_message(bot, chat, "result", "unban", serde_json::json!({
+            "id":user_id,"request_id":request_id,"success":false,"message":"無法核對申訴操作權限。"
+        })).await;
+        return;
+    }
+    let cases = match runtime.find_active_bans_for_user(user_id).await {
+        Ok(cases) => cases,
+        Err(err) => {
+            log::warn!("appeal unban query failed: {err}");
+            send_exchange_message(bot, chat, "result", "unban", serde_json::json!({
+                "id":user_id,"request_id":request_id,"success":false,"message":"暫時無法查核封禁記錄，尚未解封。"
+            })).await;
+            return;
+        }
+    };
     if cases.is_empty() {
-        // Idempotent: the desired end state ("not banned") already holds, and
-        // PM has no retry path for a failed case, so erroring here would be
-        // more likely to strand an appeal than to help.
+        // No local ban record does not establish Telegram membership state.
         send_exchange_message(bot, chat, "result", "unban", serde_json::json!({
             "id": user_id,
             "request_id": request_id,
-            "success": true,
-            "message": "沒有找到有效的封禁記錄，視為已解封。",
+            "success": false,
+            "message": "SPB 未找到有效封禁記錄，本次沒有執行解封。請管理員確認實際群組狀態。",
         }))
         .await;
         return;
@@ -8621,6 +8635,7 @@ async fn handle_exchange_request_unban(bot: &Bot, runtime: &Runtime, chat: i64, 
     // A user can have independent active bans in several unrelated groups -
     // reverse all of them, attributing the reversal to the actual staff
     // member who accepted the appeal in PM, not to "PM" or "GBB".
+    let case_ids: Vec<String> = cases.iter().map(|case| case.id.clone()).collect();
     let mut reversed = Vec::new();
     let mut errors = Vec::new();
     for case in cases {
@@ -8631,6 +8646,11 @@ async fn handle_exchange_request_unban(bot: &Bot, runtime: &Runtime, chat: i64, 
         }
     }
 
+    match runtime.find_active_bans_for_user(user_id).await {
+        Ok(remaining) if !remaining.is_empty() => errors.push("仍有未解除的封禁，請等待重試或由管理員跟進。".to_string()),
+        Err(_) => errors.push("無法確認最後封禁狀態。".to_string()),
+        _ => {}
+    }
     let success = errors.is_empty();
     let summary = if success {
         format!("PM 申訴解封成功，共解除 {} 個 case：{}", reversed.len(), reversed.join(", "))
@@ -8647,6 +8667,7 @@ async fn handle_exchange_request_unban(bot: &Bot, runtime: &Runtime, chat: i64, 
         "id": user_id,
         "request_id": request_id,
         "success": success,
+        "case_ids": case_ids,
         "message": summary,
     }))
     .await;
@@ -8669,6 +8690,8 @@ async fn handle_exchange_post(bot: Bot, runtime: Arc<Runtime>, post: Message) ->
     match (envelope.action.as_str(), envelope.kind.as_str()) {
         ("query", "bad") => handle_exchange_query_bad(&bot, &runtime, exchange_chat, envelope.data).await,
         ("query", "bad_detail") => handle_exchange_query_bad_detail(&bot, &runtime, exchange_chat, envelope.data).await,
+        ("request", "netban") => seele::handle_netban(&bot, &runtime, exchange_chat, envelope.data).await,
+        ("query", "unban") => seele::check_unban(&bot, &runtime, exchange_chat, envelope.data).await,
         ("request", "unban") => handle_exchange_request_unban(&bot, &runtime, exchange_chat, envelope.data).await,
         _ => {}
     }
@@ -9023,6 +9046,7 @@ mod tests {
     mod watch_inbox;
     mod watch_spy;
     mod watch_logs;
+    mod seele;
     mod moderation_queue;
     mod restriction_retry;
     mod queue_status;
@@ -10022,10 +10046,10 @@ mod tests {
 
         // The exact string from the incident.
         assert!(noop("Bad Request: user is an administrator of the chat").is_some());
-        assert!(noop("Bad Request: chat not found").is_some());
-        assert!(noop("Forbidden: bot was kicked from the supergroup chat").is_some());
-        assert!(noop("Bad Request: user not found").is_some());
-        assert!(noop("Bad Request: PARTICIPANT_ID_INVALID").is_some());
+        assert!(noop("Bad Request: chat not found").is_none());
+        assert!(noop("Forbidden: bot was kicked from the supergroup chat").is_none());
+        assert!(noop("Bad Request: user not found").is_none());
+        assert!(noop("Bad Request: PARTICIPANT_ID_INVALID").is_none());
 
         // Genuine failures must still be reported, not silently swallowed -
         // here the ban really is still in place.
