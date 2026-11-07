@@ -10,10 +10,12 @@ async fn private_project_ban_reverses_groups_without_unbanning_a_dm() {
     runtime.record_network_ban_target(&case.id, HOST_ID).await.unwrap();
     let stub = TelegramStub::new(vec![]);
     reverse_ban_case(&stub.bot, &runtime, case.clone(), HOST_ID, "owner").await.unwrap();
-    let calls = stub.requests.lock().unwrap();
-    let unbans: Vec<_> = calls.iter().filter(|(m, _)| m == "unbanchatmember").collect();
-    assert_eq!(unbans.len(), 1);
-    assert_eq!(unbans[0].1["chat_id"], -300);
+    {
+        let calls = stub.requests.lock().unwrap();
+        let unbans: Vec<_> = calls.iter().filter(|(m, _)| m == "unbanchatmember").collect();
+        assert_eq!(unbans.len(), 1);
+        assert_eq!(unbans[0].1["chat_id"], -300);
+    }
     assert_eq!(runtime.load_case(&case.id).await.unwrap().unwrap().status, "reversed");
 }
 
