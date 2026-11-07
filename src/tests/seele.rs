@@ -1,6 +1,22 @@
 use super::*;
 use crate::seele::{admit, NetbanRequest};
 
+#[tokio::test]
+async fn private_project_ban_reverses_groups_without_unbanning_a_dm() {
+    let runtime = test_runtime().await;
+    let case = dummy_case(ActionKind::ProjectBan, HOST_ID, 200, Utc::now());
+    runtime.persist_case(&case).await.unwrap();
+    runtime.record_network_ban_target(&case.id, -300).await.unwrap();
+    runtime.record_network_ban_target(&case.id, HOST_ID).await.unwrap();
+    let stub = TelegramStub::new(vec![]);
+    reverse_ban_case(&stub.bot, &runtime, case.clone(), HOST_ID, "owner").await.unwrap();
+    let calls = stub.requests.lock().unwrap();
+    let unbans: Vec<_> = calls.iter().filter(|(m, _)| m == "unbanchatmember").collect();
+    assert_eq!(unbans.len(), 1);
+    assert_eq!(unbans[0].1["chat_id"], -300);
+    assert_eq!(runtime.load_case(&case.id).await.unwrap().unwrap().status, "reversed");
+}
+
 fn request(id: String) -> NetbanRequest {
     NetbanRequest {
         request_id: id,

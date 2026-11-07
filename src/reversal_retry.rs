@@ -10,7 +10,7 @@ pub(super) fn begin_reversal_tx(
     actor_id: i64,
     actor_name: &str,
 ) -> Result<()> {
-    if case.status != "reversal_pending" && !watch_inbox::is_case(case) && !watch_spy::is_case(case) && !seele::is_case(case) {
+    if case.status != "reversal_pending" && case.chat_id < 0 && !watch_inbox::is_case(case) && !watch_spy::is_case(case) && !seele::is_case(case) {
         tx.execute(
                     "INSERT OR IGNORE INTO network_ban_targets(case_id,chat_id,created_at) VALUES (?1,?2,?3)",
                     params![case.id, case.chat_id, Utc::now().to_rfc3339()],
@@ -23,6 +23,8 @@ pub(super) fn begin_reversal_tx(
                  SELECT case_id,chat_id,?2 FROM network_deliveries WHERE case_id=?1 AND outcome_unknown=1",
                 params![case.id, Utc::now().to_rfc3339()],
             )?;
+    // A private command records the operator's DM as its source, not a banned group.
+    tx.execute("DELETE FROM network_ban_targets WHERE case_id=?1 AND chat_id>0", [&case.id])?;
     tx.execute("UPDATE network_deliveries SET state='cancelled',outcome_unknown=0 WHERE case_id=?1 AND state!='done'", params![case.id])?;
     tx.execute(
         "UPDATE cases SET status='reversal_pending' WHERE id=?1",
@@ -219,6 +221,10 @@ async fn apply_reversal(
     let mut errors = Vec::new();
     let mut retained = 0;
     for chat_id in targets {
+        if chat_id > 0 {
+            runtime.remove_network_ban_target(&case.id, chat_id).await.map_err(|e| e.to_string())?;
+            continue;
+        }
         if runtime
             .has_other_ban_in_chat(&case.id, chat_id, case.target_user_id)
             .await
@@ -273,7 +279,7 @@ async fn apply_reversal(
         if let Err(err) = runtime.persist_case(&case).await {
             log::warn!("could not save reversal log for {}: {err}", case.id);
         }
-        if !watch_inbox::is_case(&case) && !watch_spy::is_case(&case) && !seele::is_case(&case) {
+        if case.chat_id < 0 && !watch_inbox::is_case(&case) && !watch_spy::is_case(&case) && !seele::is_case(&case) {
             let _ = notify_group(bot, runtime, &case, id, "<b>封禁案例已撤銷</b>").await;
         }
     }
